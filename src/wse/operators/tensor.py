@@ -1,0 +1,224 @@
+"""Built-in tensor analyses: ``tensor_stats@1``, ``tensor_norm@1``, ``tensor_top_k@1``.
+
+All three read only the region the engine passes in, never call the model
+adapter's ``forward``, and accumulate in float64 without copying the region.
+Element values in results use the shortest decimal digits that round-trip the
+stored dtype.
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping
+from typing import Any
+
+import numpy as np
+from pydantic import BaseModel, Field
+
+from wse.adapters.base import CAP_WEIGHTS_READ
+from wse.operators.base import (
+    BaseAnalysisOperator,
+    OperatorParameters,
+    OperatorResult,
+    TensorRegion,
+    make_spec,
+    parse_parameters,
+)
+from wse.policy import DEFAULT_TOP_K, MAX_TOP_K
+from wse.schemas import ErrorCode, UsageContract, WSEError
+
+_ANALYSIS_USAGE = UsageContract(counter="analysis_calls", units_per_call=1, model_forward_calls=0)
+
+
+def shortest_floats(values: np.ndarray) -> list[float]:
+    """Python floats whose ``repr`` uses the shortest digits of the stored dtype.
+
+    For float32 these are NumPy's float32 digits rather than the float64 text
+    that ``.tolist()`` would produce (``0.1`` instead of ``0.10000000149011612``).
+    """
+    if values.dtype == np.float64:
+        return [float(value) for value in values.reshape(-1)]
+    return [float(str(value)) for value in values.reshape(-1)]
+
+
+def _require_finite(region: TensorRegion, operation: str) -> None:
+    bad = int(np.count_nonzero(~np.isfinite(region.values)))
+    if bad:
+        raise WSEError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"{operation} is undefined for tensor {region.tensor!r}: the selection contains {bad} "
+            "nonfinite value(s); use the stats analysis to count them",
+            details={"tensor": region.tensor, "nonfinite_count": bad},
+        )
+
+
+# -- stats ---------------------------------------------------------------------------
+
+
+class StatsResult(OperatorResult):
+    count: int = Field(description="number of elements in the selection")
+    mean: float | None = Field(description="mean of the finite elements; null if none")
+    std: float | None = Field(description="population standard deviation (ddof=0) of the finite elements")
+    min: float | None
+    max: float | None
+    nonfinite_count: int
+
+
+class StatsOperator(BaseAnalysisOperator):
+    """count/mean/std/min/max/nonfinite_count; std is the population std (ddof=0)."""
+
+    parameters_model = OperatorParameters
+    result_model = StatsResult
+    spec = make_spec(
+        operator_id="tensor_stats",
+        version="1",
+        effect="analysis",
+        description="Count, mean, population standard deviation (ddof=0), min, max, and "
+        "nonfinite count of a tensor selection; statistics cover the finite elements.",
+        required_capabilities=[CAP_WEIGHTS_READ],
+        parameters_model=OperatorParameters,
+        result_model=StatsResult,
+        usage=_ANALYSIS_USAGE,
+    )
+
+    def analyze(self, region: TensorRegion, parameters: BaseModel) -> StatsResult:
+        values = region.values
+        finite_mask = np.isfinite(values)
+        nonfinite = int(values.size - np.count_nonzero(finite_mask))
+        finite = values if nonfinite == 0 else values[finite_mask]
+        if finite.size == 0:
+            return StatsResult(count=int(values.size), mean=None, std=None, min=None, max=None,
+                               nonfinite_count=nonfinite)
+        extremes = shortest_floats(np.array([finite.min(), finite.max()], dtype=values.dtype))
+        return StatsResult(
+            count=int(values.size),
+            mean=float(np.mean(finite, dtype=np.float64)),
+            std=float(np.std(finite, dtype=np.float64, ddof=0)),
+            min=extremes[0],
+            max=extremes[1],
+            nonfinite_count=nonfinite,
+        )
+
+
+# -- norm ----------------------------------------------------------------------------
+
+
+class NormResult(OperatorResult):
+    l1: float
+    l2: float
+    linf: float
+
+
+class NormOperator(BaseAnalysisOperator):
+    """L1, L2, and Linf norms of the flattened selection (float64 accumulation)."""
+
+    parameters_model = OperatorParameters
+    result_model = NormResult
+    spec = make_spec(
+        operator_id="tensor_norm",
+        version="1",
+        effect="analysis",
+        description="L1, L2, and Linf norms of a tensor selection, treated as a flat vector.",
+        required_capabilities=[CAP_WEIGHTS_READ],
+        parameters_model=OperatorParameters,
+        result_model=NormResult,
+        usage=_ANALYSIS_USAGE,
+    )
+
+    def analyze(self, region: TensorRegion, parameters: BaseModel) -> NormResult:
+        _require_finite(region, "norm")
+        values = region.values
+        magnitude = np.abs(values)
+        l1 = float(np.sum(magnitude, dtype=np.float64))
+        l2 = math.sqrt(float(np.sum(np.square(magnitude, dtype=np.float64))))
+        linf = shortest_floats(np.array([magnitude.max()], dtype=values.dtype))[0]
+        return NormResult(l1=l1, l2=l2, linf=linf)
+
+
+# -- top-k ---------------------------------------------------------------------------
+
+
+class TopKParameters(OperatorParameters):
+    k: int | None = Field(
+        default=None,
+        description=f"number of entries, 1 <= k <= min({MAX_TOP_K}, element_count); "
+        f"omitted means min({DEFAULT_TOP_K}, element_count)",
+    )
+
+
+class TopKEntry(BaseModel):
+    flat_index: int = Field(description="row-major index within the selection")
+    index: list[int] = Field(description="coordinates within the full tensor")
+    value: float
+
+
+class TopKResult(OperatorResult):
+    k: int
+    entries: list[TopKEntry]
+
+
+class TopKOperator(BaseAnalysisOperator):
+    """Entries with the largest absolute values.
+
+    Sorted by descending absolute value, then ascending flattened index for
+    ties (so ``-0.0`` and ``0.0`` tie and keep index order).
+    """
+
+    parameters_model = TopKParameters
+    result_model = TopKResult
+    spec = make_spec(
+        operator_id="tensor_top_k",
+        version="1",
+        effect="analysis",
+        description="The k entries of a tensor selection with the largest absolute values, sorted "
+        "by descending absolute value and then ascending flattened index.",
+        required_capabilities=[CAP_WEIGHTS_READ],
+        parameters_model=TopKParameters,
+        result_model=TopKResult,
+        usage=_ANALYSIS_USAGE,
+    )
+
+    def resolve_parameters(self, parameters: Mapping[str, Any], element_count: int) -> TopKParameters:
+        parsed = parse_parameters(self.spec, TopKParameters, parameters)
+        assert isinstance(parsed, TopKParameters)
+        upper = min(MAX_TOP_K, element_count)
+        if parsed.k is None:
+            return TopKParameters(k=min(DEFAULT_TOP_K, element_count))
+        if not 1 <= parsed.k <= upper:
+            raise WSEError(
+                ErrorCode.INVALID_ARGUMENT,
+                f"k must satisfy 1 <= k <= min({MAX_TOP_K}, element_count) = {upper} for this "
+                f"selection of {element_count} element(s); got k={parsed.k}",
+                details={"k": parsed.k, "max_k": upper, "element_count": element_count},
+            )
+        return parsed
+
+    def analyze(self, region: TensorRegion, parameters: BaseModel) -> TopKResult:
+        assert isinstance(parameters, TopKParameters) and parameters.k is not None
+        _require_finite(region, "top_k")
+        flat = region.values.reshape(-1)
+        magnitude = np.abs(flat)
+        k = parameters.k
+        if k < flat.size:
+            # Every element tied with the k-th largest magnitude stays a candidate,
+            # so the index tie-break is exact.
+            threshold = np.partition(magnitude, flat.size - k)[flat.size - k]
+            candidates = np.flatnonzero(magnitude >= threshold)
+        else:
+            candidates = np.arange(flat.size)
+        order = candidates[np.lexsort((candidates, -magnitude[candidates].astype(np.float64)))][:k]
+        values = shortest_floats(flat[order])
+        return TopKResult(
+            k=k,
+            entries=[
+                TopKEntry(flat_index=int(i), index=region.tensor_index(int(i)), value=value)
+                for i, value in zip(order, values)
+            ],
+        )
+
+
+BUILTIN_ANALYSES: dict[str, BaseAnalysisOperator] = {
+    "stats": StatsOperator(),
+    "norm": NormOperator(),
+    "top_k": TopKOperator(),
+}

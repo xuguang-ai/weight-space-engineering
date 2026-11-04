@@ -39,9 +39,12 @@ from wse.schemas import (
     canonical_json,
     json_hash,
 )
-from wse.tensors import normalize_tensors, resolve_selection, weights_hash
+from wse.tensors import normalize_tensors, weights_hash
 
 if TYPE_CHECKING:
+    from wse.adapters.base import AdapterCapabilities
+    from wse.policy import OperationPolicy
+    from wse.schemas import AnalysisResult, TensorSlice
     from wse.store import ArtifactStore, RecoveryReport
 
 DEFAULT_MAX_MODEL_BYTES = 64 * 1024 * 1024
@@ -325,10 +328,13 @@ class Engine:
         registry: Registry | None = None,
         recover: bool = True,
         max_bytes: int = DEFAULT_MAX_MODEL_BYTES,
+        policy: OperationPolicy | None = None,
     ) -> None:
+        from wse.policy import default_operation_policy
         from wse.store import ArtifactStore
 
         self.registry = registry or builtin_registry()
+        self.policy = policy or default_operation_policy()
         self.max_bytes = max_bytes
         self.store: ArtifactStore = ArtifactStore(workspace)
         self.last_recovery: RecoveryReport | None = self.store.recover() if recover else None
@@ -414,12 +420,82 @@ class Engine:
                     raise
         return manifests
 
-    def read_tensor(self, checkpoint_id: str, tensor: str, selection: Any) -> torch.Tensor:
-        """Read an exact-name tensor region from a READY checkpoint."""
+    def inspect(self, checkpoint_id: str) -> ModelManifest:
+        """Return the manifest of a READY checkpoint (no tensor data, no forward)."""
+        return self.store.load_manifest(checkpoint_id)
+
+    def _capabilities(self, manifest: ModelManifest) -> AdapterCapabilities:
+        _, adapter = _resolve_adapter(self.registry, manifest.adapter)
+        return adapter.capabilities()
+
+    def _bounded_read(self, checkpoint_id: str, tensor: str, selection: Any) -> tuple[TensorSlice, torch.Tensor]:
+        from wse.analysis import bounded_read
+
         manifest = self.store.load_manifest(checkpoint_id)
         info = manifest.tensor_info(tensor)
-        slices = resolve_selection(selection, info.shape, tensor=tensor)
-        return self.store.read_slice(checkpoint_id, tensor, slices)
+        return bounded_read(
+            info=info,
+            selection=selection,
+            policy=self.policy,
+            capabilities=self._capabilities(manifest),
+            adapter=manifest.adapter,
+            read_region=lambda slices: self.store.read_slice(checkpoint_id, info.name, slices),
+            checkpoint_id=checkpoint_id,
+            weights_hash=manifest.weights_hash,
+            management="managed",
+        )
+
+    def read_tensor_slice(self, checkpoint_id: str, tensor: str, selection: Any) -> TensorSlice:
+        """Bounded read of an exact-name tensor region, serialized for responses.
+
+        At most 2,048 elements and 32 KiB of canonical JSON; oversized requests
+        fail with the largest permitted selection.
+        """
+        return self._bounded_read(checkpoint_id, tensor, selection)[0]
+
+    def read_tensor(self, checkpoint_id: str, tensor: str, selection: Any) -> torch.Tensor:
+        """Read an exact-name tensor region from a READY checkpoint (same bounds)."""
+        return self._bounded_read(checkpoint_id, tensor, selection)[1]
+
+    def analyze(
+        self,
+        checkpoint_id: str,
+        kind: str,
+        tensor: str,
+        selection: Any,
+        k: int | None = None,
+        *,
+        parameters: Mapping[str, Any] | None = None,
+    ) -> AnalysisResult:
+        """Run a permitted, registered analysis on a READY checkpoint.
+
+        ``kind`` is a public alias resolved by the operation policy (``stats``,
+        ``norm``, ``top_k`` by default). An omitted ``k`` for top-k resolves to
+        ``min(16, element_count)``; other kinds do not accept ``k``.
+        """
+        from wse.analysis import run_analysis
+
+        manifest = self.store.load_manifest(checkpoint_id)
+        return run_analysis(
+            registry=self.registry,
+            policy=self.policy,
+            kind=kind,
+            info_for=manifest.tensor_info,
+            tensor=tensor,
+            selection=selection,
+            k=k,
+            parameters=parameters,
+            capabilities=self._capabilities(manifest),
+            model=manifest.identity,
+            read_region=lambda name, slices: self.store.read_slice(checkpoint_id, name, slices),
+            checkpoint_id=checkpoint_id,
+            management="managed",
+            store_large=self.store.put_analysis_result,
+        )
+
+    def read_analysis_result(self, uri: str) -> dict[str, Any]:
+        """Return a large analysis result stored behind ``AnalysisResult.result_uri``."""
+        return json.loads(self.store.read_analysis_result(uri))
 
     def open_checkpoint(self, checkpoint_id: str) -> ModelHandle:
         """Load a READY checkpoint into an in-memory handle (hash-verified).

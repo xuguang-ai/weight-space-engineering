@@ -44,10 +44,12 @@ from wse.tensors import weights_hash
 
 WEIGHTS_DIR = "weights"
 MANIFESTS_DIR = "manifests"
+ANALYSES_DIR = "analyses"
+ANALYSIS_URI_PREFIX = "wse://analyses/"
 TMP_DIR = "tmp"
 DEFAULT_RECOVERY_GRACE_SECONDS = 600.0
 _RELPATH_PATTERN = re.compile(
-    r"^(?:weights/[0-9a-f]{64}\.safetensors|manifests/[0-9a-f]{64}\.json)$"
+    r"^(?:weights/[0-9a-f]{64}\.safetensors|manifests/[0-9a-f]{64}\.json|analyses/[0-9a-f]{64}\.json)$"
 )
 _READ_ONLY = stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH
 
@@ -86,7 +88,12 @@ class ArtifactStore:
         self.workspace = Path(workspace)
         self.artifacts_dir = self.workspace / "artifacts"
         self.tmp_dir = self.artifacts_dir / TMP_DIR
-        for directory in (self.tmp_dir, self.artifacts_dir / WEIGHTS_DIR, self.artifacts_dir / MANIFESTS_DIR):
+        for directory in (
+            self.tmp_dir,
+            self.artifacts_dir / WEIGHTS_DIR,
+            self.artifacts_dir / MANIFESTS_DIR,
+            self.artifacts_dir / ANALYSES_DIR,
+        ):
             directory.mkdir(parents=True, exist_ok=True)
         self.db = Database(self.workspace / "metadata.sqlite")
         self._verified: dict[str, tuple[int, int, int]] = {}
@@ -243,6 +250,39 @@ class ArtifactStore:
             # A concurrent identical import won; this call's manifest file is an orphan.
             return self.load_manifest(winner)
         return manifest
+
+    # -- large analysis results -----------------------------------------------
+
+    def put_analysis_result(self, data: bytes) -> str:
+        """Store a large analysis result; return its ``wse://analyses/<sha256>`` URI.
+
+        These files are content-addressed and immutable. They are derived data
+        (recomputable from a READY checkpoint), carry no checkpoint metadata, and
+        are not part of the orphan scan.
+        """
+        digest = hashlib.sha256(data).hexdigest()
+        relpath = f"{ANALYSES_DIR}/{digest}.json"
+        if not self._artifact_path(relpath).is_file():
+            self._publish_bytes(relpath, data)
+        return ANALYSIS_URI_PREFIX + digest
+
+    def read_analysis_result(self, uri: str) -> bytes:
+        """Return the stored bytes of an analysis result URI after a hash check."""
+        digest = uri.removeprefix(ANALYSIS_URI_PREFIX) if isinstance(uri, str) else ""
+        if not (isinstance(uri, str) and uri.startswith(ANALYSIS_URI_PREFIX)
+                and re.fullmatch(r"[0-9a-f]{64}", digest)):
+            raise WSEError(
+                ErrorCode.INVALID_ARGUMENT,
+                f"{uri!r} is not an analysis result URI ({ANALYSIS_URI_PREFIX}<sha256 hex>)",
+            )
+        path = self._artifact_path(f"{ANALYSES_DIR}/{digest}.json")
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            raise WSEError(ErrorCode.NOT_FOUND, f"analysis result {uri} does not exist") from None
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"analysis result {uri} failed its hash check")
+        return data
 
     def _checkpoint_for_dedup_key(self, dedup_key: str) -> str | None:
         row = self.db.conn.execute(

@@ -49,9 +49,15 @@ def _validate_adapter(extension_id: str, version: str, implementation: Any) -> N
         )
 
 
+def _validate_operator(extension_id: str, version: str, implementation: Any) -> None:
+    from wse.operators.base import validate_operator
+
+    validate_operator(extension_id, version, implementation)
+
+
 # Per-kind compatibility checks run at registration time. Later milestones add
-# validators for operators, evaluators, and strategies here.
-KIND_VALIDATORS: dict[str, Validator] = {"adapter": _validate_adapter}
+# validators for evaluators and strategies here.
+KIND_VALIDATORS: dict[str, Validator] = {"adapter": _validate_adapter, "operator": _validate_operator}
 
 
 class Registry:
@@ -123,8 +129,11 @@ class Registry:
 def builtin_registry() -> Registry:
     """Return a new registry containing the built-in M1 extensions."""
     from wse.adapters.mlp import MLPAdapter
+    from wse.operators.tensor import BUILTIN_ANALYSES
 
     registry = Registry()
     adapter = MLPAdapter()
     registry.register("adapter", adapter.adapter_id, adapter.version, adapter)
+    for operator in BUILTIN_ANALYSES.values():
+        registry.register("operator", operator.spec.operator_id, operator.spec.version, operator)
     return registry

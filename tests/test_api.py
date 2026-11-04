@@ -44,6 +44,11 @@ def test_in_memory_load_needs_neither_sqlite_nor_mcp(tmp_path):
         from wse import load_model
         handle = load_model(fixture.task_tensors(), "mlp@1", fixture.CONFIG)
         assert handle.weights_hash.startswith("sha256:")
+        from wse import analyze_tensor, read_tensor_slice
+        full = [dict(start=0, stop=4, step=1), dict(start=0, stop=2, step=1)]
+        for kind in ("stats", "norm", "top_k"):
+            assert analyze_tensor(handle, kind, "layers.0.weight", full).management == "unmanaged"
+        assert read_tensor_slice(handle, "layers.0.weight", full).element_count == 8
         assert os.listdir(".") == [], os.listdir(".")
         print("ok")
         """
@@ -57,6 +62,7 @@ def test_core_imports_no_mcp_or_agent_sdk():
         """
         import sys
         import wse, wse.api, wse.cli, wse.store, wse.database, wse.registry, wse.adapters.mlp
+        import wse.analysis, wse.policy, wse.operators.base, wse.operators.tensor
         loaded = sorted(m for m in sys.modules
                         if m.split(".")[0] in ("mcp", "agents", "openai", "claude_agent_sdk"))
         print(loaded)

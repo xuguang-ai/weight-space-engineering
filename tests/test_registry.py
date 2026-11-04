@@ -9,7 +9,9 @@ from wse.adapters.base import CAP_WEIGHTS_READ, AdapterCapabilities, ModelAdapte
 from wse.adapters.mlp import MLPAdapter
 from wse.api import load_model
 from wse.registry import EXTENSION_KINDS, Registry, builtin_registry
-from wse.schemas import ErrorCode, ExtensionRef, WSEError
+from wse.operators.base import BaseAnalysisOperator, OperatorParameters, OperatorResult, make_spec
+from wse.operators.tensor import TopKParameters, TopKResult
+from wse.schemas import ErrorCode, ExtensionRef, OperatorSpec, UsageContract, WSEError
 
 
 class ScaleAdapter(MLPAdapter):
@@ -40,7 +42,11 @@ def test_builtin_registry_contains_mlp_adapter():
     assert isinstance(adapter, MLPAdapter)
     assert isinstance(adapter, ModelAdapter)
     assert registry.list("adapter") == [ExtensionRef.parse("mlp@1")]
-    assert registry.list("operator") == []
+    assert registry.list("operator") == [
+        ExtensionRef.parse("tensor_norm@1"),
+        ExtensionRef.parse("tensor_stats@1"),
+        ExtensionRef.parse("tensor_top_k@1"),
+    ]
 
 
 def test_resolve_is_exact_and_never_substitutes_versions():
@@ -123,3 +129,107 @@ def test_separately_supplied_adapter_works_without_core_changes(signed_sum):
     plain = load_model(signed_sum.reference_tensors(), "mlp@1", signed_sum.CONFIG)
     assert plain.weights_hash == handle.weights_hash
     assert plain.identity != handle.identity
+
+
+# -- operators ---------------------------------------------------------------------------
+
+
+def test_builtin_analyses_are_registered_through_operator_specs():
+    registry = builtin_registry()
+    for ref in ("tensor_stats@1", "tensor_norm@1", "tensor_top_k@1"):
+        operator = registry.resolve_ref("operator", ref)
+        spec = operator.spec
+        assert isinstance(spec, OperatorSpec) and str(spec.ref) == ref
+        assert spec.effect == "analysis"
+        assert spec.required_capabilities == [CAP_WEIGHTS_READ]
+        assert spec.usage == UsageContract(counter="analysis_calls", units_per_call=1, model_forward_calls=0)
+        assert spec.input_schema == operator.parameters_model.model_json_schema()
+        assert spec.output_schema == operator.result_model.model_json_schema()
+    top_k = registry.resolve_ref("operator", "tensor_top_k@1").spec
+    assert top_k.input_schema == TopKParameters.model_json_schema()
+    assert "k" in top_k.input_schema["properties"]
+    assert top_k.output_schema == TopKResult.model_json_schema()
+    stats = registry.resolve_ref("operator", "tensor_stats@1").spec
+    assert stats.input_schema["properties"] == {}
+    with pytest.raises(WSEError) as excinfo:
+        registry.resolve("operator", "tensor_stats", "2")
+    assert excinfo.value.code == ErrorCode.NOT_FOUND
+
+
+class _Result(OperatorResult):
+    value: float
+
+
+def _spec(operator_id="custom", version="1", effect="analysis", parameters=OperatorParameters, result=_Result):
+    return make_spec(operator_id=operator_id, version=version, effect=effect, description="custom op",
+                     required_capabilities=[CAP_WEIGHTS_READ], parameters_model=parameters,
+                     result_model=result, usage=UsageContract(counter="analysis_calls"))
+
+
+class _Custom(BaseAnalysisOperator):
+    result_model = _Result
+    spec = _spec()
+
+    def analyze(self, region, parameters):
+        return _Result(value=0.0)
+
+
+def test_separately_supplied_operator_registers_without_core_changes():
+    registry = builtin_registry()
+    registry.register("operator", "custom", "1", _Custom())
+    assert ExtensionRef.parse("custom@1") in registry.list("operator")
+    with pytest.raises(WSEError) as excinfo:
+        registry.register("operator", "custom", "1", _Custom())
+    assert excinfo.value.code == ErrorCode.VERSION_CONFLICT
+
+
+def test_operator_registration_validates_the_contract():
+    registry = Registry()
+
+    def rejected(implementation, extension_id="custom", version="1"):
+        with pytest.raises(WSEError) as excinfo:
+            registry.register("operator", extension_id, version, implementation)
+        assert excinfo.value.code == ErrorCode.INVALID_ARGUMENT
+        return excinfo.value
+
+    rejected(object())  # no spec
+    rejected(_Custom(), version="2")  # spec declares custom@1
+    rejected(_Custom(), extension_id="other")
+
+    class NoAnalyze:
+        spec = _spec()
+        parameters_model = OperatorParameters
+        result_model = _Result
+
+        def resolve_parameters(self, parameters, element_count):
+            return OperatorParameters()
+
+    assert "analyze" in rejected(NoAnalyze()).details["missing_methods"]
+
+    class DriftingSchema(_Custom):
+        spec = _spec(parameters=TopKParameters)  # advertises k but validates no parameters
+
+    rejected(DriftingSchema())
+
+    class NotPydantic(_Custom):
+        result_model = dict
+
+    rejected(NotPydantic())
+
+    class EditWithoutApply(_Custom):
+        spec = _spec(effect="edit")
+
+    assert "apply" in rejected(EditWithoutApply()).details["missing_methods"]
+
+
+def test_operator_spec_rejects_malformed_identity_and_effects():
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        _spec(operator_id="Bad-Name")
+    with pytest.raises(ValidationError):
+        _spec(version="latest")
+    with pytest.raises(ValidationError):
+        _spec(effect="train")
+    with pytest.raises(ValidationError):
+        UsageContract(counter="free_lunch")

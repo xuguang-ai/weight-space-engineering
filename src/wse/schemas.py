@@ -52,6 +52,7 @@ class ErrorCode(StrEnum):
     INVALID_ARGUMENT = "INVALID_ARGUMENT"
     INVALID_MODEL = "INVALID_MODEL"
     ARTIFACT_CORRUPT = "ARTIFACT_CORRUPT"
+    UNSUPPORTED_CAPABILITY = "UNSUPPORTED_CAPABILITY"
 
 
 class DomainError(BaseModel):
@@ -507,3 +508,120 @@ class MaterializedPatch(_Frozen):
 
 
 Management = Literal["unmanaged", "managed"]
+
+
+# ---------------------------------------------------------------------------
+# Operators
+# ---------------------------------------------------------------------------
+
+OperatorEffect = Literal["analysis", "probe", "edit"]
+
+UsageCounter = Literal[
+    "analysis_calls",
+    "tensor_read_calls",
+    "candidate_commits",
+    "model_forward_calls",
+    "evaluation_batches",
+    "evaluated_examples",
+]
+
+
+class UsageContract(_Frozen):
+    """How one invocation of an operator is charged against a budget."""
+
+    counter: UsageCounter
+    units_per_call: int = Field(default=1, ge=1)
+    model_forward_calls: Literal[0] | None = Field(
+        default=0,
+        description="0 when the operator never runs the target network; None when it may",
+    )
+
+
+class OperatorSpec(_Frozen):
+    """Identity and contract of a registered operator.
+
+    ``input_schema`` describes the operator's own parameters (for example
+    ``k`` of top-k); the tensor and selection are common to every analysis.
+    The engine dispatches by this spec; interface adapters contain no
+    operator-specific algorithms.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    operator_id: str = Field(pattern=EXTENSION_ID_PATTERN.pattern)
+    version: str = Field(pattern=VERSION_PATTERN.pattern)
+    effect: OperatorEffect
+    description: str = Field(min_length=1, max_length=1024)
+    required_capabilities: list[str]
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any]
+    usage: UsageContract
+
+    @field_validator("required_capabilities")
+    @classmethod
+    def _sorted_unique(cls, value: list[str]) -> list[str]:
+        return sorted(set(value))
+
+    @field_validator("input_schema", "output_schema")
+    @classmethod
+    def _plain_json(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _check_json_object(value)
+
+    @property
+    def ref(self) -> ExtensionRef:
+        return ExtensionRef(extension_id=self.operator_id, version=self.version)
+
+
+# ---------------------------------------------------------------------------
+# Bounded reads and analyses
+# ---------------------------------------------------------------------------
+
+
+class TensorSlice(_Frozen):
+    """A bounded, JSON-serializable region of one stored tensor.
+
+    ``values`` are row-major and use the shortest decimal digits that
+    round-trip the stored dtype. ``checkpoint_id`` is ``None`` for direct use.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    checkpoint_id: str | None
+    weights_hash: str
+    tensor: str
+    dtype: str
+    axes: list[str]
+    tensor_shape: list[int]
+    selection: list[AxisSlice]
+    shape: list[int]
+    element_count: int
+    values: list[float]
+    usage: Usage
+    management: Management
+
+
+class AnalysisResult(_Frozen):
+    """Result of one registered analysis of a tensor region.
+
+    ``input_hash`` binds the operator, model identity, tensor, selection, and
+    resolved parameters. ``result`` holds the numerical results inline; when
+    they exceed the inline response limit of a managed call, ``result`` is
+    ``None`` and ``result_uri`` references the stored content, whose hash is
+    ``result_hash``. ``checkpoint_id`` is ``None`` for direct use.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    kind: str
+    operator: ExtensionRef
+    checkpoint_id: str | None
+    model: ModelIdentity
+    tensor: str
+    selection: list[AxisSlice]
+    element_count: int
+    parameters: dict[str, Any]
+    input_hash: str
+    result: dict[str, Any] | None
+    result_hash: str
+    result_bytes: int
+    result_uri: str | None = None
+    elapsed_seconds: float
+    usage: Usage
+    management: Management
