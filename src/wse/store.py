@@ -110,8 +110,11 @@ class ArtifactStore:
     def _publish(self, relpath: str, write: Callable[[Path], None]) -> tuple[str, int]:
         """Write a file through ``tmp/`` and publish it at ``relpath``.
 
-        Returns the file's SHA-256 hex digest and size. Publishing the same
-        content again is a no-op.
+        Returns the file's SHA-256 hex digest and size. The fresh file always
+        replaces any existing file at ``relpath`` (same content, by
+        construction), so a published file is never older than the recovery
+        grace period when its database commit runs, even if an earlier crashed
+        operation left an identical orphan behind.
         """
         final = self._artifact_path(relpath)
         temp = self.tmp_dir / f"{uuid.uuid4().hex}.part"
@@ -120,11 +123,8 @@ class ArtifactStore:
             _fsync_path(temp)
             os.chmod(temp, _READ_ONLY)
             digest, size = _file_sha256(temp), temp.stat().st_size
-            if final.exists() and _file_sha256(final) == digest:
-                temp.unlink()
-            else:
-                os.replace(temp, final)
-                _fsync_path(final.parent)
+            os.replace(temp, final)
+            _fsync_path(final.parent)
         except BaseException:
             temp.unlink(missing_ok=True)
             raise
@@ -190,6 +190,15 @@ class ArtifactStore:
                 ).fetchone()
                 winner = found["checkpoint_id"] if found else None
             if winner is None:
+                # Recovery deletes orphans inside its own write transaction, so a
+                # file that exists here cannot be removed before this commit.
+                for relpath in (weights_rel, manifest_rel):
+                    if not self._artifact_path(relpath).is_file():
+                        raise WSEError(
+                            ErrorCode.ARTIFACT_CORRUPT,
+                            f"published artifact {relpath} disappeared before commit; retry the operation",
+                            retryable=True,
+                        )
                 conn.execute(
                     "INSERT OR IGNORE INTO artifacts (artifact_id, kind, content_hash, file_sha256, "
                     "relpath, size_bytes, created_at) VALUES (?, 'weights', ?, ?, ?, ?, ?)",
@@ -374,14 +383,18 @@ class ArtifactStore:
             if path.is_file() and path.stat().st_mtime <= cutoff:
                 path.unlink(missing_ok=True)
                 report.removed_temp_files.append(path.name)
-        referenced = {row["relpath"] for row in self.db.conn.execute("SELECT relpath FROM artifacts")}
-        for directory in (WEIGHTS_DIR, MANIFESTS_DIR):
-            for path in sorted((self.artifacts_dir / directory).iterdir()):
-                relpath = f"{directory}/{path.name}"
-                if relpath in referenced or not path.is_file() or path.stat().st_mtime > cutoff:
-                    continue
-                path.unlink(missing_ok=True)
-                report.removed_orphans.append(relpath)
+        # Hold the write lock while deleting orphans: a concurrent commit checks
+        # that its files exist inside its own write transaction, so it either
+        # commits first (and its files are referenced here) or sees the deletion.
+        with self.db.transaction() as conn:
+            referenced = {row["relpath"] for row in conn.execute("SELECT relpath FROM artifacts")}
+            for directory in (WEIGHTS_DIR, MANIFESTS_DIR):
+                for path in sorted((self.artifacts_dir / directory).iterdir()):
+                    relpath = f"{directory}/{path.name}"
+                    if relpath in referenced or not path.is_file() or path.stat().st_mtime > cutoff:
+                        continue
+                    path.unlink(missing_ok=True)
+                    report.removed_orphans.append(relpath)
         rows = self.db.conn.execute(
             "SELECT DISTINCT a.* FROM artifacts a JOIN checkpoints c "
             "ON a.artifact_id IN (c.weights_artifact_id, c.manifest_artifact_id) WHERE c.state = 'READY'"

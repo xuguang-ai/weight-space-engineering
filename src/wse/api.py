@@ -133,6 +133,20 @@ def _resolve_adapter(registry: Registry, adapter: str | ExtensionRef) -> tuple[E
     return ref, registry.resolve("adapter", ref.extension_id, ref.version)
 
 
+def canonical_config(adapter: ModelAdapter, config: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the adapter-normalized configuration used for model identity.
+
+    Adapters may implement ``canonical_config(config)`` to fill defaults so
+    that configurations describing the same architecture hash identically.
+    Adapters without it are hashed over the configuration as supplied.
+    """
+    normalize = getattr(adapter, "canonical_config", None)
+    normalized = normalize(config) if callable(normalize) else config
+    if not isinstance(normalized, Mapping):
+        raise WSEError(ErrorCode.INVALID_MODEL, "adapter canonical_config() must return a JSON object")
+    return json.loads(canonical_json(dict(normalized)))
+
+
 def _build_handle(
     adapter_ref: ExtensionRef,
     adapter: ModelAdapter,
@@ -141,10 +155,11 @@ def _build_handle(
 ) -> ModelHandle:
     architecture = adapter.validate(manifest, tensors)
     ordered = {info.name: tensors[info.name] for info in architecture.tensors}
+    config = canonical_config(adapter, manifest.config)
     return ModelHandle(
         adapter_ref=adapter_ref,
-        config_json=canonical_json(manifest.config),
-        config_hash=json_hash(manifest.config),
+        config_json=canonical_json(config),
+        config_hash=json_hash(config),
         weights_hash=weights_hash(ordered),
         architecture=architecture,
         adapter=adapter,
@@ -348,15 +363,19 @@ class Engine:
         architecture = handle.architecture
         if architecture.alias_groups:
             raise WSEError(ErrorCode.INVALID_MODEL, "shared parameters are not supported in this milestone")
+        config = handle.config
         dedup_key = json_hash(
-            {"import": request.model_dump(mode="json"), "weights_hash": handle.weights_hash}
+            {
+                "import": {**request.model_dump(mode="json"), "config": config},
+                "weights_hash": handle.weights_hash,
+            }
         )
         model_manifest = ModelManifest(
             checkpoint_id=self.store.new_checkpoint_id(),
             weights_hash=handle.weights_hash,
             config_hash=handle.config_hash,
             adapter=adapter_ref,
-            config=request.config,
+            config=config,
             tensors=architecture.tensors,
             parameter_count=architecture.parameter_count,
             input_semantics=architecture.input_semantics.model_copy(
@@ -366,7 +385,7 @@ class Engine:
                 update={"description": request.output_description or architecture.output_semantics.description}
             ),
             alias_groups=architecture.alias_groups,
-            provenance=request.provenance,
+            provenance=request.provenance.to_provenance(),
             license=request.license,
         )
         return self.store.commit_checkpoint(
@@ -403,7 +422,13 @@ class Engine:
         return self.store.read_slice(checkpoint_id, tensor, slices)
 
     def open_checkpoint(self, checkpoint_id: str) -> ModelHandle:
-        """Load a READY checkpoint into an in-memory handle (hash-verified)."""
+        """Load a READY checkpoint into an in-memory handle (hash-verified).
+
+        Operator use only. The returned handle's ``forward`` runs the adapter
+        directly with no policy or budget check, so this method must never be
+        reachable from an agent-facing path; managed inference goes through
+        the worker.
+        """
         manifest = self.store.load_manifest(checkpoint_id)
         adapter_ref, adapter = _resolve_adapter(self.registry, manifest.adapter)
         handle = _build_handle(adapter_ref, adapter, manifest, self.store.load_tensors(checkpoint_id))

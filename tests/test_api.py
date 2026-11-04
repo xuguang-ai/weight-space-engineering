@@ -14,7 +14,7 @@ import torch
 from pydantic import ValidationError
 from safetensors.torch import save_file
 
-from wse.api import EditResult, EvaluationResult, load_model
+from wse.api import EditResult, Engine, EvaluationResult, load_model
 from wse.schemas import ErrorCode, MetricGate, ObjectiveSpec, Usage, WSEError
 from wse.tensors import weights_hash
 
@@ -196,3 +196,40 @@ def test_core_results_carry_no_experiment_ids():
         assert not any("experiment" in name or "report_id" in name for name in names)
         assert "management" in names
     assert Usage().model_forward_calls is None  # unavailable, not zero
+
+
+def test_config_hash_uses_the_adapter_normalized_config(signed_sum):
+    full = load_model(signed_sum.task_tensors(), "mlp@1", signed_sum.CONFIG)
+    minimal = load_model(signed_sum.task_tensors(), "mlp@1", {"layer_sizes": [2, 4, 2]})
+    assert minimal.config_hash == full.config_hash
+    assert minimal.config == full.config
+    other = load_model(
+        {k: v for k, v in signed_sum.task_tensors().items() if k.endswith("weight")},
+        "mlp@1", {"layer_sizes": [2, 4, 2], "bias": False},
+    )
+    assert other.config_hash != full.config_hash
+
+
+def test_equivalent_configs_deduplicate_on_import(tmp_path, signed_sum):
+    with Engine(tmp_path / "ws") as engine:
+        first = engine.import_model({"adapter": "mlp@1", "config": signed_sum.CONFIG},
+                                    signed_sum.task_tensors())
+        second = engine.import_model({"adapter": "mlp@1", "config": {"layer_sizes": [2, 4, 2]}},
+                                     signed_sum.task_tensors())
+    assert second.checkpoint_id == first.checkpoint_id
+    assert first.config == signed_sum.CONFIG
+
+
+def test_numpy_arrays_with_negative_strides_or_foreign_byte_order_load(signed_sum):
+    tensors = {name: t.numpy() for name, t in signed_sum.task_tensors().items()}
+    expected = load_model(tensors, "mlp@1", signed_sum.CONFIG)
+    weight = tensors["layers.0.weight"]
+    reversed_rows = np.ascontiguousarray(weight[::-1])
+    variants = dict(tensors)
+    variants["layers.0.weight"] = reversed_rows[::-1]  # negative stride, same values
+    variants["layers.1.weight"] = tensors["layers.1.weight"].astype(">f4")
+    handle = load_model(variants, "mlp@1", signed_sum.CONFIG)
+    assert handle.weights_hash == expected.weights_hash
+    with pytest.raises(WSEError) as excinfo:
+        load_model({**tensors, "layers.0.bias": np.array([object()] * 4)}, "mlp@1", signed_sum.CONFIG)
+    assert excinfo.value.code == ErrorCode.INVALID_MODEL

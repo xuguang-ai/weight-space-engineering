@@ -269,6 +269,22 @@ class Provenance(_Frozen):
     notes: str = Field(default="", max_length=1024)
 
 
+class ImportProvenance(_Frozen):
+    """Operator-supplied provenance labels accepted by an import request.
+
+    Lineage (``parent_checkpoint_id``) is deliberately absent: the server
+    derives it when it creates a checkpoint from another one and never trusts
+    a client-asserted parent. Imports always have ``kind="import"``.
+    """
+
+    kind: Literal["import"] = "import"
+    source: str = Field(default="", max_length=256)
+    notes: str = Field(default="", max_length=1024)
+
+    def to_provenance(self) -> Provenance:
+        return Provenance(kind=self.kind, source=self.source, notes=self.notes)
+
+
 class ImportManifest(_Frozen):
     """Operator-supplied description of a model to import.
 
@@ -280,7 +296,7 @@ class ImportManifest(_Frozen):
     schema_version: Literal["1"] = SCHEMA_VERSION
     adapter: ExtensionRef
     config: dict[str, Any]
-    provenance: Provenance = Field(default_factory=Provenance)
+    provenance: ImportProvenance = Field(default_factory=ImportProvenance)
     license: str = Field(default="unspecified", min_length=1, max_length=256)
     input_description: str = Field(default="", max_length=1024)
     output_description: str = Field(default="", max_length=1024)
@@ -302,7 +318,7 @@ class BundleManifest(_Frozen):
     adapter: ExtensionRef
     weights: str = Field(min_length=1, max_length=255)
     config: str = Field(min_length=1, max_length=255)
-    provenance: Provenance = Field(default_factory=Provenance)
+    provenance: ImportProvenance = Field(default_factory=ImportProvenance)
     license: str = Field(default="unspecified", min_length=1, max_length=256)
     input_description: str = Field(default="", max_length=1024)
     output_description: str = Field(default="", max_length=1024)

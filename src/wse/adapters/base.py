@@ -6,6 +6,10 @@ advertises capabilities explicitly; tensor access does not imply support for
 any other operation. Adapters never execute code shipped with a model.
 
 In managed experiments only the worker may call ``forward``.
+
+Adapters may also implement ``canonical_config(config) -> dict``, returning the
+configuration with defaults filled in; model identity hashes that normalized
+configuration so equivalent configurations share one identity.
 """
 
 from __future__ import annotations

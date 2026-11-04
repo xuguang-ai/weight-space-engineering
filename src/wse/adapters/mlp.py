@@ -70,6 +70,10 @@ class MLPAdapter:
                 )
         return parsed
 
+    def canonical_config(self, config: Mapping[str, Any]) -> dict[str, Any]:
+        """The configuration with defaults filled in, used for model identity."""
+        return self.parse_config(config).model_dump(mode="json")
+
     def describe(self, config: Mapping[str, Any]) -> Architecture:
         parsed = self.parse_config(config)
         tensors: list[TensorInfo] = []

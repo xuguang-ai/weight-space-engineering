@@ -403,8 +403,74 @@ def test_task_manifest_does_not_reveal_the_fault(workspace, bundles):
         assert forbidden not in rendered, forbidden
     manifest, _ = read_bundle(bundles["task"])
     assert manifest.provenance.model_dump() == {
-        "kind": "import", "source": "signed_sum model v1", "parent_checkpoint_id": None, "notes": ""
+        "kind": "import", "source": "signed_sum model v1", "notes": ""
     }
+    assert task.provenance.parent_checkpoint_id is None
+
+
+def test_import_rejects_client_asserted_lineage(engine, workspace, bundles, signed_sum):
+    reference = engine.import_bundle(bundles["reference"])
+    for parent in [reference.checkpoint_id, "ckpt_" + "0" * 32, "not-an-id"]:
+        _expect(ErrorCode.INVALID_ARGUMENT, engine.import_model,
+                _import_request(signed_sum, provenance={"parent_checkpoint_id": parent}),
+                signed_sum.task_tensors())
+    _expect(ErrorCode.INVALID_ARGUMENT, engine.import_model,
+            _import_request(signed_sum, provenance={"kind": "patch"}), signed_sum.task_tensors())
+    bundle_file = bundles["task"] / "wse_bundle.json"
+    data = json.loads(bundle_file.read_text())
+    data["provenance"]["parent_checkpoint_id"] = reference.checkpoint_id
+    bundle_file.write_text(json.dumps(data))
+    _expect(ErrorCode.INVALID_ARGUMENT, engine.import_bundle, bundles["task"])
+    assert _checkpoint_count(workspace) == 1
+
+
+def test_reused_orphan_is_refreshed_so_concurrent_recovery_cannot_delete_it(workspace, signed_sum):
+    with Engine(workspace) as engine:
+        manifest = engine.import_model(_import_request(signed_sum), signed_sum.task_tensors())
+    weights = _files(workspace, "weights")[0]
+    payload = weights.read_bytes()
+    # Simulate an orphan left by an earlier crashed import: same content, no metadata, old mtime.
+    shutil.rmtree(workspace)
+    with Engine(workspace):
+        pass
+    orphan = workspace / "artifacts" / "weights" / weights.name
+    orphan.write_bytes(payload)
+    old = orphan.stat().st_mtime - 3600
+    os.utime(orphan, (old, old))
+    with Engine(workspace, recover=False) as engine:
+        original_publish = engine.store._publish_bytes
+
+        def publish_then_recover(relpath, data):
+            result = original_publish(relpath, data)
+            with Engine(workspace):  # a concurrent startup recovery scan
+                pass
+            return result
+
+        engine.store._publish_bytes = publish_then_recover
+        again = engine.import_model(_import_request(signed_sum), signed_sum.task_tensors())
+        assert again.weights_hash == manifest.weights_hash
+        assert orphan.is_file()
+    with Engine(workspace) as engine:
+        assert engine.last_recovery.corrupted_checkpoints == []
+        assert engine.store.checkpoint_state(again.checkpoint_id) == "READY"
+        engine.store.load_tensors(again.checkpoint_id)
+
+
+def test_commit_fails_cleanly_when_a_published_file_vanishes(workspace, signed_sum):
+    with Engine(workspace) as engine:
+        original_publish = engine.store._publish_bytes
+
+        def publish_then_delete(relpath, data):
+            result = original_publish(relpath, data)
+            for path in _files(workspace, "weights"):
+                path.unlink()
+            return result
+
+        engine.store._publish_bytes = publish_then_delete
+        with pytest.raises(WSEError) as excinfo:
+            engine.import_model(_import_request(signed_sum), signed_sum.task_tensors())
+        assert excinfo.value.code == ErrorCode.ARTIFACT_CORRUPT and excinfo.value.retryable
+    assert _checkpoint_count(workspace) == 0
 
 
 # -- CLI ----------------------------------------------------------------------------------------

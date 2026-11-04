@@ -60,7 +60,7 @@ def normalize_tensors(tensors: Mapping[str, Any]) -> dict[str, torch.Tensor]:
     for name in sorted(tensors, key=_name_key):
         value = tensors[name]
         if isinstance(value, np.ndarray):
-            tensor = torch.from_numpy(value)
+            tensor = _from_numpy(name, value)
         elif isinstance(value, torch.Tensor):
             tensor = value
         else:
@@ -76,6 +76,23 @@ def normalize_tensors(tensors: Mapping[str, Any]) -> dict[str, torch.Tensor]:
         converted[name] = tensor.detach().clone(memory_format=torch.contiguous_format)
     _reject_shared_memory(originals)
     return converted
+
+
+def _from_numpy(name: str, value: np.ndarray) -> torch.Tensor:
+    """Convert an array, normalizing negative strides and non-native byte order."""
+    array = value
+    if not array.dtype.isnative:
+        array = array.astype(array.dtype.newbyteorder("="))
+    if any(stride < 0 for stride in array.strides):
+        array = np.ascontiguousarray(array)
+    try:
+        return torch.from_numpy(array)
+    except (TypeError, ValueError) as exc:
+        raise WSEError(
+            ErrorCode.INVALID_MODEL,
+            f"tensor {name!r} has an unsupported numpy array ({array.dtype}): {exc}",
+            details={"tensor": name},
+        ) from exc
 
 
 def _name_key(name: Any) -> str:
