@@ -51,7 +51,7 @@ Translate natural-language goals into an inspectable loop: **inspect the model â
 
 MCP interfaces should return tensor summaries, bounded slices, and artifact references rather than placing an entire large model in context. Each patch should record the baseline hash, modified regions, numerical changes, a short rationale, and evidence. Static analysis, dynamic probes, development evaluation, and final blind evaluation should have separate permissions and accounting. Validate this loop on controlled small models before extending it to real LLMs. Harness engineering correctness and the Agent's ability to discover effective edits should be separate acceptance criteria.
 
-See the [Agentic Weight-Space Engineering Harness Implementation Plan](./agentic-weight-space-engineering-plan.md) for the construction roadmap.
+See the [Weight-Space Engineering Framework â€” Initial Implementation Plan](./agentic-weight-space-engineering-plan.md) for the construction roadmap.
 
 The project direction was broadened on 2026-11-04 to a reusable weight-engineering framework with a standalone Python core, managed experiments, and CLI/MCP interfaces. The article remains a research reference rather than the limit of the framework's scope. See the [framework vision](./weight-space-engineering-vision.md).
 

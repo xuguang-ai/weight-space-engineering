@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11+, official MCP Python SDK 2.3.0, PyTorch, NumPy, Pydantic, safetensors, SQLite, and pytest. The M1 reference agent uses OpenAI Agents SDK for Python as an optional dependency; Claude Agent SDK follows in M2. Start with local stdio, then add remote GPU Workers and Streamable HTTP.
 
-**Date and status:** Created 2026-11-03; direction and agent selection revised 2026-11-04. The user selected an end-to-end loop on small models as the first phase, a general weight-engineering framework as the long-term objective, and OpenAI Agents SDK for Python as the first reference agent, followed by Claude Agent SDK. Read the [framework vision](./weight-space-engineering-vision.md) alongside this plan and the [article summary](./weight-space-programming-summary.md). Target-model hardware remains unspecified, so M1 uses CPU execution. The concrete agent model, credentials, and agent SDK versions remain implementation configuration. Recheck compatibility and lock dependencies during implementation.
+**Date and status:** Created 2026-11-03; direction and agent selection revised 2026-11-04, followed the same day by corrections to tool naming, response limits, task ordering, trial isolation, and interval reporting. The user selected an end-to-end loop on small models as the first phase, a general weight-engineering framework as the long-term objective, and OpenAI Agents SDK for Python as the first reference agent, followed by Claude Agent SDK. Read the [framework vision](./weight-space-engineering-vision.md) alongside this plan and the [article summary](./weight-space-programming-summary.md). Target-model hardware remains unspecified, so M1 uses CPU execution. The concrete agent model, credentials, and agent SDK versions remain implementation configuration. Recheck compatibility and lock dependencies during implementation. Development uses uv and a local Git repository with no remote.
 
 ## Global Constraints
 
@@ -61,15 +61,15 @@ The managed service wraps these same implementations, assigns artifact/report ID
 
 Use **OpenAI Agents SDK for Python** for the M1 reference agent. Add **Claude Agent SDK** in M2 to verify reuse across agent runtimes. Keep both behind optional adapters; WSE remains usable through direct Python, scripted strategies, and other MCP clients.
 
-The OpenAI integration uses the SDK's agent/tool loop and local stdio MCP connection. It exposes only the permitted WSE tools in the initial benchmark profile. The SDK handles conversation and model invocation; all weight operations, job scheduling, budget checks, candidate selection, and evaluation remain in WSE. This follows the application-owned runtime and local MCP integration described in the [Agents SDK guide](https://developers.openai.com/api/docs/guides/agents/sdk) and [MCP integration guide](https://developers.openai.com/api/docs/guides/agents/integrations-observability).
+The OpenAI integration uses the SDK's agent/tool loop and local stdio MCP connection. It exposes only the permitted WSE tools in the initial benchmark profile. By default the SDK forwards MCP tool names verbatim as model function names, shows the model the text content of tool results rather than `structuredContent` (`use_structured_content=False`), and exposes MCP resources only to application code; Sections 4.1 and 4.2 constrain tool names and result contents accordingly. The SDK handles conversation and model invocation; all weight operations, job scheduling, budget checks, candidate selection, and evaluation remain in WSE. This follows the application-owned runtime and local MCP integration described in the [Agents SDK guide](https://developers.openai.com/api/docs/guides/agents/sdk) and [MCP integration guide](https://developers.openai.com/api/docs/guides/agents/integrations-observability).
 
 Define a vendor-neutral `AgentAdapter` with `run(experiment_id, agent_config, event_sink) -> AgentRunResult` and `cancel(experiment_id)`. `AgentRunResult` contains a termination status/reason, final message, optional conversation reference, usage, and provider metadata. It does not select a checkpoint or close the experiment. The runner reads authoritative state from WSE, settles outstanding jobs, and applies the freeze protocol after the SDK exits.
 
 The runner persists the experiment before starting the adapter. Pass the same workspace/database location and run grant explicitly to the stdio server subprocess. The MCP server process is the sole job-scheduler owner for the reference agent run; the outer runner must not start a second scheduler. The runner manages the adapter's lifecycle so the MCP connection and server remain alive after the SDK loop returns, until pending work is settled and the experiment is frozen. On unexpected server loss, complete WSE recovery before attempting finalization. Reconnection refreshes state from WSE, and SDK conversation resume never resets the experiment budget.
 
-Set initial controller limits to 100 SDK turns and 900 seconds of wall time per trial, independently of WSE's 300-second computation budget. These are configurable pilot limits, not expected task costs. The adapter records the terminal reason, propagates cancellation to the SDK, and asks WSE to cancel or drain active jobs before freezing. Observed stop conditions and budget errors must terminate the controller rather than let it repeatedly request denied work.
+Set initial controller limits to 100 SDK turns and 900 seconds of wall time per trial, independently of WSE's 300-second computation budget. Pass `max_turns=100` explicitly, because the SDK default is 10. These are configurable pilot limits, not expected task costs. The adapter records the terminal reason, propagates cancellation to the SDK, and asks WSE to cancel or drain active jobs before freezing. Observed stop conditions and budget errors must terminate the controller rather than let it repeatedly request denied work.
 
-Plan optional extras `agents-openai` (`openai-agents`) and, in M2, `agents-claude` (`claude-agent-sdk`). Their imports live inside the corresponding adapter modules. Installation of the base package and its core tests must succeed without either extra. SDK-level traces are supplemental; WSE audit records and the budget ledger remain authoritative.
+Plan optional extras `agents-openai` (`openai-agents`) and, in M2, `agents-claude` (`claude-agent-sdk`). Their imports live inside the corresponding adapter modules. Installation of the base package and its core tests must succeed without either extra. Benchmark runs disable SDK tracing (`RunConfig(tracing_disabled=True)`), because the SDK enables tracing by default, includes tool inputs and outputs, and exports traces to `api.openai.com`; the export metadata records the tracing setting. Where tracing is enabled outside benchmark runs, SDK-level traces are supplemental; WSE audit records and the budget ledger remain authoritative.
 
 The Claude adapter must preserve the same task, tool permissions, budget accounting, and report formats. Verify its actual tool/configuration controls during integration rather than equating SDK option names. See the [Claude Agent SDK overview](https://code.claude.com/docs/en/agent-sdk/overview). This decision adds no implementation code or live API calls to the current documentation deliverable.
 
@@ -140,25 +140,27 @@ The MCP interface below is one front end to the Python library. The SDK exposes 
 
 ### 4.1 Tool Set
 
-The following tool names are planned and have not yet been registered. Every tool within an experiment checks object ownership. Every mutation tool requires an `idempotency_key`: the same key and input return the same result without creating another version or charging the budget again; the same key with different input returns a conflict.
+The following tool names are planned and have not yet been registered. Tool names use only letters, digits, `_`, and `-`, with at most 64 characters: OpenAI Agents SDK forwards MCP tool names verbatim as model function names, and the Chat Completions function-name rule excludes `.`. Every tool within an experiment checks object ownership. Every mutation tool requires an `idempotency_key`: the same key and input return the same result without creating another version or charging the budget again; the same key with different input returns a conflict.
 
 | Tool | Main inputs | Output and constraints |
 | --- | --- | --- |
-| `wse.list_models` | Pagination cursor | Registered model summaries; does not scan arbitrary filesystem paths |
-| `wse.create_experiment` | `run_id, task_id, policy_id, idempotency_key` | An experiment; an operator-issued run grant restricts task/policy and permits at most one experiment per run |
-| `wse.get_experiment` | `experiment_id` | State, selected version, remaining budget, available operations, and suites |
-| `wse.inspect_model` | `experiment_id, checkpoint_id` | Manifest and parameter statistics by layer |
-| `wse.read_tensor` | The IDs above, `tensor, selection` | A bounded slice or artifact reference; at most 4,096 elements and a 64 KiB response |
-| `wse.analyze` | The IDs above, `kind, tensor, selection, k=16` | MVP: stats/norm/top-k only; M2 adds SVD, weight-matrix products, and direction analysis |
-| `wse.preview_patch` | `experiment_id, patch_spec, idempotency_key` | Saves an immutable preview and `patch_id` without switching the current model |
-| `wse.apply_patch` | `experiment_id, patch_id, idempotency_key` | Creates a candidate checkpoint from the validated preview |
-| `wse.submit_evaluation` | `experiment_id, checkpoint_id, suite_id, eval_config, idempotency_key` | Returns `job_id` immediately; development suites only |
-| `wse.get_job` | `experiment_id, job_id` | queued/running/succeeded/failed/cancelled, progress, and report references |
-| `wse.cancel_job` | The IDs above, `idempotency_key` | Requests a stop; computation already performed remains charged |
-| `wse.compare` | `experiment_id, base_report_id, candidate_report_id` | Paired differences and intervals; rejects comparisons with mismatched configurations or samples |
-| `wse.select_checkpoint` | `experiment_id, checkpoint_id, expected_selected_id, idempotency_key` | Updates the selected version using CAS; selecting an ancestor performs a rollback |
+| `wse_list_models` | Pagination cursor | Registered model summaries; does not scan arbitrary filesystem paths |
+| `wse_create_experiment` | `run_id, task_id, policy_id, idempotency_key` | An experiment; an operator-issued run grant restricts task/policy and permits at most one experiment per run |
+| `wse_get_experiment` | `experiment_id` | State, task definition and `ObjectiveSpec`, selected version, remaining budget, available operations, and suites |
+| `wse_inspect_model` | `experiment_id, checkpoint_id` | Manifest and parameter statistics by layer |
+| `wse_read_tensor` | The IDs above, `tensor, selection` | A bounded slice of at most 2,048 elements within the response-size rule below; oversized requests return an error stating the largest permitted selection |
+| `wse_analyze` | The IDs above, `kind, tensor, selection`, optional `k` | MVP: stats/norm/top-k only; M2 adds SVD, weight-matrix products, and direction analysis |
+| `wse_preview_patch` | `experiment_id, patch_spec, idempotency_key` | Saves an immutable preview and `patch_id` without switching the current model |
+| `wse_apply_patch` | `experiment_id, patch_id, idempotency_key` | Creates a candidate checkpoint from the validated preview |
+| `wse_submit_evaluation` | `experiment_id, checkpoint_id, suite_id, eval_config, idempotency_key` | Returns `job_id` immediately; development suites only |
+| `wse_get_job` | `experiment_id, job_id, wait_seconds=0` | queued/running/succeeded/failed/cancelled, progress, the report summary (metrics, sample count, errors) inline, and report references; `wait_seconds` (0–10) holds the call until the job is terminal or the wait expires, so polling does not consume agent turns |
+| `wse_cancel_job` | The IDs above, `idempotency_key` | Requests a stop; computation already performed remains charged |
+| `wse_compare` | `experiment_id, base_report_id, candidate_report_id` | Paired differences and intervals; rejects comparisons with mismatched configurations or samples |
+| `wse_select_checkpoint` | `experiment_id, checkpoint_id, expected_selected_id, idempotency_key` | Updates the selected version using CAS; selecting an ancestor performs a rollback |
 
-`selection` is a list of `start/stop/step` specifications, one per axis. The MVP accepts only nonnegative, nonempty, in-bounds contiguous slices with step 1. Tensor names require exact matches; Python expressions are rejected. stats returns count/mean/std/min/max/nonfinite_count, with population standard deviation (ddof=0); norm returns L1/L2/Linf; top-k returns indices and values with `1 ≤ k ≤ min(64, element_count)`, sorted by descending absolute value and then ascending flattened index for ties. Other kinds do not use k.
+`selection` is a list of `start/stop/step` specifications, one per axis. The MVP accepts only nonnegative, nonempty, in-bounds contiguous slices with step 1. Tensor names require exact matches; Python expressions are rejected. stats returns count/mean/std/min/max/nonfinite_count, with population standard deviation (ddof=0); norm returns L1/L2/Linf; top-k returns indices and values sorted by descending absolute value and then ascending flattened index for ties. An explicit `k` must satisfy `1 ≤ k ≤ min(64, element_count)`; an omitted `k` resolves to `min(16, element_count)`, so default calls also succeed on tensors with fewer than 16 elements, such as every tensor of the signed-sum fixture. Other kinds do not use k.
+
+Values are serialized as JSON numbers in the shortest representation that round-trips the stored dtype; for FP32 this is NumPy's float32 representation, not the float64 text produced by `.tolist()`. The canonical compact JSON of a read or analysis result must not exceed 32 KiB, because the MCP response carries it twice, as `structuredContent` and as the text mirror that OpenAI Agents SDK shows the model by default; the complete response must stay within 64 KiB. Measured for 2,048 FP32 values: 25.2 KiB for N(0, 0.02) weights, 30.0 KiB when every value needs 14 characters, and 44.7 KiB with `.tolist()`. A request that would exceed the limit returns an actionable error stating the largest permitted selection.
 
 The MVP fields of `eval_config` are `sample_count, seed`. Only sample slices and seeds preregistered in the suite manifest are accepted; the server fixes the execution device and batch size. The LLM phase adds preregistered sampling profiles so agents cannot silently change decoding settings during comparisons.
 
@@ -168,7 +170,7 @@ A local stdio server process is bound to a persisted run grant; the run_id suppl
 
 ### 4.2 Resources and Return Formats
 
-Resource URIs are `wse://models/{checkpoint_id}/manifest`, `wse://experiments/{experiment_id}/policy`, `wse://reports/{report_id}`, and `wse://patches/{patch_id}`. Reads and tools use the same authorization checks; final reports are withheld from the agent until the experiment closes. Large artifacts return only summaries and URIs. Resource reads are also paginated and bounded so they cannot bypass slice-size limits.
+Resource URIs are `wse://models/{checkpoint_id}/manifest`, `wse://experiments/{experiment_id}/policy`, `wse://reports/{report_id}`, and `wse://patches/{patch_id}`. Reads and tools use the same authorization checks; final reports are withheld from the agent until the experiment closes. Large artifacts return summaries inline plus URIs. Resource reads are also paginated and bounded so they cannot bypass slice-size limits. A benchmark agent must be able to complete a trial through tools alone, because OpenAI Agents SDK exposes MCP resources only to application code. Tool results therefore carry inline everything the agent needs (task and objective, manifests, patch previews, and report metrics), and resources remain an optional view for hosts that surface them.
 
 Tools declare input/output JSON Schema. Successful output includes object IDs, a summary, artifact URIs, and per-call/cumulative usage. Domain errors contain `code, message, retryable, details` and are returned as MCP tool errors. Define at least `NOT_FOUND`, `POLICY_DENIED`, `INVALID_PATCH`, `BUDGET_EXCEEDED`, `VERSION_CONFLICT`, `IDEMPOTENCY_CONFLICT`, `INCOMPATIBLE_REPORTS`, and `WORKER_FAILED`.
 
@@ -190,20 +192,20 @@ Register these as versioned built-in operators. Agent-facing patches remain decl
 - `scale_slice`: Multiply a slice by a finite scalar while preserving shape/dtype. Record no-op changes, but do not count them as changed elements.
 - A patch may contain multiple operations, applied in list order to the same candidate snapshot. Check finite values and shapes after every step and in the final result. If any step fails, commit none of the patch.
 
-The following example is a `patch_spec` tool input. Its checkpoint ID illustrates the contract; actual IDs are returned by tools at runtime:
+The following example is a `patch_spec` tool input for a hypothetical 8-input MLP. Documentation, tool descriptions, and schema examples always use a model and task other than any agent-trial fixture, so no example can reveal a trial's answer. Its checkpoint ID illustrates the contract; actual IDs are returned by tools at runtime:
 
 ```json
 {
-  "base_checkpoint_id": "ckpt_demo_base",
-  "hypothesis": "One class direction in the output layer may have been reversed, causing both classes to receive identical scores.",
-  "expected_behavior": "Restore class 1 predictions when the input sum is positive while preserving predictions for negative examples.",
-  "development_suite_id": "signed_sum_dev_v1",
+  "base_checkpoint_id": "ckpt_example_base",
+  "hypothesis": "Hidden unit 3 dominates the output for inputs outside the training range.",
+  "expected_behavior": "Halve that unit's input weights while keeping development accuracy unchanged.",
+  "development_suite_id": "example_dev_v1",
   "operations": [
     {
       "op": "scale_slice",
-      "tensor": "layers.2.weight",
-      "selection": [{"start": 1, "stop": 2, "step": 1}, {"start": 0, "stop": 4, "step": 1}],
-      "factor": -1.0
+      "tensor": "layers.0.weight",
+      "selection": [{"start": 3, "stop": 4, "step": 1}, {"start": 0, "stop": 8, "step": 1}],
+      "factor": 0.5
     }
   ]
 }
@@ -245,9 +247,9 @@ The filesystem and SQLite do not share a transaction. Visibility depends on READ
 
 ### 6.2 Budget Ledger
 
-The main demo uses `small_model_v1` with `mode=bounded_eval`: at most **20 candidate commits, 50 tensor analyses, 100 slice reads, 10 development evaluation batches, 64 examples per batch, 640 examples total, 30 seconds per computation operation, and 300 seconds of computation per run**. Only one worker executes at a time. Computation time is the sum of elapsed time spent executing server operations, excluding queue waits. Also register `small_model_weights_only_v1` with `mode=weights_only`: evaluation batch/example/forward allowances are all 0, with all other limits unchanged. Mode is an immutable policy field and cannot be overridden by create_experiment. These are initial engineering limits, not claims about optimal research budgets.
+The main demo uses `small_model_v1` with `mode=bounded_eval`: at most **20 candidate commits, 50 tensor analyses, 100 slice reads, 10 development evaluation batches, 64 examples per batch, 640 examples total, 30 seconds per computation operation, and 300 seconds of computation per run**. Only one worker executes at a time. Computation time is the sum of elapsed time spent executing server operations, excluding queue waits. Also register `small_model_weights_only_v1` with `mode=weights_only`: evaluation batch/example/forward allowances are all 0 and candidate commits are limited to 1, so the server, not the runner, enforces the one-candidate protocol for every client; all other limits are unchanged. Mode is an immutable policy field and cannot be overridden by create_experiment. These are initial engineering limits, not claims about optimal research budgets.
 
-Atomically reserve allowance in SQLite before queuing each computation. Settle failures, cancellations, and timeouts according to work already executed. Release portions that have not started. For crashed jobs whose usage cannot be verified, conservatively charge the reservation and do not rerun automatically. Retrying the same idempotency key only retrieves the original result. Worker heartbeats and leases detect interruptions; after restart, settle them before accepting new jobs.
+Atomically reserve allowance in SQLite before queuing each computation. The MCP server (job scheduler), worker, and runner are separate processes that share the database, so each reservation is a single conditional `UPDATE` or runs inside `BEGIN IMMEDIATE`; Python's `sqlite3` opens no transaction before a `SELECT`, so a separate check-then-update can overallocate. Settle failures, cancellations, and timeouts according to work already executed. Release portions that have not started. For crashed jobs whose usage cannot be verified, conservatively charge the reservation and do not rerun automatically. Retrying the same idempotency key only retrieves the original result. Worker heartbeats and leases detect interruptions; after restart, settle them before accepting new jobs.
 
 Record at least these separate quantities:
 
@@ -280,7 +282,7 @@ Fault: multiply row 1 of W2 (zero-indexed) by -1.
 
 After the fault, the two rows are identical, so deterministic argmax selects class 0. Generate balanced data as pairs of `x,-x`, excluding `|x0+x1|<0.1`. Baseline accuracy should be 50%; restoring the row should yield 100%. This behavior can be verified analytically without training or external data.
 
-The development set contains a fixed 64 examples. `task.json` declares `target_accuracy=1.0`, and the target is met only by a successful evaluation report covering all 64 examples. The final set contains 1,024 independently pregenerated examples; its contents and seed remain accessible only to the final evaluator. The agent can see the task definition, faulty model, and development feedback, but not the clean checkpoint, fault location, ideal patch, or fixture construction code in this section. The reference runner must isolate the source code and this plan document; a prompt asking the agent not to look at the answer is insufficient.
+The development set contains a fixed 64 examples. `task.json` declares `target_accuracy=1.0`, and the target is met only by a successful evaluation report covering all 64 examples. The final set contains 1,024 independently pregenerated examples; its contents and seed remain accessible only to the final evaluator. The agent can see the task definition, faulty model, and development feedback, but not the clean checkpoint, fault location, ideal patch, or fixture construction code in this section. The reference runner must isolate the source code and this plan document; a prompt asking the agent not to look at the answer is insufficient. Agent instructions are generated from `task.json` and the policy, never from repository documentation. Nothing the agent can observe (instructions, tool names, descriptions and schemas, or tool outputs including manifest `provenance`) may contain the clean checkpoint ID, the oracle patch, or a description of the injected fault; an automated leak test renders these surfaces for the signed-sum trial and checks them.
 
 ### 7.2 Two Levels of Acceptance
 
@@ -310,7 +312,7 @@ Each of the 5 agent trials uses a separate run grant and fresh context. Execute 
 
 For subsequent research, include at least a baseline, a no-op patch, random perturbations matched for changed-element count and L2 norm, a human oracle where available, and agent conditions with and without dynamic feedback. Use 5 seeds for random controls and report every preregistered agent run. Repeated access to the same holdout contaminates candidate selection; subsequent experiments require new preregistered splits.
 
-For classification, report accuracy and paired-bootstrap 95% intervals. The `x,-x` examples in this fixture are correlated, so bootstrap clusters must be generated pairs; sample-level resampling is appropriate only for tasks with independent examples. Cluster episode tasks by episode and repeated LLM samples by question. Report separate cross-capability regression metrics and allowable degradation thresholds rather than only an aggregate score. Fix random seeds, dependencies, hardware, and sampling settings. PyTorch does not guarantee bitwise reproducibility across versions or devices, so distinguish byte-identical weight replay from metrics that agree within statistical tolerances. [PyTorch reproducibility guidance](https://docs.pytorch.org/docs/2.15/notes/randomness.html)
+For classification, report accuracy and paired differences with cluster-bootstrap 95% intervals. The `x,-x` examples in this fixture are correlated, so clusters are the generated pairs; sample-level resampling is appropriate only for tasks with independent examples. At this fixture's 50% and 100% boundaries every pair has the same score (the faulty model gets exactly one example of each pair right, and a repair gets both), so the bootstrap interval collapses to zero width; also report an exact Clopper–Pearson 95% interval on the number of fully correct pairs. With 512 final pairs, 512/512 gives a lower bound of 99.28% and 511/512 gives 98.92%. Cluster episode tasks by episode and repeated LLM samples by question. Report separate cross-capability regression metrics and allowable degradation thresholds rather than only an aggregate score. Fix random seeds, dependencies, hardware, and sampling settings. PyTorch does not guarantee bitwise reproducibility across versions or devices, so distinguish byte-identical weight replay from metrics that agree within statistical tolerances. [PyTorch reproducibility guidance](https://docs.pytorch.org/docs/2.15/notes/randomness.html)
 
 ## 8. Planned Files and Modules
 
@@ -361,16 +363,16 @@ examples/signed_sum/
   build_fixture.py             # Operator/test use only
   task.json                    # Agent-visible task description
   policy.json                  # Fixed experiment policy
-docs/protocol.md               # Tool contracts, errors, and example calls
+docs/protocol.md               # Tool contracts, errors, and example calls (non-trial models only)
 docs/extensions.md             # Adapter/operator/evaluator/strategy contracts
 docs/experiments.md            # Running experiments and interpreting results
 ```
 
-Runtime outputs go to the configured `workspace/artifacts/`, `workspace/metadata.sqlite`, and `workspace/exports/`; the final dataset resides in separate evaluator storage. Actual weights, datasets, and credentials stay outside the source repository. If Git is introduced during implementation, commit only source, configuration, and documentation.
+Runtime outputs go to the configured `workspace/artifacts/`, `workspace/metadata.sqlite`, and `workspace/exports/`; the final dataset resides in separate evaluator storage. Actual weights, datasets, and credentials stay outside the source repository. The repository is a local Git repository with no remote; commit only source, configuration, and documentation.
 
 ## 9. Implementation Tasks and Dependencies
 
-Tasks 1→2→3 establish the core contracts. Tasks 4 and 5 can then proceed in parallel; Task 6 integrates the system; Task 7 completes agent trials and delivery. Commands below are future implementation acceptance checks and have not been run for this planning deliverable.
+Tasks run in order 1→2→3→4→5→6→7. Tasks 1–3 establish the core contracts. Task 5 depends on Task 4: freezing checks Task 4's jobs and reservations, parity with managed evaluation runs through Task 4's worker, and both tasks extend `schemas.py`. Task 6 integrates the system; Task 7 completes agent trials and delivery. Commands below are future implementation acceptance checks and have not been run for this planning deliverable.
 
 ### Task 1: Model Registration and Immutable Storage
 
@@ -389,9 +391,9 @@ Tasks 1→2→3 establish the core contracts. Tasks 4 and 5 can then proceed in 
 
 **Files:** `src/wse/analysis.py`, `src/wse/policy.py`, `src/wse/operators/{base,tensor}.py`, `tests/test_analysis.py`; extend `schemas.py`, `registry.py`, and `tests/test_registry.py`.
 
-**Interfaces:** `inspect(checkpoint_id) -> ModelManifest`; `analyze(checkpoint_id, kind, tensor, selection, k=16) -> AnalysisResult`. `AnalysisResult` includes the operation, input hash, numerical results, and elapsed time; large results are referenced by artifact URI.
+**Interfaces:** `inspect(checkpoint_id) -> ModelManifest`; `analyze(checkpoint_id, kind, tensor, selection, k=None) -> AnalysisResult`, where an omitted `k` resolves as described in Section 4.1. `AnalysisResult` includes the operation, input hash, numerical results, and elapsed time; large results are referenced by artifact URI.
 
-- [ ] Write tests for slice boundaries, the 4,096-element limit, and the 64 KiB limit; reject expressions and oversized top-k requests.
+- [ ] Write tests for slice boundaries, the 2,048-element limit, and the 32 KiB canonical-JSON limit; reject expressions and oversized top-k requests; confirm that default top-k succeeds on tensors with fewer than 16 elements.
 - [ ] Implement stats, norm, top-k, and a large-object response policy without implicit copying.
 - [ ] Register built-in analyses through `OperatorSpec`; test a separately supplied analysis implementation and a missing-capability rejection without changes to dispatch code.
 - [ ] Verify means, norms, and top-k indices using known matrices; confirm that none of these paths calls adapter.forward.
@@ -407,7 +409,7 @@ The managed patch path uses core `apply_operator(model, operator_id, parameters)
 
 - [ ] Write known-value tests for set/scale, including a multi-operation patch whose later failure must produce no READY candidate.
 - [ ] Implement set/scale as registered edit operators; verify a direct in-memory edit and a managed edit yield the same changed tensor bytes, and replay of the materialized patch does not execute the editing plugin.
-- [ ] Implement frozen previews, immutable candidates, idempotency records, the single-experiment run-grant limit, object ownership, and CAS selection; test that recreating an experiment cannot reset its budget and that policy/mode changes are rejected.
+- [ ] Implement frozen previews, immutable candidates, idempotency records, the single-experiment run-grant limit, object ownership, and CAS selection; test that recreating an experiment cannot reset its budget, that policy/mode changes are rejected, and that `apply_patch` enforces the policy's candidate-commit limit (1 under `small_model_weights_only_v1`).
 - [ ] Inject failures before and after file rename and database commit; verify restart recovery and unchanged original weights.
 - [ ] Verify that `uv run pytest tests/test_patches.py tests/test_experiments.py tests/test_recovery.py -q` passes; failures must remain traceable without affecting the selected checkpoint.
 - [ ] Review and save the deliverable.
@@ -416,9 +418,9 @@ The managed patch path uses core `apply_operator(model, operator_id, parameters)
 
 **Files:** `src/wse/{budget,jobs,worker}.py`, `tests/test_budget_jobs.py`; extend `policy.py`, `database.py`, and `schemas.py`.
 
-**Interfaces:** `reserve(experiment_id, job_id, requested_usage) -> Reservation`; `settle(reservation_id, actual_usage, terminal_state)`; `submit_evaluation(experiment_id, checkpoint_id, suite_id, config, key) -> Job`; `get_job(experiment_id, job_id) -> Job`; `cancel_job(experiment_id, job_id, key) -> Job`.
+**Interfaces:** `reserve(experiment_id, job_id, requested_usage) -> Reservation`; `settle(reservation_id, actual_usage, terminal_state)`; `submit_evaluation(experiment_id, checkpoint_id, suite_id, config, key) -> Job`; `get_job(experiment_id, job_id, wait_seconds=0) -> Job`; `cancel_job(experiment_id, job_id, key) -> Job`.
 
-- [ ] First write concurrency tests: with one unit of budget remaining, only one of two independent requests can reserve it; repeated idempotent requests create only one job.
+- [ ] First write concurrency tests: with one unit of budget remaining, only one of two requests on independent database connections can reserve it; repeated idempotent requests create only one job.
 - [ ] Implement atomic SQLite reservations, a single-worker queue, process time limits, heartbeats, cancellation, and settlement after crashes.
 - [ ] Cover cancellation while queued, while running, and after success, plus jobs lost during restart; confirm that cancellation does not refund consumed budget.
 - [ ] Verify that `uv run pytest tests/test_budget_jobs.py -q` passes and review the deliverable.
@@ -434,7 +436,7 @@ The worker invokes core `evaluate_candidate(model, evaluator, config) -> Evaluat
 - [ ] Write exact tests for clean/broken/repaired models: 100%/50%/100% accuracy on the balanced fixture.
 - [ ] Complete the no-service Python acceptance path in `tests/test_api.py`; check metric and model/configuration identity parity with managed evaluation.
 - [ ] Implement development/final dataset manifests, task hashes, evaluation configurations, and paired comparisons; reject comparisons with mismatched configurations.
-- [ ] Test that the final set cannot be read through tools/resources, active jobs prevent freezing, frozen experiments cannot be edited or accept checkpoint selection or new jobs, and failed final evaluations can be retried on the same frozen model.
+- [ ] Test that no agent-facing service operation can read the final set (Task 6 repeats this through MCP tools and resources), that active jobs prevent freezing, frozen experiments cannot be edited or accept checkpoint selection or new jobs, and failed final evaluations can be retried on the same frozen model.
 - [ ] Verify that `uv run pytest tests/test_evaluation.py -q` passes; produce machine-readable reports and concise Markdown reports.
 - [ ] Review and save the deliverable.
 
@@ -446,6 +448,7 @@ The worker invokes core `evaluate_candidate(model, evaluator, config) -> Evaluat
 
 - [ ] Launch a stdio subprocess using the official SDK client; write tests for tools/resources discovery and schema validation.
 - [ ] Register service capabilities as tools, send logs to stderr, and verify identical object-access boundaries for tools and resources.
+- [ ] Repeat the final-set isolation test through MCP tools and resources; verify that the largest permitted `wse_read_tensor` response, including its text mirror, stays within 64 KiB; run the Section 7.1 leak test against the registered tool names, descriptions, and schemas.
 - [ ] Compare managed SDK, CLI, and MCP calls for identical patch content, policy decisions, and usage accounting; handlers must not implement separate editing algorithms.
 - [ ] Run the complete oracle repair sequence through a scripted client, covering budget exhaustion, duplicate requests, cancellation, state after reconnect, and rollback.
 - [ ] Verify that `uv run pytest tests/test_mcp_e2e.py -q` passes; test a connection with one actual MCP host and record its host/protocol versions and compatibility behavior.
@@ -460,9 +463,9 @@ The worker invokes core `evaluate_candidate(model, evaluator, config) -> Evaluat
 - [ ] Implement the loop: read task and budget → gather information → submit a patch with a brief rationale → evaluate on development data → compare → select/rollback → stop and freeze.
 - [ ] Define `Strategy.next_action(objective, observations, remaining_budget)` for stepwise controllers and the separate `AgentAdapter` run/cancel contract for complete SDK loops. Run a scripted strategy and the SDK-backed reference agent through the same experiment service; record their IDs, versions, and configurations without nesting two tool loops.
 - [ ] Add the optional `agents-openai` dependency and implement the Python OpenAI Agents SDK adapter with local stdio MCP. Persist the experiment first, pass its workspace and run grant to the server, and keep that server as the sole scheduler owner.
-- [ ] Test adapter behavior with an SDK test double: normalized events/usage, 100-turn and 900-second limits, stop-condition cancellation, connection failure, and unfinished jobs at SDK exit. Verify that the base package still imports without the optional SDK and that SDK completion alone does not close an experiment.
+- [ ] Test adapter behavior with an SDK test double: normalized events/usage, 100-turn (passed explicitly as `max_turns`) and 900-second limits, tracing disabled in the benchmark configuration, stop-condition cancellation, connection failure, and unfinished jobs at SDK exit. Verify that the base package still imports without the optional SDK and that SDK completion alone does not close an experiment.
 - [ ] Document a direct Python example and an external extension example, including required capabilities, unsupported operations, and the distinction between exact patch replay and recipe re-execution.
-- [ ] Fix bounded_eval stopping conditions: insufficient budget for the next operation, the full development evaluation meets its target, 3 consecutive evaluated candidates show no improvement, or the agent voluntarily stops. The weights_only control freezes after submitting one candidate or voluntarily stopping and does not use a development-score stopping threshold. Do not request or store private chain-of-thought; record brief hypotheses and observable evidence only.
+- [ ] Fix bounded_eval stopping conditions: insufficient budget for the next operation, the full development evaluation meets its target, 3 consecutive evaluated candidates show no improvement, or the agent voluntarily stops. The weights_only control freezes after its single permitted candidate commit or a voluntary stop and does not use a development-score stopping threshold. Do not request or store private chain-of-thought; record brief hypotheses and observable evidence only.
 - [ ] Export base/patch/report hashes, tool traces, policies, and costs; replay in a clean workspace to recover identical weights.
 - [ ] Run 5 live OpenAI Agents SDK demos with isolated run grants and contexts using a fixed operator-configured model; record the exact SDK/model settings. Evaluate all final candidates after every trial has frozen. Report success rates and failures separately as specified in Section 7; one success is not complete acceptance.
 - [ ] Run `uv run pytest -q` and record versions and the CPU environment; deliver documentation, demo commands, and representative success and failure reports.
