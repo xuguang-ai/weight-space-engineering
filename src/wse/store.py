@@ -258,11 +258,13 @@ class ArtifactStore:
 
         These files are content-addressed and immutable. They are derived data
         (recomputable from a READY checkpoint), carry no checkpoint metadata, and
-        are not part of the orphan scan.
+        are not part of the orphan scan. An existing file is reused only when
+        its content still matches its digest; a damaged file is replaced.
         """
         digest = hashlib.sha256(data).hexdigest()
         relpath = f"{ANALYSES_DIR}/{digest}.json"
-        if not self._artifact_path(relpath).is_file():
+        path = self._artifact_path(relpath)
+        if not (path.is_file() and _file_sha256(path) == digest):
             self._publish_bytes(relpath, data)
         return ANALYSIS_URI_PREFIX + digest
 

@@ -31,6 +31,7 @@ from wse.schemas import (
 __all__ = [
     "AnalysisOperator",
     "BaseAnalysisOperator",
+    "EFFECT_COUNTERS",
     "EFFECT_METHODS",
     "OperatorParameters",
     "OperatorResult",
@@ -44,6 +45,14 @@ __all__ = [
 # The method each effect category must implement. Probe and edit operators are
 # introduced by later milestones; their methods are reserved here.
 EFFECT_METHODS: dict[str, str] = {"analysis": "analyze", "probe": "probe", "edit": "apply"}
+
+# The budget counters each effect category may be charged under. Analyses and
+# edits never run the target network, so they must declare zero forward calls.
+EFFECT_COUNTERS: dict[str, frozenset[str]] = {
+    "analysis": frozenset({"analysis_calls", "tensor_read_calls"}),
+    "edit": frozenset({"candidate_commits"}),
+    "probe": frozenset({"model_forward_calls", "evaluation_batches", "evaluated_examples"}),
+}
 
 
 class OperatorParameters(BaseModel):
@@ -192,8 +201,21 @@ def validate_operator(extension_id: str, version: str, implementation: Any) -> N
         raise WSEError(ErrorCode.INVALID_ARGUMENT, f"operator {spec.ref} input_schema does not match parameters_model")
     if spec.output_schema != implementation.result_model.model_json_schema():
         raise WSEError(ErrorCode.INVALID_ARGUMENT, f"operator {spec.ref} output_schema does not match result_model")
+    allowed = EFFECT_COUNTERS[spec.effect]
+    if spec.usage.counter not in allowed:
+        raise WSEError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"{spec.effect} operator {spec.ref} declares usage counter {spec.usage.counter!r}; "
+            f"{spec.effect} operators are charged under one of {sorted(allowed)}",
+        )
+    if spec.effect in ("analysis", "edit") and spec.usage.model_forward_calls != 0:
+        raise WSEError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"{spec.effect} operator {spec.ref} must declare model_forward_calls=0; "
+            f"{spec.effect} operators never run the target network",
+        )
     method = EFFECT_METHODS[spec.effect]
-    required = [method] + (["resolve_parameters"] if spec.effect == "analysis" else [])
+    required = [method] + (["resolve_parameters"] if spec.effect in ("analysis", "edit") else [])
     missing = [name for name in required if not callable(getattr(implementation, name, None))]
     if missing:
         raise WSEError(

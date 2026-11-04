@@ -160,10 +160,11 @@ class _Result(OperatorResult):
     value: float
 
 
-def _spec(operator_id="custom", version="1", effect="analysis", parameters=OperatorParameters, result=_Result):
+def _spec(operator_id="custom", version="1", effect="analysis", parameters=OperatorParameters, result=_Result,
+          usage=None):
     return make_spec(operator_id=operator_id, version=version, effect=effect, description="custom op",
                      required_capabilities=[CAP_WEIGHTS_READ], parameters_model=parameters,
-                     result_model=result, usage=UsageContract(counter="analysis_calls"))
+                     result_model=result, usage=usage or UsageContract(counter="analysis_calls"))
 
 
 class _Custom(BaseAnalysisOperator):
@@ -217,9 +218,39 @@ def test_operator_registration_validates_the_contract():
     rejected(NotPydantic())
 
     class EditWithoutApply(_Custom):
-        spec = _spec(effect="edit")
+        spec = _spec(effect="edit", usage=UsageContract(counter="candidate_commits"))
 
     assert "apply" in rejected(EditWithoutApply()).details["missing_methods"]
+
+
+def test_operator_usage_contract_must_match_the_effect():
+    registry = Registry()
+
+    def rejected(implementation):
+        with pytest.raises(WSEError) as excinfo:
+            registry.register("operator", "custom", "1", implementation)
+        assert excinfo.value.code == ErrorCode.INVALID_ARGUMENT
+        return excinfo.value.message
+
+    class ChargesCommits(_Custom):
+        spec = _spec(usage=UsageContract(counter="candidate_commits"))
+
+    assert "analysis_calls" in rejected(ChargesCommits())
+
+    class MayRunForward(_Custom):
+        spec = _spec(usage=UsageContract(counter="analysis_calls", model_forward_calls=None))
+
+    assert "model_forward_calls=0" in rejected(MayRunForward())
+
+    class EditChargedAsAnalysis(_Custom):
+        spec = _spec(effect="edit")
+
+    assert "candidate_commits" in rejected(EditChargedAsAnalysis())
+
+    class ChargesReads(_Custom):
+        spec = _spec(usage=UsageContract(counter="tensor_read_calls", units_per_call=3))
+
+    registry.register("operator", "custom", "1", ChargesReads())
 
 
 def test_operator_spec_rejects_malformed_identity_and_effects():

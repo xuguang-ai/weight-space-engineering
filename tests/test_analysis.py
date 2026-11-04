@@ -630,3 +630,93 @@ def test_analysis_element_limit_is_enforced_before_reading(workspace, signed_sum
                         "layers.0.weight", _full([4, 2]))
         assert error.details["largest_permitted_selection"] == _sel((0, 2), (0, 2))
         assert engine.analyze(ckpt.checkpoint_id, "stats", "layers.0.weight", _sel((0, 2), (0, 2))).result["count"] == 4
+
+
+# -- review fixes: response re-measurement, weights.read, usage contract, store repair ------
+
+
+class BigParameters(OperatorParameters):
+    direction: list[float] = []
+
+
+class BigParametersOperator(BaseAnalysisOperator):
+    """Large resolved parameters with a large result."""
+
+    parameters_model = BigParameters
+    result_model = DumpResult
+    spec = make_spec(
+        operator_id="bigp", version="1", effect="analysis", description="Echo with a direction.",
+        required_capabilities=[CAP_WEIGHTS_READ], parameters_model=BigParameters,
+        result_model=DumpResult, usage=UsageContract(counter="analysis_calls"),
+    )
+
+    def analyze(self, region, parameters):
+        return DumpResult(values=list(parameters.direction))
+
+
+def test_response_is_remeasured_after_moving_the_result_behind_a_uri(workspace, signed_sum):
+    registry, policy = _extended(("bigp", BigParametersOperator()))
+    with Engine(workspace, registry=registry, policy=policy) as engine:
+        ckpt = engine.import_model({"adapter": "mlp@1", "config": signed_sum.CONFIG},
+                                   signed_sum.task_tensors()).checkpoint_id
+        error = _expect(ErrorCode.INVALID_ARGUMENT, engine.analyze, ckpt, "bigp", "layers.0.weight",
+                        _full([4, 2]), parameters={"direction": [0.123456789] * 4000})
+        assert error.details["json_bytes"] > MAX_INLINE_JSON_BYTES
+        # A large result with small parameters is still served by reference within the limit.
+        stored = engine.analyze(ckpt, "bigp", "layers.0.weight", _full([4, 2]),
+                                parameters={"direction": [0.123456789] * 1500})
+        assert stored.result is None and stored.result_uri is not None
+        assert json_size(stored.model_dump(mode="json")) <= MAX_INLINE_JSON_BYTES
+        assert stored.usage.artifact_bytes == stored.result_bytes
+
+
+class NoCapabilityOperator(AbsMeanOperator):
+    spec = make_spec(
+        operator_id="nocap", version="1", effect="analysis", description="Declares no capabilities.",
+        required_capabilities=[], parameters_model=OperatorParameters,
+        result_model=AbsMeanResult, usage=UsageContract(counter="analysis_calls"),
+    )
+
+
+def test_every_analysis_requires_weight_reads(workspace, signed_sum):
+    registry, policy = _extended(("nocap", NoCapabilityOperator()))
+    registry.register("adapter", "opaque_mlp", "1", OpaqueAdapter())
+    with Engine(workspace, registry=registry, policy=policy) as engine:
+        ckpt = engine.import_model({"adapter": "opaque_mlp@1", "config": signed_sum.CONFIG},
+                                   signed_sum.task_tensors()).checkpoint_id
+        error = _expect(ErrorCode.UNSUPPORTED_CAPABILITY, engine.analyze, ckpt, "nocap", "layers.0.weight",
+                        _full([4, 2]))
+        assert error.details["missing_capabilities"] == [CAP_WEIGHTS_READ]
+
+
+class ReadCountingOperator(AbsMeanOperator):
+    spec = make_spec(
+        operator_id="read_counting", version="1", effect="analysis", description="Charged as reads.",
+        required_capabilities=[CAP_WEIGHTS_READ], parameters_model=OperatorParameters,
+        result_model=AbsMeanResult, usage=UsageContract(counter="tensor_read_calls", units_per_call=3),
+    )
+
+
+def test_usage_follows_the_operator_usage_contract(engine, task_ckpt, signed_sum):
+    builtin = engine.analyze(task_ckpt.checkpoint_id, "stats", "layers.0.weight", _full([4, 2]))
+    assert builtin.usage.analysis_calls == 1 and builtin.usage.tensor_read_calls is None
+    registry, policy = _extended(("reads", ReadCountingOperator()))
+    model = load_model(signed_sum.task_tensors(), "mlp@1", signed_sum.CONFIG)
+    result = analyze_tensor(model, "reads", "layers.0.weight", _full([4, 2]), registry=registry, policy=policy)
+    assert result.usage.tensor_read_calls == 3
+    assert result.usage.analysis_calls is None
+    assert result.usage.model_forward_calls == 0
+
+
+def test_damaged_stored_analysis_result_is_replaced(workspace):
+    registry, policy = _extended(("dump", DumpOperator()))
+    tensors = _mlp_tensors(WIDE_CONFIG, _normal(3))
+    with Engine(workspace, registry=registry, policy=policy) as engine:
+        ckpt = engine.import_model({"adapter": "mlp@1", "config": WIDE_CONFIG}, tensors).checkpoint_id
+        uri = engine.analyze(ckpt, "dump", "layers.0.weight", _full([64, 64])).result_uri
+        path = workspace / "artifacts" / "analyses" / (uri.removeprefix("wse://analyses/") + ".json")
+        path.chmod(0o644)
+        path.write_bytes(b"{}")
+        _expect(ErrorCode.ARTIFACT_CORRUPT, engine.read_analysis_result, uri)
+        assert engine.analyze(ckpt, "dump", "layers.0.weight", _full([64, 64])).result_uri == uri
+        assert len(engine.read_analysis_result(uri)["values"]) == 64 * 64

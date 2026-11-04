@@ -16,7 +16,7 @@ and the text mirror) within a 64 KiB total. Explicit top-k values satisfy
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from pydantic import Field
@@ -25,6 +25,7 @@ from wse.schemas import (
     ErrorCode,
     ExtensionRef,
     OperatorSpec,
+    Usage,
     WSEError,
     _Frozen,
     canonical_json,
@@ -91,9 +92,17 @@ def default_operation_policy() -> OperationPolicy:
     )
 
 
-def require_capabilities(capabilities: Any, spec: OperatorSpec, *, adapter: str) -> None:
-    """Reject an operator whose required capabilities the adapter does not advertise."""
-    missing = [name for name in spec.required_capabilities if not capabilities.supports(name)]
+def require_capabilities(
+    capabilities: Any, spec: OperatorSpec, *, adapter: str, always: Sequence[str] = ()
+) -> None:
+    """Reject an operator whose capabilities the adapter does not advertise.
+
+    ``always`` names capabilities the engine requires for the operator's
+    effect regardless of what the spec declares (for example ``weights.read``
+    for every analysis, because the engine reads the weights it passes in).
+    """
+    required = sorted(set(spec.required_capabilities) | set(always))
+    missing = [name for name in required if not capabilities.supports(name)]
     if missing:
         raise WSEError(
             ErrorCode.UNSUPPORTED_CAPABILITY,
@@ -105,3 +114,14 @@ def require_capabilities(capabilities: Any, spec: OperatorSpec, *, adapter: str)
 def json_size(payload: Mapping[str, Any]) -> int:
     """Size in bytes of the canonical compact JSON of ``payload``."""
     return len(canonical_json(payload).encode("utf-8"))
+
+
+def contract_usage(spec: OperatorSpec, *, compute_seconds: float | None = None, calls: int = 1) -> Usage:
+    """Per-call usage charged under ``spec.usage``: its counter and forward calls."""
+    return Usage.model_validate(
+        {
+            spec.usage.counter: spec.usage.units_per_call * calls,
+            "model_forward_calls": spec.usage.model_forward_calls,
+            "compute_seconds": compute_seconds,
+        }
+    )

@@ -35,7 +35,14 @@ from pydantic import BaseModel
 
 from wse.operators.base import TensorRegion
 from wse.operators.tensor import shortest_floats
-from wse.policy import OperationPolicy, default_operation_policy, json_size, require_capabilities
+from wse.adapters.base import CAP_WEIGHTS_READ
+from wse.policy import (
+    OperationPolicy,
+    contract_usage,
+    default_operation_policy,
+    json_size,
+    require_capabilities,
+)
 from wse.schemas import (
     AnalysisResult,
     AxisSlice,
@@ -62,6 +69,9 @@ SUPPORTED_DTYPES = {"float16": np.float16, "float32": np.float32, "float64": np.
 # Timing fields are measured with a fixed-width stand-in so that whether a
 # response fits never depends on how long the call took.
 _TIMING_PLACEHOLDER = 99999.999999
+# Analysis result URIs have a fixed length; this stand-in measures a response
+# before the result is stored.
+_URI_PLACEHOLDER = "wse://analyses/" + "0" * 64
 
 ReadRegion = Callable[[tuple[slice, ...]], torch.Tensor]
 StoreLarge = Callable[[bytes], str]
@@ -198,8 +208,6 @@ def bounded_read(
     management: Management,
 ) -> tuple[TensorSlice, torch.Tensor]:
     """Read a bounded region; return its JSON form and the region tensor."""
-    from wse.adapters.base import CAP_WEIGHTS_READ
-
     start = time.perf_counter()
     if not capabilities.supports(CAP_WEIGHTS_READ):
         raise WSEError(
@@ -295,7 +303,7 @@ def run_analysis(
     spec = operator.spec
     if spec.effect != "analysis":
         raise WSEError(ErrorCode.POLICY_DENIED, f"operator {ref} is not an analysis operator")
-    require_capabilities(capabilities, spec, adapter=str(model.adapter))
+    require_capabilities(capabilities, spec, adapter=str(model.adapter), always=(CAP_WEIGHTS_READ,))
     info = info_for(tensor)
     entries = _entries(resolve_selection(selection, info.shape, tensor=info.name))
     _require_supported_dtype(info)
@@ -358,12 +366,30 @@ def run_analysis(
         result_hash=json_hash(payload),
         result_bytes=len(payload_text.encode("utf-8")),
         elapsed_seconds=elapsed,
-        usage=Usage(analysis_calls=spec.usage.units_per_call, model_forward_calls=0, compute_seconds=elapsed),
+        usage=contract_usage(spec, compute_seconds=elapsed),
         management=management,
     )
-    if store_large is not None and inline_size(result) > policy.limits.max_inline_json_bytes:
-        uri = store_large(payload_text.encode("utf-8"))
-        result = result.model_copy(update={"result": None, "result_uri": uri})
+    limit = policy.limits.max_inline_json_bytes
+    if store_large is not None and inline_size(result) > limit:
+        data = payload_text.encode("utf-8")
+        by_reference = result.model_copy(
+            update={
+                "result": None,
+                "result_uri": _URI_PLACEHOLDER,
+                "usage": result.usage.model_copy(update={"artifact_bytes": len(data)}),
+            }
+        )
+        size = inline_size(by_reference)
+        if size > limit:
+            # Moving the result behind a URI is not enough: the rest of the
+            # response (for example large resolved parameters) is too big.
+            raise WSEError(
+                ErrorCode.INVALID_ARGUMENT,
+                f"the analysis response would serialize to {size} bytes of JSON even with its result "
+                f"stored by reference, above the {limit}-byte response limit; pass smaller parameters",
+                details={"limit": "max_inline_json_bytes", "max_inline_json_bytes": limit, "json_bytes": size},
+            )
+        result = by_reference.model_copy(update={"result_uri": store_large(data)})
     return result
 
 
