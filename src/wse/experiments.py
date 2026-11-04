@@ -441,10 +441,13 @@ class ExperimentService:
                 f"{'.'.join(str(part) for part in error['loc']) or 'patch_spec'}: {error['msg']}"
                 for error in exc.errors(include_url=False)
             )
+            extra = [error["loc"][0] for error in exc.errors() if error["type"] == "extra_forbidden"
+                     and len(error["loc"]) == 1]
+            hint = (" The server resolves the base content hash itself; do not send it."
+                    if "base_weights_hash" in extra else "")
             raise WSEError(
                 ErrorCode.INVALID_PATCH,
-                f"invalid patch_spec: {problems}. The server resolves the base content hash itself; "
-                "do not send it",
+                f"invalid patch_spec: {problems}.{hint}",
                 details={"errors": json.loads(exc.json(include_url=False, include_input=False))},
             ) from exc
 
@@ -456,6 +459,8 @@ class ExperimentService:
         """
         _check_key(key)
         row = self._experiment_row(experiment_id)
+        if not isinstance(spec, (PatchSpec, Mapping)):
+            raise WSEError(ErrorCode.INVALID_PATCH, "patch_spec must be an object")
         try:
             raw = spec.model_dump(mode="json") if isinstance(spec, PatchSpec) else json.loads(canonical_json(dict(spec)))
         except (WSEError, TypeError, ValueError) as exc:
