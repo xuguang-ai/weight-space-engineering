@@ -11,7 +11,7 @@ from wse.api import load_model
 from wse.registry import EXTENSION_KINDS, Registry, builtin_registry
 from wse.operators.base import BaseAnalysisOperator, OperatorParameters, OperatorResult, make_spec
 from wse.operators.tensor import TopKParameters, TopKResult
-from wse.schemas import ErrorCode, ExtensionRef, OperatorSpec, UsageContract, WSEError
+from wse.schemas import ErrorCode, ExtensionRef, OperatorSpec, PatchStep, UsageContract, WSEError
 
 
 class ScaleAdapter(MLPAdapter):
@@ -43,10 +43,22 @@ def test_builtin_registry_contains_mlp_adapter():
     assert isinstance(adapter, ModelAdapter)
     assert registry.list("adapter") == [ExtensionRef.parse("mlp@1")]
     assert registry.list("operator") == [
+        ExtensionRef.parse("scale_slice@1"),
+        ExtensionRef.parse("set_slice@1"),
         ExtensionRef.parse("tensor_norm@1"),
         ExtensionRef.parse("tensor_stats@1"),
         ExtensionRef.parse("tensor_top_k@1"),
     ]
+
+
+def test_builtin_edits_are_registered_through_operator_specs():
+    registry = builtin_registry()
+    for ref in ("set_slice@1", "scale_slice@1"):
+        spec = registry.resolve_ref("operator", ref).spec
+        assert spec.effect == "edit"
+        assert spec.required_capabilities == sorted([CAP_WEIGHTS_READ, "weights.slice_edit"])
+        assert spec.usage == UsageContract(counter="candidate_commits", units_per_call=1, model_forward_calls=0)
+        assert spec.output_schema == PatchStep.model_json_schema()
 
 
 def test_resolve_is_exact_and_never_substitutes_versions():
@@ -218,9 +230,19 @@ def test_operator_registration_validates_the_contract():
     rejected(NotPydantic())
 
     class EditWithoutApply(_Custom):
-        spec = _spec(effect="edit", usage=UsageContract(counter="candidate_commits"))
+        result_model = PatchStep
+        spec = _spec(effect="edit", result=PatchStep, usage=UsageContract(counter="candidate_commits"))
 
     assert "apply" in rejected(EditWithoutApply()).details["missing_methods"]
+
+    class EditWithOwnOutput(EditWithoutApply):
+        result_model = _Result
+        spec = _spec(effect="edit", usage=UsageContract(counter="candidate_commits"))
+
+        def apply(self, region, parameters):  # pragma: no cover - never registered
+            return region.values
+
+    assert "PatchStep" in rejected(EditWithOwnOutput()).message
 
 
 def test_operator_usage_contract_must_match_the_effect():
@@ -243,7 +265,11 @@ def test_operator_usage_contract_must_match_the_effect():
     assert "model_forward_calls=0" in rejected(MayRunForward())
 
     class EditChargedAsAnalysis(_Custom):
-        spec = _spec(effect="edit")
+        result_model = PatchStep
+        spec = _spec(effect="edit", result=PatchStep)
+
+        def apply(self, region, parameters):  # pragma: no cover - never registered
+            return region.values
 
     assert "candidate_commits" in rejected(EditChargedAsAnalysis())
 

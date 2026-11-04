@@ -43,8 +43,18 @@ from wse.tensors import normalize_tensors, weights_hash
 
 if TYPE_CHECKING:
     from wse.adapters.base import AdapterCapabilities
-    from wse.policy import OperationPolicy
-    from wse.schemas import AnalysisResult, TensorSlice
+    from wse.experiments import ExperimentService
+    from wse.policy import ExperimentPolicy, OperationPolicy
+    from wse.schemas import (
+        AnalysisResult,
+        Experiment,
+        ExperimentCheckpoint,
+        PatchArtifact,
+        PatchPreview,
+        PatchSpec,
+        RunGrant,
+        TensorSlice,
+    )
     from wse.store import ArtifactStore, RecoveryReport
 
 DEFAULT_MAX_MODEL_BYTES = 64 * 1024 * 1024
@@ -232,6 +242,26 @@ def load_model(
     return _build_handle(adapter_ref, implementation, manifest, normalize_tensors(tensors))
 
 
+def apply_operator(
+    model: ModelHandle,
+    operator_id: str | ExtensionRef,
+    parameters: Mapping[str, Any],
+    *,
+    registry: Registry | None = None,
+    policy: OperationPolicy | None = None,
+) -> EditResult:
+    """Apply one registered edit operator in memory (direct use, unmanaged).
+
+    ``operator_id`` is an exact reference (``"scale_slice@1"``) or a public
+    alias (``"scale_slice"``); ``parameters`` holds ``tensor``, ``selection``,
+    and the operator's own parameters. Returns the immutable candidate, the
+    materialized patch, and the per-tensor diff; the input model is unchanged.
+    """
+    from wse.patches import apply_operator as _apply_operator
+
+    return _apply_operator(model, operator_id, parameters, registry=registry, policy=policy)
+
+
 def _import_manifest(value: ImportManifest | Mapping[str, Any]) -> ImportManifest:
     if isinstance(value, ImportManifest):
         return value
@@ -315,10 +345,12 @@ def read_bundle(path: str | Path, *, max_bytes: int = DEFAULT_MAX_MODEL_BYTES) -
 
 
 class Engine:
-    """Managed facade over the artifact store and registry.
+    """Managed facade over the artifact store, registry, and experiments.
 
     Opening an engine applies database migrations and runs the startup
-    recovery scan.
+    recovery scan. ``run_id`` binds the engine to one persisted run grant (as
+    for a server process started for one agent trial): it can then create and
+    see only that run's experiment, and operator actions are denied.
     """
 
     def __init__(
@@ -329,7 +361,9 @@ class Engine:
         recover: bool = True,
         max_bytes: int = DEFAULT_MAX_MODEL_BYTES,
         policy: OperationPolicy | None = None,
+        run_id: str | None = None,
     ) -> None:
+        from wse.experiments import ExperimentService
         from wse.policy import default_operation_policy
         from wse.store import ArtifactStore
 
@@ -337,7 +371,12 @@ class Engine:
         self.policy = policy or default_operation_policy()
         self.max_bytes = max_bytes
         self.store: ArtifactStore = ArtifactStore(workspace)
-        self.last_recovery: RecoveryReport | None = self.store.recover() if recover else None
+        try:
+            self.last_recovery: RecoveryReport | None = self.store.recover() if recover else None
+            self.experiments: ExperimentService = ExperimentService(self, bound_run_id=run_id)
+        except BaseException:
+            self.store.close()
+            raise
 
     def close(self) -> None:
         self.store.close()
@@ -511,3 +550,49 @@ class Engine:
         if handle.identity != manifest.identity:
             raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"checkpoint {checkpoint_id} identity mismatch")
         return handle
+
+    # -- experiments ------------------------------------------------------------
+
+    def register_policy(self, policy: ExperimentPolicy | Mapping[str, Any]) -> ExperimentPolicy:
+        """Register an immutable experiment policy (operator only)."""
+        return self.experiments.register_policy(policy)
+
+    def get_policy(self, policy_id: str) -> ExperimentPolicy:
+        return self.experiments.get_policy(policy_id)
+
+    def grant_run(self, task_id: str, policy_id: str, base_checkpoint_id: str) -> RunGrant:
+        """Issue a run grant permitting one experiment (operator only)."""
+        return self.experiments.grant_run(task_id, policy_id, base_checkpoint_id)
+
+    def create_experiment(self, run_id: str, task_id: str, policy_id: str, key: str) -> Experiment:
+        """Create the run's single experiment; retries return the existing one."""
+        return self.experiments.create_experiment(run_id, task_id, policy_id, key)
+
+    def get_experiment(self, experiment_id: str) -> Experiment:
+        return self.experiments.get_experiment(experiment_id)
+
+    def preview_patch(self, experiment_id: str, spec: PatchSpec | Mapping[str, Any], key: str) -> PatchPreview:
+        """Freeze, validate, and materialize a patch without changing the selected model."""
+        return self.experiments.preview_patch(experiment_id, spec, key)
+
+    def apply_patch(self, experiment_id: str, patch_id: str, key: str) -> ModelManifest:
+        """Create a READY candidate checkpoint from a stored preview."""
+        return self.experiments.apply_patch(experiment_id, patch_id, key)
+
+    def select_checkpoint(
+        self, experiment_id: str, checkpoint_id: str, expected_selected_id: str, key: str
+    ) -> Experiment:
+        """Compare-and-swap the selected checkpoint; selecting an ancestor rolls back."""
+        return self.experiments.select_checkpoint(experiment_id, checkpoint_id, expected_selected_id, key)
+
+    def get_patch(self, experiment_id: str, patch_id: str) -> PatchPreview:
+        return self.experiments.get_patch(experiment_id, patch_id)
+
+    def read_patch(self, experiment_id: str, patch_id: str) -> PatchArtifact:
+        return self.experiments.read_patch(experiment_id, patch_id)
+
+    def list_experiment_checkpoints(self, experiment_id: str) -> list[ExperimentCheckpoint]:
+        return self.experiments.list_checkpoints(experiment_id)
+
+    def audit_log(self, experiment_id: str) -> list[dict[str, Any]]:
+        return self.experiments.audit_log(experiment_id)

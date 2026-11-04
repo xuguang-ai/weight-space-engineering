@@ -7,7 +7,12 @@ Commit protocol (the filesystem and SQLite share no transaction):
    then sync the directory. A published file without database metadata is an
    invisible orphan.
 3. In one SQLite transaction, write artifact metadata, the READY checkpoint
-   row, and an audit event.
+   row, and an audit event. Callers add their own rows (ownership, budget
+   charges, idempotent results) to the same transaction through
+   ``commit_checkpoint(on_commit=...)``.
+
+Patch previews follow the same protocol: their content-addressed JSON file
+is published first and becomes visible only through a ``patches`` row.
 
 Only READY checkpoints can be listed or loaded. Recovery removes expired
 temporary files and unreferenced artifacts, and marks checkpoints whose files
@@ -45,11 +50,13 @@ from wse.tensors import weights_hash
 WEIGHTS_DIR = "weights"
 MANIFESTS_DIR = "manifests"
 ANALYSES_DIR = "analyses"
+PATCHES_DIR = "patches"
 ANALYSIS_URI_PREFIX = "wse://analyses/"
 TMP_DIR = "tmp"
 DEFAULT_RECOVERY_GRACE_SECONDS = 600.0
 _RELPATH_PATTERN = re.compile(
-    r"^(?:weights/[0-9a-f]{64}\.safetensors|manifests/[0-9a-f]{64}\.json|analyses/[0-9a-f]{64}\.json)$"
+    r"^(?:weights/[0-9a-f]{64}\.safetensors|manifests/[0-9a-f]{64}\.json"
+    r"|analyses/[0-9a-f]{64}\.json|patches/[0-9a-f]{64}\.json)$"
 )
 _READ_ONLY = stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH
 
@@ -59,6 +66,10 @@ class RecoveryReport:
     removed_temp_files: list[str] = field(default_factory=list)
     removed_orphans: list[str] = field(default_factory=list)
     corrupted_checkpoints: list[str] = field(default_factory=list)
+    corrupted_patches: list[str] = field(default_factory=list)
+
+
+OnCommit = Callable[[sqlite3.Connection, ModelManifest], None]
 
 
 def _hex(hash_text: str) -> str:
@@ -93,6 +104,7 @@ class ArtifactStore:
             self.artifacts_dir / WEIGHTS_DIR,
             self.artifacts_dir / MANIFESTS_DIR,
             self.artifacts_dir / ANALYSES_DIR,
+            self.artifacts_dir / PATCHES_DIR,
         ):
             directory.mkdir(parents=True, exist_ok=True)
         self.db = Database(self.workspace / "metadata.sqlite")
@@ -159,11 +171,16 @@ class ArtifactStore:
         *,
         dedup_key: str | None,
         event_type: str,
+        on_commit: OnCommit | None = None,
+        experiment_id: str | None = None,
     ) -> ModelManifest:
         """Store ``tensors`` and ``manifest`` and make the checkpoint READY.
 
         When ``dedup_key`` matches an existing checkpoint, that checkpoint is
         returned and nothing is written. Identical weights are stored once.
+        ``on_commit(conn, manifest)`` runs inside the commit transaction after
+        the checkpoint row is written; if it raises, nothing is committed and
+        the published files remain invisible orphans.
         """
         if dedup_key is not None:
             existing = self._checkpoint_for_dedup_key(dedup_key)
@@ -244,8 +261,12 @@ class ArtifactStore:
                         "config_hash": manifest.config_hash,
                         "adapter": str(manifest.adapter),
                         "manifest_hash": manifest_hash,
+                        "parent_checkpoint_id": manifest.provenance.parent_checkpoint_id,
                     },
+                    experiment_id=experiment_id,
                 )
+                if on_commit is not None:
+                    on_commit(conn, manifest)
         if winner is not None:
             # A concurrent identical import won; this call's manifest file is an orphan.
             return self.load_manifest(winner)
@@ -285,6 +306,68 @@ class ArtifactStore:
         if hashlib.sha256(data).hexdigest() != digest:
             raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"analysis result {uri} failed its hash check")
         return data
+
+    # -- patch artifacts ------------------------------------------------------
+
+    def publish_patch(self, data: bytes) -> tuple[str, str, int]:
+        """Publish a patch artifact; return its relpath, SHA-256 hex, and size.
+
+        The file is invisible until a ``patches`` row references it; callers
+        must check ``require_published`` inside their commit transaction.
+        """
+        digest = hashlib.sha256(data).hexdigest()
+        relpath = f"{PATCHES_DIR}/{digest}.json"
+        file_sha, size = self._publish_bytes(relpath, data)
+        return relpath, file_sha, size
+
+    def require_published(self, relpath: str) -> None:
+        """Inside a write transaction: fail if a published file vanished."""
+        if not self._artifact_path(relpath).is_file():
+            raise WSEError(
+                ErrorCode.ARTIFACT_CORRUPT,
+                f"published artifact {relpath} disappeared before commit; retry the operation",
+                retryable=True,
+            )
+
+    def read_patch(self, patch: sqlite3.Row) -> bytes:
+        """Return the bytes of a READY patch row's artifact after a hash check.
+
+        A missing or mismatching file marks the patch CORRUPT.
+        """
+        if patch["state"] != "READY":
+            raise WSEError(
+                ErrorCode.ARTIFACT_CORRUPT,
+                f"patch {patch['patch_id']} is {patch['state']} and cannot be used",
+                details={"patch_id": patch["patch_id"], "reason": patch["corrupt_reason"]},
+            )
+        path = self._artifact_path(patch["relpath"])
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            data = None
+        if data is None or len(data) != patch["size_bytes"] or hashlib.sha256(data).hexdigest() != patch["file_sha256"]:
+            reason = "patch artifact is missing" if data is None else "patch artifact hash mismatch"
+            self._mark_patches_corrupt(patch["relpath"], reason)
+            raise WSEError(
+                ErrorCode.ARTIFACT_CORRUPT,
+                f"patch {patch['patch_id']}: {reason}; it can no longer be applied",
+                details={"patch_id": patch["patch_id"]},
+            )
+        return data
+
+    def _mark_patches_corrupt(self, relpath: str, reason: str) -> list[str]:
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                "SELECT patch_id, experiment_id FROM patches WHERE relpath = ? AND state = 'READY'", (relpath,)
+            ).fetchall()
+            conn.execute(
+                "UPDATE patches SET state = 'CORRUPT', corrupt_reason = ? WHERE relpath = ? AND state = 'READY'",
+                (reason, relpath),
+            )
+            for row in rows:
+                insert_audit_event(conn, "patch.corrupt", row["patch_id"], {"reason": reason},
+                                   experiment_id=row["experiment_id"])
+        return [row["patch_id"] for row in rows]
 
     def _checkpoint_for_dedup_key(self, dedup_key: str) -> str | None:
         row = self.db.conn.execute(
@@ -430,7 +513,8 @@ class ArtifactStore:
         # commits first (and its files are referenced here) or sees the deletion.
         with self.db.transaction() as conn:
             referenced = {row["relpath"] for row in conn.execute("SELECT relpath FROM artifacts")}
-            for directory in (WEIGHTS_DIR, MANIFESTS_DIR):
+            referenced |= {row["relpath"] for row in conn.execute("SELECT relpath FROM patches")}
+            for directory in (WEIGHTS_DIR, MANIFESTS_DIR, PATCHES_DIR):
                 for path in sorted((self.artifacts_dir / directory).iterdir()):
                     relpath = f"{directory}/{path.name}"
                     if relpath in referenced or not path.is_file() or path.stat().st_mtime > cutoff:
@@ -451,4 +535,16 @@ class ArtifactStore:
             else:
                 continue
             report.corrupted_checkpoints.extend(self._mark_corrupt_for_artifact(artifact["artifact_id"], reason))
+        patches = self.db.conn.execute(
+            "SELECT DISTINCT relpath, file_sha256, size_bytes FROM patches WHERE state = 'READY'"
+        ).fetchall()
+        for patch in patches:
+            path = self._artifact_path(patch["relpath"])
+            if not path.is_file():
+                reason = "patch artifact is missing"
+            elif path.stat().st_size != patch["size_bytes"] or _file_sha256(path) != patch["file_sha256"]:
+                reason = "patch artifact hash mismatch"
+            else:
+                continue
+            report.corrupted_patches.extend(self._mark_patches_corrupt(patch["relpath"], reason))
         return report

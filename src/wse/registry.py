@@ -129,11 +129,11 @@ class Registry:
 def builtin_registry() -> Registry:
     """Return a new registry containing the built-in M1 extensions."""
     from wse.adapters.mlp import MLPAdapter
-    from wse.operators.tensor import BUILTIN_ANALYSES
+    from wse.operators.tensor import BUILTIN_ANALYSES, BUILTIN_EDITS
 
     registry = Registry()
     adapter = MLPAdapter()
     registry.register("adapter", adapter.adapter_id, adapter.version, adapter)
-    for operator in BUILTIN_ANALYSES.values():
+    for operator in [*BUILTIN_ANALYSES.values(), *BUILTIN_EDITS.values()]:
         registry.register("operator", operator.spec.operator_id, operator.spec.version, operator)
     return registry

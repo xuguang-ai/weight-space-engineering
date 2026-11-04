@@ -49,6 +49,18 @@ def test_in_memory_load_needs_neither_sqlite_nor_mcp(tmp_path):
         for kind in ("stats", "norm", "top_k"):
             assert analyze_tensor(handle, kind, "layers.0.weight", full).management == "unmanaged"
         assert read_tensor_slice(handle, "layers.0.weight", full).element_count == 8
+        from wse import apply_operator, materialize_patch, replay_patch
+        row = [dict(start=1, stop=2, step=1), dict(start=0, stop=4, step=1)]
+        edit = apply_operator(handle, "scale_slice@1",
+                              dict(tensor="layers.1.weight", selection=row, factor=-1.0))
+        reference = load_model(fixture.reference_tensors(), "mlp@1", fixture.CONFIG)
+        assert edit.candidate.weights_hash == reference.weights_hash
+        assert edit.management == "unmanaged" and edit.patch.steps[0].changed_elements == 4
+        assert replay_patch(handle, edit.patch).weights_hash == reference.weights_hash
+        assert materialize_patch(handle, [dict(op="set_slice", tensor="layers.1.weight", selection=row,
+                                               values=[[1, -1, 1, -1]])]).candidate.weights_hash == \
+            reference.weights_hash
+        assert handle.weights_hash != reference.weights_hash
         assert os.listdir(".") == [], os.listdir(".")
         print("ok")
         """
@@ -63,6 +75,7 @@ def test_core_imports_no_mcp_or_agent_sdk():
         import sys
         import wse, wse.api, wse.cli, wse.store, wse.database, wse.registry, wse.adapters.mlp
         import wse.analysis, wse.policy, wse.operators.base, wse.operators.tensor
+        import wse.patches, wse.experiments, wse.audit
         loaded = sorted(m for m in sys.modules
                         if m.split(".")[0] in ("mcp", "agents", "openai", "claude_agent_sdk"))
         print(loaded)
@@ -239,3 +252,19 @@ def test_numpy_arrays_with_negative_strides_or_foreign_byte_order_load(signed_su
     with pytest.raises(WSEError) as excinfo:
         load_model({**tensors, "layers.0.bias": np.array([object()] * 4)}, "mlp@1", signed_sum.CONFIG)
     assert excinfo.value.code == ErrorCode.INVALID_MODEL
+
+
+def test_direct_edit_result_contract(signed_sum):
+    from wse.api import apply_operator
+
+    model = load_model(signed_sum.task_tensors(), "mlp@1", signed_sum.CONFIG)
+    selection = [{"start": 0, "stop": 1, "step": 1}, {"start": 0, "stop": 4, "step": 1}]
+    result = apply_operator(model, "scale_slice", {"tensor": "layers.1.weight", "selection": selection,
+                                                   "factor": 2.0})
+    assert isinstance(result, EditResult) and result.management == "unmanaged"
+    assert result.patch.base == model.identity
+    assert result.patch.result_weights_hash == result.candidate.weights_hash
+    assert result.candidate.identity.config_hash == model.config_hash
+    assert [d.tensor for d in result.diff] == list(model.tensor_names())
+    assert result.candidate.tensor("layers.1.weight")[0].tolist() == [-2.0, 2.0, -2.0, 2.0]
+    assert model.tensor("layers.1.weight")[0].tolist() == [-1.0, 1.0, -1.0, 1.0]

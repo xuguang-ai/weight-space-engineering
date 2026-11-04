@@ -139,7 +139,7 @@ def test_stored_artifacts_are_read_only_and_content_addressed(engine, workspace,
     assert list((workspace / "artifacts" / "tmp").iterdir()) == []
     with sqlite3.connect(workspace / "metadata.sqlite") as conn:
         events = [row[0] for row in conn.execute("SELECT event_type FROM audit_events")]
-    assert events == ["checkpoint.imported"]
+    assert [event for event in events if event.startswith("checkpoint.")] == ["checkpoint.imported"]
 
 
 # -- validation ----------------------------------------------------------------------
@@ -377,12 +377,14 @@ def test_missing_file_detected_on_load_marks_checkpoint_corrupt(workspace, bundl
 # -- migrations ------------------------------------------------------------------------------
 
 
-def test_migration_1_creates_schema_once(workspace):
+def test_migrations_create_schema_once(workspace):
     with Engine(workspace) as engine:
-        assert engine.store.db.schema_version() == LATEST_SCHEMA_VERSION == 1
+        assert engine.store.db.schema_version() == LATEST_SCHEMA_VERSION == 2
         tables = {row[0] for row in engine.store.db.conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert {"artifacts", "checkpoints", "audit_events"} <= tables
+        assert {"policies", "run_grants", "experiments", "budget_ledger", "patches",
+                "experiment_checkpoints", "idempotency_records"} <= tables
     Database(workspace / "metadata.sqlite").close()  # reapplying is a no-op
     with sqlite3.connect(workspace / "metadata.sqlite") as conn:
         conn.execute("PRAGMA user_version = 99")

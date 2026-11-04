@@ -475,7 +475,13 @@ class Usage(_Frozen):
 
 
 class TensorDiff(_Frozen):
-    """Per-tensor difference between a base and a candidate model."""
+    """Per-tensor difference between a base and a candidate model.
+
+    ``changed_elements`` counts elements whose stored bytes differ after
+    writing back to the original dtype (so ``-0.0`` replacing ``0.0`` counts,
+    and a no-op write does not). ``relative_l2_delta`` is ``l2_delta`` divided
+    by the base tensor's L2 norm, or ``None`` when that norm is zero.
+    """
 
     tensor: str
     before_hash: str
@@ -484,27 +490,44 @@ class TensorDiff(_Frozen):
     element_count: int
     l2_delta: float
     max_abs_delta: float
+    before_l2: float
+    relative_l2_delta: float | None
     all_finite: bool
 
 
-class PatchRegion(_Frozen):
-    """Exact after-values written to one contiguous region, in row-major order."""
+class PatchStep(_Frozen):
+    """One materialized edit step: the exact after-values of one region.
 
+    ``values`` are row-major, in the stored dtype's shortest round-trip
+    digits, so replaying a step writes exactly these bytes without running
+    the editing operator. ``before_hash``/``after_hash`` are the tensor's
+    content hashes around this step.
+    """
+
+    op: str
+    operator: ExtensionRef
     tensor: str
     selection: list[AxisSlice]
+    parameters: dict[str, Any]
     dtype: str
+    before_hash: str
+    after_hash: str
     values: list[float]
+    changed_elements: int
 
 
 class MaterializedPatch(_Frozen):
-    """An exact patch: replayable from its base without running the editing plugin."""
+    """An exact patch: replayable from its base without running the editing plugin.
+
+    Steps apply in order to one snapshot. ``base`` is the full identity
+    (adapter, configuration, weights) the patch was materialized against; an
+    exact patch is specific to that base revision.
+    """
 
     schema_version: Literal["1"] = SCHEMA_VERSION
-    base_weights_hash: str
+    base: ModelIdentity
     result_weights_hash: str
-    operator: ExtensionRef
-    parameters: dict[str, Any] = Field(default_factory=dict)
-    regions: list[PatchRegion] = Field(default_factory=list)
+    steps: list[PatchStep]
 
 
 Management = Literal["unmanaged", "managed"]
@@ -625,3 +648,197 @@ class AnalysisResult(_Frozen):
     elapsed_seconds: float
     usage: Usage
     management: Management
+
+
+# ---------------------------------------------------------------------------
+# Patches (managed declarative edits)
+# ---------------------------------------------------------------------------
+
+OBJECT_ID_PATTERNS = {
+    "run": re.compile(r"^run_[0-9a-f]{32}$"),
+    "experiment": re.compile(r"^exp_[0-9a-f]{32}$"),
+    "patch": re.compile(r"^patch_[0-9a-f]{32}$"),
+}
+IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.:\-]{1,128}$")
+LABEL_PATTERN = r"^[A-Za-z0-9_.\-]{1,128}$"
+_COMMON_OPERATION_FIELDS = ("op", "tensor", "selection")
+
+
+class PatchOperation(BaseModel):
+    """One declarative operation of a patch.
+
+    ``op`` is a public operation alias permitted by the experiment policy
+    (``set_slice`` or ``scale_slice`` by default). ``tensor`` is an exact
+    tensor name and ``selection`` a list of ``{start, stop, step}`` objects,
+    one per axis. Every other field is a parameter of the operator (for
+    example ``factor`` of ``scale_slice`` or ``values`` of ``set_slice``) and
+    is validated by that operator.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="allow")
+
+    op: str = Field(min_length=1, max_length=128)
+    tensor: str = Field(min_length=1, max_length=256)
+    selection: list[Any]
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return dict(self.model_extra or {})
+
+    def operator_request(self) -> dict[str, Any]:
+        """Tensor, selection, and parameters as passed to ``apply_operator``."""
+        return {"tensor": self.tensor, "selection": list(self.selection), **self.parameters}
+
+
+class PatchSpec(_Frozen):
+    """A client-proposed patch: base checkpoint, ordered operations, and rationale.
+
+    The base content hash is deliberately absent: the server resolves it from
+    the immutable checkpoint and writes it into the frozen spec.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    base_checkpoint_id: str = Field(pattern=CHECKPOINT_ID_PATTERN.pattern)
+    hypothesis: str = Field(min_length=1, max_length=2000)
+    expected_behavior: str = Field(default="", max_length=2000)
+    development_suite_id: str | None = Field(default=None, pattern=LABEL_PATTERN)
+    operations: list[PatchOperation] = Field(min_length=1)
+
+
+class FrozenOperation(_Frozen):
+    """An operation resolved to an exact operator version."""
+
+    op: str
+    operator: ExtensionRef
+    tensor: str
+    selection: list[AxisSlice]
+    parameters: dict[str, Any]
+
+
+class FrozenPatchSpec(_Frozen):
+    """The server-resolved, immutable form of a ``PatchSpec``."""
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    base_checkpoint_id: str
+    base_weights_hash: str
+    hypothesis: str
+    expected_behavior: str
+    development_suite_id: str | None
+    operations: list[FrozenOperation]
+
+
+class PatchArtifact(_Frozen):
+    """Stored content of a preview: the frozen spec and its exact patch."""
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    spec: FrozenPatchSpec
+    patch: MaterializedPatch
+
+
+class PatchOperationSummary(_Frozen):
+    index: int
+    op: str
+    operator: ExtensionRef
+    tensor: str
+    selection: list[AxisSlice]
+    changed_elements: int
+
+
+class StorageCost(_Frozen):
+    """Bytes stored for the preview and for a candidate created from it.
+
+    The MVP saves complete snapshots, so ``candidate_bytes`` is the size of
+    every tensor of the model; identical weights are stored once.
+    """
+
+    patch_bytes: int
+    candidate_bytes: int
+
+
+class PatchPreview(_Frozen):
+    """Immutable, validated preview of a patch; ``apply_patch`` accepts only its ID."""
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    patch_id: str
+    experiment_id: str
+    spec_hash: str
+    base_checkpoint_id: str
+    base_weights_hash: str
+    result_weights_hash: str
+    hypothesis: str
+    expected_behavior: str
+    development_suite_id: str | None
+    operations: list[PatchOperationSummary]
+    tensors: list[TensorDiff]
+    changed_elements: int
+    parameter_count: int
+    changed_fraction: float
+    l2_delta: float
+    max_abs_delta: float
+    relative_l2_delta: float | None
+    all_finite: bool
+    storage: StorageCost
+    patch_uri: str
+    usage: Usage
+    management: Management = "managed"
+
+
+# ---------------------------------------------------------------------------
+# Experiments
+# ---------------------------------------------------------------------------
+
+ExperimentState = Literal["OPEN", "FROZEN", "CLOSED"]
+ExperimentMode = Literal["weights_only", "bounded_eval"]
+
+
+class RunGrant(_Frozen):
+    """An operator-issued grant: one experiment for this task, policy, and base model."""
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    run_id: str
+    task_id: str
+    policy_id: str
+    base_checkpoint_id: str
+    created_at: str
+
+
+class BudgetEntry(_Frozen):
+    """One counter of an experiment's budget ledger."""
+
+    limit: int | float
+    consumed: int | float
+    remaining: int | float
+
+
+class Experiment(_Frozen):
+    """Persistent state of one managed experiment.
+
+    ``policy_id`` names an immutable policy whose ``mode`` and ``policy_hash``
+    are recorded here. ``budget`` maps each ledger counter to its limit and
+    consumption; consumed allowance is never refunded.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    experiment_id: str
+    run_id: str
+    task_id: str
+    policy_id: str
+    policy_hash: str
+    mode: ExperimentMode
+    base_checkpoint_id: str
+    selected_checkpoint_id: str
+    state: ExperimentState
+    budget: dict[str, BudgetEntry]
+    created_at: str
+    ended_at: str | None = None
+
+
+class ExperimentCheckpoint(_Frozen):
+    """A checkpoint owned by an experiment: its base or one of its candidates."""
+
+    checkpoint_id: str
+    role: Literal["base", "candidate"]
+    parent_checkpoint_id: str | None
+    patch_id: str | None
+    weights_hash: str
+    created_at: str

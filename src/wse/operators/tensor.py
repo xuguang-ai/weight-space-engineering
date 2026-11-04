@@ -1,9 +1,11 @@
-"""Built-in tensor analyses: ``tensor_stats@1``, ``tensor_norm@1``, ``tensor_top_k@1``.
+"""Built-in tensor operators.
 
-All three read only the region the engine passes in, never call the model
-adapter's ``forward``, and accumulate in float64 without copying the region.
-Element values in results use the shortest decimal digits that round-trip the
-stored dtype.
+Analyses ``tensor_stats@1``, ``tensor_norm@1``, and ``tensor_top_k@1`` read
+only the region the engine passes in and accumulate in float64 without
+copying it. Edits ``set_slice@1`` and ``scale_slice@1`` return new values for
+that region, computed in FP32. None of them calls the model adapter's
+``forward``. Element values in results use the shortest decimal digits that
+round-trip the stored dtype.
 """
 
 from __future__ import annotations
@@ -13,11 +15,13 @@ from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from typing_extensions import TypeAliasType
 
-from wse.adapters.base import CAP_WEIGHTS_READ
+from wse.adapters.base import CAP_WEIGHTS_READ, CAP_WEIGHTS_SLICE_EDIT
 from wse.operators.base import (
     BaseAnalysisOperator,
+    BaseEditOperator,
     OperatorParameters,
     OperatorResult,
     TensorRegion,
@@ -25,7 +29,7 @@ from wse.operators.base import (
     parse_parameters,
 )
 from wse.policy import DEFAULT_TOP_K, MAX_TOP_K
-from wse.schemas import ErrorCode, UsageContract, WSEError
+from wse.schemas import ErrorCode, PatchStep, UsageContract, WSEError
 
 _ANALYSIS_USAGE = UsageContract(counter="analysis_calls", units_per_call=1, model_forward_calls=0)
 
@@ -221,4 +225,116 @@ BUILTIN_ANALYSES: dict[str, BaseAnalysisOperator] = {
     "stats": StatsOperator(),
     "norm": NormOperator(),
     "top_k": TopKOperator(),
+}
+
+
+# -- edits ---------------------------------------------------------------------------
+
+_EDIT_USAGE = UsageContract(counter="candidate_commits", units_per_call=1, model_forward_calls=0)
+_EDIT_CAPABILITIES = [CAP_WEIGHTS_READ, CAP_WEIGHTS_SLICE_EDIT]
+_FLOAT32_MAX = float(np.finfo(np.float32).max)
+
+# Nested lists of numbers, one nesting level per axis of the selection.
+NestedValues = TypeAliasType("NestedValues", "list[float] | list[NestedValues]")
+
+
+class SetSliceParameters(OperatorParameters):
+    values: NestedValues = Field(
+        description="replacement values as nested lists whose shape equals the selection's shape "
+        "exactly (no broadcasting); a 1-axis selection takes a flat list"
+    )
+
+
+class SetSliceOperator(BaseEditOperator):
+    """Replace a region with explicit values; shapes must match exactly."""
+
+    parameters_model = SetSliceParameters
+    spec = make_spec(
+        operator_id="set_slice",
+        version="1",
+        effect="edit",
+        description="Replace a tensor selection with explicit finite values. The values' nested-list "
+        "shape must equal the selection's shape exactly; nothing is broadcast.",
+        required_capabilities=_EDIT_CAPABILITIES,
+        parameters_model=SetSliceParameters,
+        result_model=PatchStep,
+        usage=_EDIT_USAGE,
+    )
+
+    def resolve_parameters(self, parameters: Mapping[str, Any], region: TensorRegion) -> SetSliceParameters:
+        parsed = parse_parameters(self.spec, SetSliceParameters, parameters)
+        assert isinstance(parsed, SetSliceParameters)
+        expected = tuple(region.values.shape)
+        try:
+            array = np.array(parsed.values, dtype=np.float64)
+        except ValueError:
+            array = None
+        if array is None or array.shape != expected:
+            raise WSEError(
+                ErrorCode.INVALID_ARGUMENT,
+                f"set_slice values must be nested lists of shape {list(expected)} to match the selection "
+                f"exactly; got {_shape_text(parsed.values)}",
+                details={"expected_shape": list(expected), "tensor": region.tensor},
+            )
+        _require_float32_range(array, "set_slice values", region.tensor)
+        return parsed
+
+    def apply(self, region: TensorRegion, parameters: BaseModel) -> np.ndarray:
+        assert isinstance(parameters, SetSliceParameters)
+        return np.array(parameters.values, dtype=np.float32)
+
+
+class ScaleSliceParameters(OperatorParameters):
+    factor: float = Field(description="finite multiplier applied to every element of the selection")
+
+    @field_validator("factor")
+    @classmethod
+    def _finite(cls, value: float) -> float:
+        if not math.isfinite(value) or abs(value) > _FLOAT32_MAX:
+            raise ValueError("factor must be a finite number within the float32 range")
+        return value
+
+
+class ScaleSliceOperator(BaseEditOperator):
+    """Multiply a region by a finite scalar in FP32; shape and dtype are preserved."""
+
+    parameters_model = ScaleSliceParameters
+    spec = make_spec(
+        operator_id="scale_slice",
+        version="1",
+        effect="edit",
+        description="Multiply every element of a tensor selection by a finite factor, computed in "
+        "float32. Elements whose stored bytes do not change are not counted as changed.",
+        required_capabilities=_EDIT_CAPABILITIES,
+        parameters_model=ScaleSliceParameters,
+        result_model=PatchStep,
+        usage=_EDIT_USAGE,
+    )
+
+    def apply(self, region: TensorRegion, parameters: BaseModel) -> np.ndarray:
+        assert isinstance(parameters, ScaleSliceParameters)
+        with np.errstate(over="ignore", invalid="ignore"):
+            return region.values.astype(np.float32) * np.float32(parameters.factor)
+
+
+def _shape_text(values: Any) -> str:
+    try:
+        return f"shape {list(np.array(values, dtype=np.float64).shape)}"
+    except ValueError:
+        return "ragged nested lists"
+
+
+def _require_float32_range(array: np.ndarray, what: str, tensor: str) -> None:
+    bad = int(np.count_nonzero(~np.isfinite(array) | (np.abs(array) > _FLOAT32_MAX)))
+    if bad:
+        raise WSEError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"{what} for tensor {tensor!r} contain {bad} value(s) that are not finite float32 numbers",
+            details={"tensor": tensor, "nonfinite_count": bad},
+        )
+
+
+BUILTIN_EDITS: dict[str, BaseEditOperator] = {
+    "set_slice": SetSliceOperator(),
+    "scale_slice": ScaleSliceOperator(),
 }

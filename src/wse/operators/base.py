@@ -8,6 +8,13 @@ advertised schemas cannot drift from what the engine validates.
 Analysis operators receive a read-only ``TensorRegion`` that the engine has
 already selected and bounded; they never read checkpoints, files, or other
 tensors themselves, and never run the target network.
+
+Edit operators receive the same read-only region and return its new values
+as an array of the region's shape. The engine computes in FP32, casts back to
+the stored dtype, writes only that region, checks shapes and finiteness, and
+records the result in the standard materialized representation
+(``PatchStep``), which is therefore every edit operator's output schema.
+Replaying a materialized patch never runs the operator again.
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ from wse.schemas import (
     ErrorCode,
     OperatorEffect,
     OperatorSpec,
+    PatchStep,
     UsageContract,
     WSEError,
 )
@@ -31,6 +39,8 @@ from wse.schemas import (
 __all__ = [
     "AnalysisOperator",
     "BaseAnalysisOperator",
+    "BaseEditOperator",
+    "EditOperator",
     "EFFECT_COUNTERS",
     "EFFECT_METHODS",
     "OperatorParameters",
@@ -113,6 +123,27 @@ class AnalysisOperator(Protocol):
         ...
 
 
+@runtime_checkable
+class EditOperator(Protocol):
+    """Contract for registered edit operators.
+
+    ``result_model`` is always ``PatchStep``: the engine, not the operator,
+    produces the materialized record of an edit.
+    """
+
+    spec: OperatorSpec
+    parameters_model: type[BaseModel]
+    result_model: type[BaseModel]
+
+    def resolve_parameters(self, parameters: Mapping[str, Any], region: TensorRegion) -> BaseModel:
+        """Validate parameters against the selected region (shape, dtype)."""
+        ...
+
+    def apply(self, region: TensorRegion, parameters: BaseModel) -> np.ndarray:
+        """Return the region's new values (same shape); must not modify the region."""
+        ...
+
+
 def make_spec(
     *,
     operator_id: str,
@@ -153,6 +184,23 @@ class BaseAnalysisOperator:
         return parse_parameters(self.spec, self.parameters_model, parameters)
 
     def analyze(self, region: TensorRegion, parameters: BaseModel) -> BaseModel:  # pragma: no cover
+        raise NotImplementedError
+
+
+class BaseEditOperator:
+    """Convenience base for edit operators.
+
+    Subclasses set ``spec`` and ``parameters_model`` and implement ``apply``.
+    """
+
+    spec: ClassVar[OperatorSpec]
+    parameters_model: ClassVar[type[BaseModel]] = OperatorParameters
+    result_model: ClassVar[type[BaseModel]] = PatchStep
+
+    def resolve_parameters(self, parameters: Mapping[str, Any], region: TensorRegion) -> BaseModel:
+        return parse_parameters(self.spec, self.parameters_model, parameters)
+
+    def apply(self, region: TensorRegion, parameters: BaseModel) -> np.ndarray:  # pragma: no cover
         raise NotImplementedError
 
 
@@ -201,6 +249,12 @@ def validate_operator(extension_id: str, version: str, implementation: Any) -> N
         raise WSEError(ErrorCode.INVALID_ARGUMENT, f"operator {spec.ref} input_schema does not match parameters_model")
     if spec.output_schema != implementation.result_model.model_json_schema():
         raise WSEError(ErrorCode.INVALID_ARGUMENT, f"operator {spec.ref} output_schema does not match result_model")
+    if spec.effect == "edit" and implementation.result_model is not PatchStep:
+        raise WSEError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"edit operator {spec.ref} must declare result_model = PatchStep, the standard "
+            "materialized patch representation",
+        )
     allowed = EFFECT_COUNTERS[spec.effect]
     if spec.usage.counter not in allowed:
         raise WSEError(

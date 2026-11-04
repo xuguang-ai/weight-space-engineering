@@ -65,6 +65,100 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             """,
         ],
     ),
+    (
+        2,
+        [
+            # Immutable experiment policies; policy_json is canonical JSON.
+            """
+            CREATE TABLE policies (
+                policy_id    TEXT PRIMARY KEY,
+                mode         TEXT NOT NULL,
+                policy_hash  TEXT NOT NULL,
+                policy_json  TEXT NOT NULL,
+                created_at   TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE run_grants (
+                run_id              TEXT PRIMARY KEY,
+                task_id             TEXT NOT NULL,
+                policy_id           TEXT NOT NULL REFERENCES policies (policy_id),
+                base_checkpoint_id  TEXT NOT NULL REFERENCES checkpoints (checkpoint_id),
+                created_at          TEXT NOT NULL
+            )
+            """,
+            # UNIQUE (run_id): at most one experiment per run grant.
+            """
+            CREATE TABLE experiments (
+                experiment_id           TEXT PRIMARY KEY,
+                run_id                  TEXT NOT NULL UNIQUE REFERENCES run_grants (run_id),
+                task_id                 TEXT NOT NULL,
+                policy_id               TEXT NOT NULL REFERENCES policies (policy_id),
+                policy_hash             TEXT NOT NULL,
+                mode                    TEXT NOT NULL,
+                base_checkpoint_id      TEXT NOT NULL REFERENCES checkpoints (checkpoint_id),
+                selected_checkpoint_id  TEXT NOT NULL REFERENCES checkpoints (checkpoint_id),
+                state                   TEXT NOT NULL CHECK (state IN ('OPEN', 'FROZEN', 'CLOSED')),
+                created_at              TEXT NOT NULL,
+                ended_at                TEXT
+            )
+            """,
+            # Consumption can never exceed the limit, so a conditional UPDATE that
+            # would overdraw fails instead of overallocating.
+            """
+            CREATE TABLE budget_ledger (
+                experiment_id  TEXT NOT NULL REFERENCES experiments (experiment_id),
+                counter        TEXT NOT NULL,
+                limit_value    NUMERIC NOT NULL CHECK (limit_value >= 0),
+                consumed       NUMERIC NOT NULL DEFAULT 0 CHECK (consumed >= 0 AND consumed <= limit_value),
+                PRIMARY KEY (experiment_id, counter)
+            )
+            """,
+            """
+            CREATE TABLE patches (
+                patch_id               TEXT PRIMARY KEY,
+                experiment_id          TEXT NOT NULL REFERENCES experiments (experiment_id),
+                state                  TEXT NOT NULL CHECK (state IN ('READY', 'CORRUPT')),
+                spec_hash              TEXT NOT NULL,
+                base_checkpoint_id     TEXT NOT NULL REFERENCES checkpoints (checkpoint_id),
+                result_weights_hash    TEXT NOT NULL,
+                relpath                TEXT NOT NULL,
+                file_sha256            TEXT NOT NULL,
+                size_bytes             INTEGER NOT NULL,
+                preview_json           TEXT NOT NULL,
+                applied_checkpoint_id  TEXT REFERENCES checkpoints (checkpoint_id),
+                corrupt_reason         TEXT,
+                created_at             TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX patches_experiment ON patches (experiment_id, created_at)",
+            """
+            CREATE TABLE experiment_checkpoints (
+                experiment_id  TEXT NOT NULL REFERENCES experiments (experiment_id),
+                checkpoint_id  TEXT NOT NULL REFERENCES checkpoints (checkpoint_id),
+                role           TEXT NOT NULL CHECK (role IN ('base', 'candidate')),
+                patch_id       TEXT REFERENCES patches (patch_id),
+                created_at     TEXT NOT NULL,
+                PRIMARY KEY (experiment_id, checkpoint_id)
+            )
+            """,
+            # One record per (scope, key); the request hash detects key reuse
+            # with different input.
+            """
+            CREATE TABLE idempotency_records (
+                scope            TEXT NOT NULL,
+                idempotency_key  TEXT NOT NULL,
+                operation        TEXT NOT NULL,
+                request_hash     TEXT NOT NULL,
+                result_json      TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                PRIMARY KEY (scope, idempotency_key)
+            )
+            """,
+            "ALTER TABLE audit_events ADD COLUMN experiment_id TEXT",
+            "CREATE INDEX audit_events_experiment ON audit_events (experiment_id, event_id)",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -126,28 +220,42 @@ class Database:
 
 
 def insert_audit_event(
-    conn: sqlite3.Connection, event_type: str, subject_id: str | None, payload: dict[str, Any]
+    conn: sqlite3.Connection,
+    event_type: str,
+    subject_id: str | None,
+    payload: dict[str, Any],
+    *,
+    experiment_id: str | None = None,
 ) -> None:
     """Append one structured audit event inside the caller's transaction."""
     conn.execute(
-        "INSERT INTO audit_events (created_at, event_type, subject_id, payload) VALUES (?, ?, ?, ?)",
-        (utc_now(), event_type, subject_id, canonical_json(payload)),
+        "INSERT INTO audit_events (created_at, event_type, subject_id, payload, experiment_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (utc_now(), event_type, subject_id, canonical_json(payload), experiment_id),
     )
 
 
-def audit_events(conn: sqlite3.Connection, subject_id: str | None = None) -> list[dict[str, Any]]:
-    query = "SELECT event_id, created_at, event_type, subject_id, payload FROM audit_events"
-    args: tuple[Any, ...] = ()
+def audit_events(
+    conn: sqlite3.Connection, subject_id: str | None = None, *, experiment_id: str | None = None
+) -> list[dict[str, Any]]:
+    query = "SELECT event_id, created_at, event_type, subject_id, experiment_id, payload FROM audit_events"
+    clauses, args = [], []
     if subject_id is not None:
-        query += " WHERE subject_id = ?"
-        args = (subject_id,)
-    rows = conn.execute(query + " ORDER BY event_id", args).fetchall()
+        clauses.append("subject_id = ?")
+        args.append(subject_id)
+    if experiment_id is not None:
+        clauses.append("experiment_id = ?")
+        args.append(experiment_id)
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    rows = conn.execute(query + " ORDER BY event_id", tuple(args)).fetchall()
     return [
         {
             "event_id": row["event_id"],
             "created_at": row["created_at"],
             "event_type": row["event_type"],
             "subject_id": row["subject_id"],
+            "experiment_id": row["experiment_id"],
             "payload": json.loads(row["payload"]),
         }
         for row in rows
