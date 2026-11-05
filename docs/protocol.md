@@ -35,6 +35,7 @@ wse --workspace WORKSPACE serve --run-id run_example
 | `--no-worker` | Do not start the evaluation worker. By default the server process owns the run's job scheduler and keeps one worker process running until it exits. |
 | `--worker-args "..."` | Extra worker options, for example `"--poll-seconds 0.02"`. |
 | `--constraint-status verified` | Attest that the host has no other execution channel (Section 6.1 of the plan). The default is `unverified`. |
+| `--log-file PATH` | Append the server's and its worker's log lines to this file instead of stderr (the reference runner uses it). |
 
 The transport is stdio: stdout carries only the protocol and every log line
 goes to stderr. When the client closes the connection, the server stops its

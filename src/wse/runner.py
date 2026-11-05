@@ -96,8 +96,10 @@ __all__ = [
     "initial_message",
     "parse_controller_config",
     "render_instructions",
+    "render_trials_markdown",
     "run_experiment",
     "serve_environment",
+    "summarize_trial",
 ]
 
 logger = logging.getLogger("wse.runner")
@@ -731,3 +733,98 @@ def run_experiment(run_id: str, task_id: str, policy_id: str,
                    **runner_options: Any) -> str:
     """Run one controller on a run grant's experiment and freeze it (see ``ReferenceRunner``)."""
     return ReferenceRunner(workspace, **runner_options).run_experiment(run_id, task_id, policy_id, agent_config)
+
+
+# ---------------------------------------------------------------------------
+# Trial summaries (Section 7.2: agent acceptance is reported separately)
+# ---------------------------------------------------------------------------
+
+SUCCESS_ACCURACY = 0.99
+
+
+def summarize_trial(engine: Engine, experiment_id: str, *, threshold: float = SUCCESS_ACCURACY) -> dict[str, Any]:
+    """One trial's record for reporting: controller, termination, costs, changed fraction, and final result.
+
+    ``success`` is ``None`` until the experiment is closed by final
+    evaluation; then it is whether the frozen candidate's final accuracy is
+    at least ``threshold``. ``failure_cause`` explains every unsuccessful
+    trial from the controller's termination record and the final result.
+    """
+    engine._require_operator("summarizing a trial")
+    experiment = engine.get_experiment(experiment_id)
+    record = controller_record(engine.store.db, experiment_id) or {}
+    result = record.get("result") or {}
+    usage = result.get("usage") or {}
+    checkpoints = engine.list_experiment_checkpoints(experiment_id)
+    selected = next(c for c in checkpoints if c.checkpoint_id == experiment.selected_checkpoint_id)
+    parameters = engine.load_manifest(selected.checkpoint_id).parameter_count
+    changed = engine.get_patch(experiment_id, selected.patch_id).changed_elements if selected.patch_id else 0
+    config = record.get("config") or {}
+    row: dict[str, Any] = {
+        "experiment_id": experiment_id, "run_id": experiment.run_id, "policy_id": experiment.policy_id,
+        "mode": experiment.mode, "state": experiment.state,
+        "controller": None if not record else f"{record['controller']['extension_id']}@"
+                                              f"{record['controller']['version']}",
+        "model": config.get("model"), "status": result.get("status"), "reason": result.get("reason"),
+        "stop_condition": result.get("stop_condition"),
+        "candidates": sum(1 for c in checkpoints if c.role == "candidate"),
+        "evaluated_examples": experiment.budget["evaluated_examples"].consumed,
+        "compute_seconds": round(float(experiment.budget["compute_seconds"].consumed), 6),
+        "elapsed_seconds": result.get("elapsed_seconds"), "turns": result.get("turns"),
+        "tool_calls": result.get("tool_calls"),
+        "tokens": {name: usage.get(name) for name in ("input_tokens", "output_tokens", "total_tokens")},
+        "tokens_unavailable": {name: reason for name, reason in (usage.get("unavailable") or {}).items()
+                               if name in ("input_tokens", "output_tokens", "total_tokens")},
+        "changed_elements": changed, "parameter_count": parameters,
+        "changed_fraction": changed / parameters if parameters else 0.0,
+        "constraint_status": record.get("constraint_status"), "tracing": record.get("tracing"),
+        "final": None, "success": None, "failure_cause": None,
+    }
+    if experiment.state == "CLOSED":
+        final = engine.get_final_report(experiment_id)
+        comparison = final.comparison
+        row["final"] = {"candidate_accuracy": comparison.candidate_value, "control_accuracy": comparison.base_value,
+                        "difference": comparison.difference,
+                        "fully_correct_clusters": comparison.candidate_fully_correct.successes,
+                        "clusters": comparison.candidate_fully_correct.trials,
+                        "clopper_pearson_lower": comparison.candidate_fully_correct.lower,
+                        "clopper_pearson_upper": comparison.candidate_fully_correct.upper}
+        row["success"] = comparison.candidate_value >= threshold
+        if not row["success"]:
+            row["failure_cause"] = (f"final accuracy {comparison.candidate_value:g} is below {threshold:g}; the "
+                                    f"controller ended {row['status']}: {row['reason']}")
+    elif experiment.state == "OPEN":
+        row["failure_cause"] = "the experiment was not frozen: " + str(result.get("finalization_error") or
+                                                                       "the controller did not finish")
+    return row
+
+
+def render_trials_markdown(rows: Sequence[Mapping[str, Any]], *, threshold: float = SUCCESS_ACCURACY) -> str:
+    """A concise Markdown report of trials: a table, the success count, and every failure cause."""
+    closed = [row for row in rows if row["success"] is not None]
+    lines = ["# Trial report", "",
+             f"{sum(1 for row in closed if row['success'])}/{len(rows)} trials found a candidate with final accuracy "
+             f">= {threshold:.0%}" + ("" if len(closed) == len(rows) else f" ({len(rows) - len(closed)} not yet "
+                                       "final-evaluated)") + ".", "",
+             "| Experiment | Controller | Model | Policy | Status | Candidates | Evaluated examples | Elapsed s | "
+             "Tokens (in/out) | Changed fraction | Final accuracy (control) | CP 95% lower |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for row in rows:
+        tokens = row["tokens"]
+        token_text = ("n/a" if tokens["input_tokens"] is None
+                      else f"{tokens['input_tokens']}/{tokens['output_tokens']}")
+        final = row["final"]
+        final_text = "pending" if final is None else f"{final['candidate_accuracy']:.4f} ({final['control_accuracy']:.4f})"
+        lower = "" if final is None else f"{final['clopper_pearson_lower']:.4f}"
+        elapsed = "" if row["elapsed_seconds"] is None else f"{row['elapsed_seconds']:.1f}"
+        lines.append(f"| {row['experiment_id']} | {row['controller']} | {row['model'] or ''} | {row['policy_id']} | "
+                     f"{row['status']} | {row['candidates']} | {row['evaluated_examples']} | {elapsed} | "
+                     f"{token_text} | {row['changed_fraction']:.4f} | {final_text} | {lower} |")
+    lines += ["", "Termination and failure causes:", ""]
+    for row in rows:
+        cause = row["failure_cause"] or "success"
+        lines.append(f"- {row['experiment_id']}: {row['status']} ({row['reason']}); {cause}")
+    unavailable = {reason for row in rows for reason in row["tokens_unavailable"].values()}
+    if unavailable:
+        lines += ["", "Token counts reported as n/a: " + "; ".join(sorted(unavailable)) + "."]
+    return "\n".join(lines) + "\n"

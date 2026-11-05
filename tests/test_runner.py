@@ -28,6 +28,7 @@ from wse.runner import (
     allowed_tools,
     render_instructions,
     serve_environment,
+    summarize_trial,
 )
 from wse.schemas import ErrorCode, TaskDefinition, WSEError
 from wse.strategies.base import Action
@@ -103,6 +104,26 @@ def test_the_weights_only_control_stops_after_its_single_candidate_commit(engine
     assert set(record["config"]["allowed_tools"]).isdisjoint(EVALUATION_TOOLS)
     final = engine.final_evaluate(eid)  # no development score guided this candidate
     assert final.candidate_checkpoint_id == experiment.selected_checkpoint_id
+
+
+def test_trial_summaries_report_costs_changed_fraction_and_failure_causes(engine, workspace, prepared, capsys):
+    run_id = _grant(engine, prepared, WEIGHTS_ONLY_POLICY_ID)
+    eid, _ = _run(workspace, run_id, prepared, WEIGHTS_ONLY_POLICY_ID)
+    pending = summarize_trial(engine, eid)
+    assert pending["success"] is None and pending["final"] is None and pending["state"] == "FROZEN"
+    engine.final_evaluate(eid)
+    capsys.readouterr()
+    assert cli_main(["--workspace", str(workspace), "trials", eid, "--format", "markdown"]) == 0
+    text = capsys.readouterr().out
+    assert "0/1 trials found a candidate with final accuracy >= 99%" in text and eid in text
+    row = summarize_trial(engine, eid)
+    assert row["candidates"] == 1 and row["evaluated_examples"] == 0 and row["changed_elements"] > 0
+    assert row["changed_fraction"] == row["changed_elements"] / row["parameter_count"]
+    assert row["tokens"]["input_tokens"] is None and row["tokens_unavailable"]["input_tokens"]
+    assert row["final"]["clusters"] == 512 and row["controller"] == "scripted_search@1"
+    assert row["success"] is (row["final"]["candidate_accuracy"] >= 0.99)
+    if not row["success"]:
+        assert row["failure_cause"].startswith("final accuracy")
 
 
 def test_three_evaluated_candidates_without_improvement_stop_the_run(engine, workspace, prepared):

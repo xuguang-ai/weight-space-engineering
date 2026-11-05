@@ -3,9 +3,14 @@
 This milestone provides ``wse import``, ``wse grant-run``, ``wse serve`` (the
 stdio MCP server for one run grant; see ``wse.mcp_server``), ``wse worker``
 (the evaluation worker process; see ``wse.worker``), ``wse freeze``,
-``wse final-evaluate``, ``wse report``, and the read-only operator views
-``wse experiment`` and ``wse patch``. A later milestone adds ``export``.
-Every command calls the same Engine operations as the Python API and MCP.
+``wse final-evaluate``, ``wse report``, the read-only operator views
+``wse experiment`` and ``wse patch``, ``wse run`` (the reference runner: one
+controller per run grant, then settlement and freezing; see ``wse.runner``),
+``wse export`` (an experiment export; final-set data excluded by default),
+``wse replay`` (replays an export's exact patches into the workspace and
+verifies byte-identical weights), and ``wse trials`` (per-trial summaries for
+agent-acceptance reports). Every command calls the same Engine operations as
+the Python API and MCP.
 Reports print as JSON (machine-readable) or, with ``--format markdown``, as
 concise Markdown; ``--output`` also writes the rendering to a file. Errors
 print as ``{"error": {...}}`` JSON on stderr with exit code 2.
@@ -76,6 +81,10 @@ def _parser() -> argparse.ArgumentParser:
                           help="also export the final set's inputs, labels, and generation seed (excluded by default)")
     replay = commands.add_parser("replay", help="replay an export's exact patches into this workspace")
     replay.add_argument("export_dir")
+    trials = commands.add_parser("trials", help="summarize trials: controller, costs, changed fraction, final result")
+    trials.add_argument("experiment_ids", nargs="+")
+    trials.add_argument("--format", choices=("json", "markdown"), default="json")
+    trials.add_argument("--output", default=None, help="also write the rendering to this file")
     experiment = commands.add_parser("experiment", help="print an experiment's state and budget")
     experiment.add_argument("experiment_id")
     patch = commands.add_parser("patch", help="print a stored patch: its frozen spec and exact materialized patch")
@@ -220,6 +229,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                                                     include_base_weights=not args.no_base_weights,
                                                     include_final_data=args.include_final_data)
                 print(json.dumps(exported.model_dump(mode="json"), indent=2, sort_keys=True))
+            elif args.command == "trials":
+                from wse.runner import render_trials_markdown, summarize_trial
+
+                rows = [summarize_trial(engine, experiment_id) for experiment_id in args.experiment_ids]
+                text = (render_trials_markdown(rows) if args.format == "markdown"
+                        else json.dumps(rows, indent=2, sort_keys=True) + "\n")
+                if args.output:
+                    with open(args.output, "w", encoding="utf-8") as handle:
+                        handle.write(text)
+                sys.stdout.write(text)
             elif args.command == "replay":
                 print(json.dumps(engine.replay_export(args.export_dir).model_dump(mode="json"), indent=2,
                                  sort_keys=True))
