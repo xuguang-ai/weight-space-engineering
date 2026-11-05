@@ -280,7 +280,7 @@ class Worker:
             if policy.policy_hash != experiment["policy_hash"]:
                 raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"policy of experiment {experiment['experiment_id']} changed")
             meter.batch_size = policy.budget.examples_per_batch
-            suite = self.jobs.get_suite(row["suite_id"])
+            suite = self.jobs.load_suite(row["suite_id"])
             config = EvalConfig.model_validate_json(row["config_json"])
             evaluator = self.engine.registry.resolve_ref("evaluator", suite.evaluator)
             handle = self.engine.open_checkpoint(row["checkpoint_id"])

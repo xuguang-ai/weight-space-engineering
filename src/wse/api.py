@@ -722,6 +722,10 @@ class Engine:
         self._require_operator("registering an evaluation suite")
         return self.jobs.register_suite(suite)
 
+    def get_suite(self, suite_id: str) -> EvaluationSuite:
+        """A registered suite; a run-bound engine sees only development suites of its task."""
+        return self.jobs.get_suite(suite_id)
+
     def submit_evaluation(self, experiment_id: str, checkpoint_id: str, suite_id: str,
                           config: EvalConfig | Mapping[str, Any], key: str) -> Job:
         """Queue a development evaluation; returns the job immediately."""

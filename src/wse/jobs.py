@@ -122,7 +122,19 @@ class JobService:
                 )
         return parsed
 
-    def get_suite(self, suite_id: Any, conn: sqlite3.Connection | None = None) -> EvaluationSuite:
+    def get_suite(self, suite_id: Any) -> EvaluationSuite:
+        """A registered suite. A run-bound service sees only development suites of its run's task."""
+        suite = self.load_suite(suite_id)
+        bound = self.experiments.bound_run_id
+        if bound is not None:
+            grant = self.experiments._grant_row(bound)
+            if suite.split != "development" or suite.task_id != grant["task_id"]:
+                raise WSEError(ErrorCode.NOT_FOUND, f"suite {suite_id!r} does not exist",
+                               details={"suite_id": str(suite_id)})
+        return suite
+
+    def load_suite(self, suite_id: Any, conn: sqlite3.Connection | None = None) -> EvaluationSuite:
+        """Any registered suite, unscoped (service and worker use)."""
         row = None
         if isinstance(suite_id, str) and len(suite_id) <= 128:
             row = (conn or self.db.conn).execute("SELECT * FROM suites WHERE suite_id = ?", (suite_id,)).fetchone()
@@ -136,7 +148,7 @@ class JobService:
 
     def _development_suite(self, suite_id: Any, task_id: str) -> EvaluationSuite:
         try:
-            suite = self.get_suite(suite_id)
+            suite = self.load_suite(suite_id)
         except WSEError as exc:
             if exc.code != ErrorCode.NOT_FOUND:
                 raise

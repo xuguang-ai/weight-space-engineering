@@ -622,6 +622,8 @@ def test_a_worker_process_never_runs_forward_in_weights_only_mode(workspace, eng
 
 
 def test_a_bound_engine_sees_only_its_own_jobs_and_cannot_touch_the_ledger(workspace, engine, base, signed_sum):
+    engine.register_suite(_suite(signed_sum, "signed_sum_final_stub", split="final"))
+    engine.register_suite(_suite(signed_sum, "other_task_dev", task_id="other_task"))
     mine, other = _experiment(engine, base), _experiment(engine, base)
     foreign = engine.submit_evaluation(other.experiment_id, base.checkpoint_id, DEV, {"sample_count": 8, "seed": 0},
                                        "k1")
@@ -636,6 +638,11 @@ def test_a_bound_engine_sees_only_its_own_jobs_and_cannot_touch_the_ledger(works
                 {"evaluation_batches": 1})
         _expect(ErrorCode.POLICY_DENIED, bound.settle, own.reservation.reservation_id, {}, "failed")
         _expect(ErrorCode.POLICY_DENIED, bound.register_suite, _suite(signed_sum, "bound_suite"))
+        # A bound engine cannot read a final suite (or another task's suite) at all.
+        assert bound.get_suite(DEV).suite_id == DEV
+        _expect(ErrorCode.NOT_FOUND, bound.get_suite, "signed_sum_final_stub")
+        _expect(ErrorCode.NOT_FOUND, bound.get_suite, "other_task_dev")
+        _expect(ErrorCode.NOT_FOUND, bound.jobs.get_suite, "signed_sum_final_stub")
     assert engine.get_job(other.experiment_id, foreign.job_id).state == "queued"
 
 
