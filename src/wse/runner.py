@@ -620,7 +620,12 @@ class ReferenceRunner:
                     status, reason = "stopped", stop
                     break
                 budget = bound.get_experiment(eid).budget
-                action = strategy.next_action(task.objective, list(observations), budget)
+                try:
+                    action = strategy.next_action(task.objective, list(observations), budget)
+                except Exception as exc:  # noqa: BLE001 - a strategy failure still settles and freezes
+                    logger.exception("strategy failed")
+                    status, reason = "error", f"{type(exc).__name__}: {exc}"[:2000]
+                    break
                 steps += 1
                 if action.kind == "stop":
                     status, reason = "completed", f"the strategy stopped: {action.reason}"
@@ -712,9 +717,13 @@ class ReferenceRunner:
                         trace.emit("cancel_requested", details={"reason": reason})
                         adapter.cancel(eid, reason)
 
-                await adapter.start(connection, config)
                 try:
-                    result = await adapter.run(eid, config, sink)
+                    try:
+                        await adapter.start(connection, config)
+                        result = await adapter.run(eid, config, sink)
+                    except Exception as exc:  # noqa: BLE001 - an adapter failure still settles and freezes
+                        logger.exception("agent adapter failed")
+                        result = AgentRunResult(status="error", reason=f"{type(exc).__name__}: {exc}"[:2000])
                     try:
                         finalization = await asyncio.to_thread(self._finalize, operator, eid)
                     except WSEError as exc:

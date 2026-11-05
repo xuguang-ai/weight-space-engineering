@@ -306,7 +306,7 @@ with Engine(sys.argv[2]) as engine:
 runner = wse.runner.ReferenceRunner(sys.argv[2])
 eid = runner.run_experiment(run_id, ids['task_id'], 'small_model_weights_only_v1', {'kind': 'strategy'})
 try:
-    asyncio.run(OpenAIAgentsAdapter('a-model').start(None, None))
+    OpenAIAgentsAdapter('a-model')
 except WSEError as exc:
     code = exc.code.value
 print(json.dumps({'state': runner.last_result['result']['finalization']['state'], 'code': code,
@@ -324,3 +324,27 @@ def test_the_base_package_and_scripted_runs_work_without_the_optional_sdk(tmp_pa
     assert probe.returncode == 0, probe.stderr
     assert json.loads(probe.stdout.strip().splitlines()[-1]) == {"state": "FROZEN", "code": "UNSUPPORTED_CAPABILITY",
                                                                  "loaded": []}
+
+
+class FailingStrategy:
+    strategy_id, version = "failing", "1"
+
+    def config(self):
+        return {}
+
+    def next_action(self, objective, observations, remaining_budget):
+        raise RuntimeError("strategy bug")
+
+
+def test_a_failing_controller_is_recorded_and_its_experiment_still_frozen(engine, workspace, prepared):
+    from wse.registry import builtin_registry
+
+    registry = builtin_registry()
+    registry.register("strategy", "failing", "1", FailingStrategy)
+    run_id = _grant(engine, prepared, WEIGHTS_ONLY_POLICY_ID)
+    runner = ReferenceRunner(workspace, registry=registry)
+    eid = runner.run_experiment(run_id, prepared["task_id"], WEIGHTS_ONLY_POLICY_ID,
+                                {"kind": "strategy", "strategy": "failing@1"})
+    result = runner.last_result["result"]
+    assert result["status"] == "error" and "strategy bug" in result["reason"]
+    assert engine.get_experiment(eid).state == "FROZEN"

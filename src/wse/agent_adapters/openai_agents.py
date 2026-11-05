@@ -198,12 +198,15 @@ class OpenAIAgentsAdapter(AgentAdapter):
 
     ``model`` is the operator-chosen model name, or an SDK ``Model`` instance
     (a test double); when omitted, the ``AgentConfig.model`` name is used.
+    Constructing the adapter without the optional SDK fails with
+    ``UNSUPPORTED_CAPABILITY``.
     """
 
     adapter_id = "openai_agents"
     version = "1"
 
     def __init__(self, model: Any = None) -> None:
+        _require_sdk()  # fail before the runner records a controller for the run grant
         self.model = model
         self._sessions: dict[str, _Session] = {}
         self._lock = threading.Lock()
