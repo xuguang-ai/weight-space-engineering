@@ -72,6 +72,19 @@ class RecoveryReport:
 OnCommit = Callable[[sqlite3.Connection, ModelManifest], None]
 
 
+def checkpoint_not_found(checkpoint_id: object) -> WSEError:
+    """The error for a checkpoint ID that does not exist or is not visible to the caller.
+
+    Hidden and nonexistent checkpoints share this exact error, so a caller
+    cannot learn whether an ID it may not see exists.
+    """
+    return WSEError(
+        ErrorCode.NOT_FOUND,
+        f"checkpoint {checkpoint_id!r} does not exist",
+        details={"checkpoint_id": str(checkpoint_id)},
+    )
+
+
 def _hex(hash_text: str) -> str:
     return hash_text.removeprefix("sha256:")
 
@@ -384,11 +397,7 @@ class ArtifactStore:
                 "SELECT * FROM checkpoints WHERE checkpoint_id = ?", (checkpoint_id,)
             ).fetchone()
         if row is None:
-            raise WSEError(
-                ErrorCode.NOT_FOUND,
-                f"checkpoint {checkpoint_id!r} does not exist",
-                details={"checkpoint_id": str(checkpoint_id)},
-            )
+            raise checkpoint_not_found(checkpoint_id)
         if row["state"] != "READY":
             raise WSEError(
                 ErrorCode.ARTIFACT_CORRUPT,

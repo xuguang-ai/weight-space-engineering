@@ -262,6 +262,13 @@ def validate_operator(extension_id: str, version: str, implementation: Any) -> N
             f"{spec.effect} operator {spec.ref} declares usage counter {spec.usage.counter!r}; "
             f"{spec.effect} operators are charged under one of {sorted(allowed)}",
         )
+    if spec.effect == "edit" and spec.usage.units_per_call != 1:
+        raise WSEError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"edit operator {spec.ref} declares units_per_call={spec.usage.units_per_call}; edit operators "
+            "must declare units_per_call=1, because the managed path charges exactly one candidate commit "
+            "per applied patch, whatever its operators",
+        )
     if spec.effect in ("analysis", "edit") and spec.usage.model_forward_calls != 0:
         raise WSEError(
             ErrorCode.INVALID_ARGUMENT,

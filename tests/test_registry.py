@@ -273,6 +273,13 @@ def test_operator_usage_contract_must_match_the_effect():
 
     assert "candidate_commits" in rejected(EditChargedAsAnalysis())
 
+    class EditChargedFiveCommits(EditChargedAsAnalysis):
+        spec = _spec(effect="edit", result=PatchStep,
+                     usage=UsageContract(counter="candidate_commits", units_per_call=5))
+
+    # The managed path charges exactly one candidate commit per applied patch.
+    assert "units_per_call=1" in rejected(EditChargedFiveCommits())
+
     class ChargesReads(_Custom):
         spec = _spec(usage=UsageContract(counter="tensor_read_calls", units_per_call=3))
 

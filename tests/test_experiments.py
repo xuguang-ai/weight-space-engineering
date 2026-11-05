@@ -436,3 +436,100 @@ def test_closed_states_reject_mutations_but_keep_recorded_results(engine, base, 
     _expect(ErrorCode.VERSION_CONFLICT, engine.select_checkpoint, eid, base.checkpoint_id, base.checkpoint_id, "s1")
     assert engine.preview_patch(eid, _spec(base.checkpoint_id), "p1") == preview
     assert engine.get_experiment(eid).budget["candidate_commits"].consumed == 0
+
+
+# -- run-bound engines expose only the grant's objects ------------------------------------
+
+
+def _not_found_message(func, *args):
+    """The NOT_FOUND error of ``func(*args)``, with the checkpoint ID masked for comparison."""
+    error = _expect(ErrorCode.NOT_FOUND, func, *args)
+    return error.message.replace(str(args[0]), "<id>"), {**error.details, "checkpoint_id": "<id>"}
+
+
+def test_a_run_bound_engine_exposes_only_its_grant_base_and_own_candidates(workspace, engine, bundles, base, grant,
+                                                                           experiment):
+    reference = engine.import_bundle(bundles["reference"])
+    other_grant = engine.grant_run(TASK, SMALL_MODEL_POLICY_ID, base.checkpoint_id)
+    other = engine.create_experiment(other_grant.run_id, TASK, SMALL_MODEL_POLICY_ID, "c1")
+    foreign = engine.apply_patch(other.experiment_id,
+                                 engine.preview_patch(other.experiment_id, _spec(base.checkpoint_id), "p1").patch_id,
+                                 "a1")
+    eid = experiment.experiment_id
+    missing = "ckpt_" + "0" * 32
+    weight = "layers.1.weight"
+    with Engine(workspace, run_id=grant.run_id) as bound:
+        assert [m.checkpoint_id for m in bound.list_models()] == [base.checkpoint_id]
+        own = bound.apply_patch(eid, bound.preview_patch(eid, _spec(base.checkpoint_id), "p1").patch_id, "a1")
+        assert [m.checkpoint_id for m in bound.list_models()] == [base.checkpoint_id, own.checkpoint_id]
+        for visible in (base.checkpoint_id, own.checkpoint_id):
+            assert bound.inspect(visible).checkpoint_id == visible
+            assert bound.load_manifest(visible).checkpoint_id == visible
+            assert bound.read_tensor_slice(visible, weight, ROW1).element_count == 4
+            assert bound.analyze(visible, "stats", weight, ROW1).result["count"] == 4
+            assert bound.open_checkpoint(visible).weights_hash == bound.load_manifest(visible).weights_hash
+        # Other checkpoints fail exactly like an ID that does not exist, so existence is not confirmed.
+        calls = [
+            lambda c: bound.inspect(c),
+            lambda c: bound.load_manifest(c),
+            lambda c: bound.read_tensor_slice(c, weight, ROW1),
+            lambda c: bound.read_tensor(c, weight, ROW1),
+            lambda c: bound.analyze(c, "stats", weight, ROW1),
+            lambda c: bound.open_checkpoint(c),
+        ]
+        for call in calls:
+            expected = _not_found_message(call, missing)
+            for hidden in (reference.checkpoint_id, foreign.checkpoint_id):
+                assert _not_found_message(call, hidden) == expected
+        for hidden in (reference.checkpoint_id, foreign.checkpoint_id):
+            assert _not_found_message(lambda c: bound.preview_patch(eid, _spec(c), f"p-{c}"), hidden) == \
+                _not_found_message(lambda c: bound.preview_patch(eid, _spec(c), f"p-{c}"), missing)
+            assert _not_found_message(lambda c: bound.select_checkpoint(eid, c, base.checkpoint_id, f"s-{c}"),
+                                      hidden) == \
+                _not_found_message(lambda c: bound.select_checkpoint(eid, c, base.checkpoint_id, f"s-{c}"), missing)
+        # Operator actions are denied to a run.
+        _expect(ErrorCode.POLICY_DENIED, bound.import_bundle, bundles["reference"])
+        _expect(ErrorCode.POLICY_DENIED, bound.import_model, {"adapter": "mlp@1", "config": {"layer_sizes": [2, 2]}},
+                {"layers.0.weight": torch.eye(2), "layers.0.bias": torch.zeros(2)})
+        _expect(ErrorCode.POLICY_DENIED, bound.grant_run, TASK, SMALL_MODEL_POLICY_ID, base.checkpoint_id)
+        _expect(ErrorCode.POLICY_DENIED, bound.register_policy,
+                ExperimentPolicy(policy_id="bigger_v2", mode="bounded_eval"))
+    # The unbound operator engine still sees everything.
+    assert {reference.checkpoint_id, foreign.checkpoint_id} <= {m.checkpoint_id for m in engine.list_models()}
+
+
+def test_a_bound_engine_before_creation_sees_only_the_grant_base(workspace, engine, bundles, base):
+    reference = engine.import_bundle(bundles["reference"])
+    grant = engine.grant_run(TASK, SMALL_MODEL_POLICY_ID, base.checkpoint_id)
+    with Engine(workspace, run_id=grant.run_id) as bound:
+        assert [m.checkpoint_id for m in bound.list_models()] == [base.checkpoint_id]
+        _expect(ErrorCode.NOT_FOUND, bound.inspect, reference.checkpoint_id)
+
+
+# -- review fixes: argument types and traceable creation failures ---------------------------
+
+
+@pytest.mark.parametrize("expected", [{"x": 1}, ["a"], 3, None])
+def test_select_rejects_a_non_string_expected_id_as_a_domain_error(engine, base, experiment, expected):
+    eid = experiment.experiment_id
+    error = _expect(ErrorCode.INVALID_ARGUMENT, engine.select_checkpoint, eid, base.checkpoint_id, expected, "s1")
+    assert "expected_selected_id" in error.message
+    assert engine.audit_log(eid)[-1]["event_type"] == "experiment.select.failed"
+    assert engine.get_experiment(eid).selected_checkpoint_id == base.checkpoint_id
+
+
+def test_rejected_experiment_creation_is_recorded(engine, base, grant, experiment):
+    _expect(ErrorCode.POLICY_DENIED, engine.create_experiment, grant.run_id, TASK, WEIGHTS_ONLY_POLICY_ID, "c3")
+    _expect(ErrorCode.IDEMPOTENCY_CONFLICT, engine.create_experiment, grant.run_id, "other_task",
+            SMALL_MODEL_POLICY_ID, "create-1")
+    failures = [e for e in engine.audit_log(experiment.experiment_id) if e["event_type"] == "experiment.create.failed"]
+    assert [f["payload"]["code"] for f in failures] == ["POLICY_DENIED", "IDEMPOTENCY_CONFLICT"]
+    assert all(f["subject_id"] == grant.run_id for f in failures)
+    # Before any experiment exists, the failure is recorded against the run grant.
+    fresh = engine.grant_run(TASK, SMALL_MODEL_POLICY_ID, base.checkpoint_id)
+    _expect(ErrorCode.POLICY_DENIED, engine.create_experiment, fresh.run_id, "other_task", SMALL_MODEL_POLICY_ID, "c1")
+    from wse.database import audit_events
+
+    events = audit_events(engine.store.db.conn, fresh.run_id)
+    assert [e["event_type"] for e in events][-1] == "experiment.create.failed"
+    assert events[-1]["experiment_id"] is None

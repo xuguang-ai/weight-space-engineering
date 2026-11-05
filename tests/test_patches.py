@@ -426,8 +426,14 @@ def test_core_patch_modules_import_no_mcp_or_agent_sdk():
     assert result.stdout.strip() == "[]"
 
 
-def test_unused_registry_is_not_required_for_replay(task_model):
+def test_replay_resolves_nothing_from_any_registry(task_model, monkeypatch):
     result = apply_operator(task_model, "scale_slice", {k: v for k, v in ORACLE_SCALE.items() if k != "op"})
-    assert Registry().list("operator") == []
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("replay must not resolve any registered extension")
+
+    monkeypatch.setattr(Registry, "resolve", refuse)
+    monkeypatch.setattr(Registry, "resolve_ref", refuse)
+    monkeypatch.setattr("wse.registry.builtin_registry", refuse)
     assert replay_patch(task_model, result.patch).weights_hash == result.candidate.weights_hash
     assert isinstance(result.candidate.tensor("layers.1.weight"), torch.Tensor)

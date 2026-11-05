@@ -24,7 +24,8 @@ Rules implemented here (Sections 4.1, 5.1-5.3, and 6.2 of the plan):
   exceed the policy's limit.
 * ``select_checkpoint`` is a compare-and-swap on the selected ID; selecting an
   ancestor is a rollback, which deletes no history and refunds nothing.
-* Rejected mutations are recorded as audit events and leave state unchanged.
+* Rejected mutations (creation, previews, applies, selections) are recorded
+  as audit events and leave state unchanged.
 """
 
 from __future__ import annotations
@@ -99,6 +100,14 @@ def _check_key(key: Any) -> str:
             "a request and a new key for a new request",
         )
     return key
+
+
+def _hashable(value: Any) -> Any:
+    """``value`` for request hashing; non-JSON input hashes by type and text."""
+    try:
+        return json.loads(canonical_json(value))
+    except WSEError:
+        return {"unhashable": type(value).__name__, "text": repr(value)[:256]}
 
 
 def _number(value: Any) -> int | float:
@@ -239,7 +248,7 @@ class ExperimentService:
     def _guarded(
         self,
         operation: str,
-        experiment_id: str,
+        experiment_id: str | None,
         request_hash: str,
         subject_id: str | None,
         body: Callable[[], Any],
@@ -302,11 +311,28 @@ class ExperimentService:
         )
 
     def create_experiment(self, run_id: str, task_id: str, policy_id: str, key: str) -> Experiment:
-        """Create the run's single experiment, or return it if it already exists."""
+        """Create the run's single experiment, or return it if it already exists.
+
+        A rejected request is recorded against the run's experiment when it
+        exists, and against the run grant otherwise.
+        """
+        request_hash = json_hash({"operation": "create_experiment", "run_id": _hashable(run_id),
+                                  "task_id": _hashable(task_id), "policy_id": _hashable(policy_id)})
+        try:
+            return self._create(run_id, task_id, policy_id, key, request_hash)
+        except WSEError as exc:
+            existing = None
+            if isinstance(run_id, str) and OBJECT_ID_PATTERNS["run"].fullmatch(run_id):
+                existing = self.db.conn.execute(
+                    "SELECT experiment_id FROM experiments WHERE run_id = ?", (run_id,)).fetchone()
+            record_failure(self.db, "experiment.create", exc,
+                           experiment_id=existing["experiment_id"] if existing else None,
+                           subject_id=str(run_id), request_hash=request_hash)
+            raise
+
+    def _create(self, run_id: Any, task_id: Any, policy_id: Any, key: Any, request_hash: str) -> Experiment:
         _check_key(key)
         self._check_bound(run_id)
-        request_hash = json_hash({"operation": "create_experiment", "run_id": run_id, "task_id": task_id,
-                                  "policy_id": policy_id})
         scope = f"run:{run_id}"
         with self.db.transaction() as conn:
             self._lookup(conn, scope, key, "create_experiment", request_hash)
@@ -562,7 +588,7 @@ class ExperimentService:
         """Create a READY candidate from a validated preview, charging one candidate commit."""
         _check_key(key)
         self._experiment_row(experiment_id)
-        request_hash = json_hash({"operation": "apply_patch", "patch_id": patch_id})
+        request_hash = json_hash({"operation": "apply_patch", "patch_id": _hashable(patch_id)})
         recorded = self._lookup(self.db.conn, experiment_id, key, "apply_patch", request_hash)
         if recorded is not None:
             return self._recorded_manifest(recorded)
@@ -691,8 +717,8 @@ class ExperimentService:
         """Compare-and-swap the selected checkpoint; selecting an ancestor is a rollback."""
         _check_key(key)
         self._experiment_row(experiment_id)
-        request_hash = json_hash({"operation": "select_checkpoint", "checkpoint_id": checkpoint_id,
-                                  "expected_selected_id": expected_selected_id})
+        request_hash = json_hash({"operation": "select_checkpoint", "checkpoint_id": _hashable(checkpoint_id),
+                                  "expected_selected_id": _hashable(expected_selected_id)})
         recorded = self._lookup(self.db.conn, experiment_id, key, "select_checkpoint", request_hash)
         if recorded is not None:
             return Experiment.model_validate_json(recorded)
@@ -701,6 +727,12 @@ class ExperimentService:
                                                   request_hash))
 
     def _select(self, experiment_id: str, checkpoint_id: Any, expected: Any, key: str, request_hash: str) -> Experiment:
+        if not isinstance(expected, str):
+            raise WSEError(
+                ErrorCode.INVALID_ARGUMENT,
+                f"expected_selected_id must be a checkpoint ID string, not {type(expected).__name__}; "
+                "read the experiment and pass its selected_checkpoint_id",
+            )
         self._owned_checkpoint(self.db.conn, experiment_id, checkpoint_id)
         self.store.load_manifest(checkpoint_id)  # hash-verified before it can be selected
         with self.db.transaction() as conn:

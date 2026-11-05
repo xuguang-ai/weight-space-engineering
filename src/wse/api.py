@@ -349,8 +349,13 @@ class Engine:
 
     Opening an engine applies database migrations and runs the startup
     recovery scan. ``run_id`` binds the engine to one persisted run grant (as
-    for a server process started for one agent trial): it can then create and
-    see only that run's experiment, and operator actions are denied.
+    for a server process started for one agent trial). A bound engine, and
+    every service it uses, can create and see only that run's experiment and
+    can see only the grant's base checkpoint and the candidates created in
+    that experiment: listings omit every other checkpoint, and any other
+    checkpoint ID fails with the same ``NOT_FOUND`` error as an ID that does
+    not exist. Operator actions (imports, policy registration, run grants,
+    suite registration) fail with ``POLICY_DENIED``.
     """
 
     def __init__(
@@ -370,6 +375,7 @@ class Engine:
         self.registry = registry or builtin_registry()
         self.policy = policy or default_operation_policy()
         self.max_bytes = max_bytes
+        self.bound_run_id = run_id
         self.store: ArtifactStore = ArtifactStore(workspace)
         try:
             self.last_recovery: RecoveryReport | None = self.store.recover() if recover else None
@@ -387,14 +393,50 @@ class Engine:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
+    # -- run scoping ------------------------------------------------------------
+
+    def _require_operator(self, action: str) -> None:
+        if self.bound_run_id is not None:
+            raise WSEError(ErrorCode.POLICY_DENIED, f"{action} is an operator action and is not available to a run")
+
+    def visible_checkpoint_ids(self) -> set[str] | None:
+        """Checkpoint IDs a bound engine may see, or ``None`` when unbound (operator).
+
+        The set is the grant's base checkpoint plus the candidates created in
+        the run's experiment.
+        """
+        if self.bound_run_id is None:
+            return None
+        rows = self.store.db.conn.execute(
+            "SELECT base_checkpoint_id AS checkpoint_id FROM run_grants WHERE run_id = ? "
+            "UNION SELECT c.checkpoint_id FROM experiment_checkpoints c "
+            "JOIN experiments e ON e.experiment_id = c.experiment_id WHERE e.run_id = ?",
+            (self.bound_run_id, self.bound_run_id),
+        ).fetchall()
+        return {row["checkpoint_id"] for row in rows}
+
+    def require_visible(self, checkpoint_id: Any) -> str:
+        """Fail like a nonexistent ID unless this engine may see ``checkpoint_id``."""
+        from wse.store import checkpoint_not_found
+
+        visible = self.visible_checkpoint_ids()
+        if visible is not None and not (isinstance(checkpoint_id, str) and checkpoint_id in visible):
+            raise checkpoint_not_found(checkpoint_id)
+        return checkpoint_id
+
+    def _manifest(self, checkpoint_id: str) -> ModelManifest:
+        self.require_visible(checkpoint_id)
+        return self.store.load_manifest(checkpoint_id)
+
     def import_model(
         self, manifest: ImportManifest | Mapping[str, Any], tensors: Mapping[str, Any]
     ) -> ModelManifest:
-        """Validate and store a model; return its READY manifest.
+        """Validate and store a model; return its READY manifest (operator only).
 
         Importing an identical request again returns the existing checkpoint;
         identical weights are stored once.
         """
+        self._require_operator("importing a model")
         request = _import_manifest(manifest)
         adapter_ref, adapter = _resolve_adapter(self.registry, request.adapter)
         normalized = normalize_tensors(tensors)
@@ -441,17 +483,22 @@ class Engine:
         )
 
     def import_bundle(self, path: str | Path) -> ModelManifest:
+        """Import a bundle directory (operator only)."""
+        self._require_operator("importing a model")
         manifest, tensors = read_bundle(path, max_bytes=self.max_bytes)
         return self.import_model(manifest, tensors)
 
     def load_manifest(self, checkpoint_id: str) -> ModelManifest:
         """Return the manifest of a READY checkpoint."""
-        return self.store.load_manifest(checkpoint_id)
+        return self._manifest(checkpoint_id)
 
     def list_models(self) -> list[ModelManifest]:
-        """Manifests of all READY checkpoints, oldest first."""
+        """Manifests of the READY checkpoints this engine may see, oldest first."""
         manifests = []
+        visible = self.visible_checkpoint_ids()
         for checkpoint_id in self.store.list_ready():
+            if visible is not None and checkpoint_id not in visible:
+                continue
             try:
                 manifests.append(self.store.load_manifest(checkpoint_id))
             except WSEError as exc:
@@ -461,7 +508,7 @@ class Engine:
 
     def inspect(self, checkpoint_id: str) -> ModelManifest:
         """Return the manifest of a READY checkpoint (no tensor data, no forward)."""
-        return self.store.load_manifest(checkpoint_id)
+        return self._manifest(checkpoint_id)
 
     def _capabilities(self, manifest: ModelManifest) -> AdapterCapabilities:
         _, adapter = _resolve_adapter(self.registry, manifest.adapter)
@@ -470,7 +517,7 @@ class Engine:
     def _bounded_read(self, checkpoint_id: str, tensor: str, selection: Any) -> tuple[TensorSlice, torch.Tensor]:
         from wse.analysis import bounded_read
 
-        manifest = self.store.load_manifest(checkpoint_id)
+        manifest = self._manifest(checkpoint_id)
         info = manifest.tensor_info(tensor)
         return bounded_read(
             info=info,
@@ -514,7 +561,7 @@ class Engine:
         """
         from wse.analysis import run_analysis
 
-        manifest = self.store.load_manifest(checkpoint_id)
+        manifest = self._manifest(checkpoint_id)
         return run_analysis(
             registry=self.registry,
             policy=self.policy,
@@ -544,7 +591,7 @@ class Engine:
         reachable from an agent-facing path; managed inference goes through
         the worker.
         """
-        manifest = self.store.load_manifest(checkpoint_id)
+        manifest = self._manifest(checkpoint_id)
         adapter_ref, adapter = _resolve_adapter(self.registry, manifest.adapter)
         handle = _build_handle(adapter_ref, adapter, manifest, self.store.load_tensors(checkpoint_id))
         if handle.identity != manifest.identity:

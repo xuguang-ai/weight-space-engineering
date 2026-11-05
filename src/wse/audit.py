@@ -37,7 +37,7 @@ def record_failure(
     operation: str,
     error: WSEError,
     *,
-    experiment_id: str,
+    experiment_id: str | None,
     subject_id: str | None = None,
     request_hash: str | None = None,
 ) -> None:
