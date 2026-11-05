@@ -195,7 +195,7 @@ def test_setup_generates_both_sets_into_evaluator_storage(engine, workspace, ids
     files = sorted(p.relative_to(workspace).as_posix() for p in (workspace / "evaluator").rglob("*") if p.is_file())
     assert len(files) == 4 and all(name.startswith("evaluator/datasets/") for name in files)
     assert not any("evaluator" in str(p) for p in (workspace / "artifacts").rglob("*"))
-    assert not list(REPO_ROOT.glob("**/evaluator/datasets"))
+    assert not [p for d in ("src", "tests", "examples") for p in (REPO_ROOT / d).glob("**/evaluator")]
     # A fresh setup draws a fresh final seed: the final examples differ, the development set does not.
     with Engine(workspace.parent / "other") as other:
         again = signed_sum.setup_workspace(other, workspace.parent / "other_bundles")
@@ -564,3 +564,21 @@ def test_markdown_renders_comparisons(engine, workspace, ids):
     text = render_markdown(engine.compare(eid, a, b))
     assert "Base accuracy 50.00%; candidate accuracy 100.00%" in text
     assert "improved / worsened / unchanged: 32 / 0 / 0" in text
+
+
+def test_concurrent_final_evaluations_seal_one_result(engine, workspace, ids):
+    eid, _, _ = _repaired_and_frozen(engine, workspace, ids)
+    barrier, results = threading.Barrier(2), []
+
+    def run():
+        with Engine(workspace, recover=False) as own:
+            barrier.wait()
+            results.append(own.final_evaluate(eid))
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(results) == 2 and results[0] == results[1] == engine.get_final_report(eid)
+    assert len(engine.list_reports(eid)) == 2  # one candidate and one control report, written once

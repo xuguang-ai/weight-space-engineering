@@ -346,37 +346,50 @@ class EvaluationService:
                                       list(candidate_result.scores), list(candidate_result.cluster_ids))
         with self.db.transaction() as conn:
             current = self.experiments._experiment_row(experiment_id, conn)
-            if current["state"] != "FROZEN" or current["selected_checkpoint_id"] != frozen:
+            if current["state"] == "CLOSED" and current["selected_checkpoint_id"] == frozen:
+                sealed_concurrently = True  # another attempt sealed the result first; keep it
+            elif current["state"] != "FROZEN" or current["selected_checkpoint_id"] != frozen:
                 raise WSEError(ErrorCode.VERSION_CONFLICT,
                                f"experiment {experiment_id} changed during the final evaluation",
                                details={"state": current["state"]})
-            attempts = conn.execute(
-                "SELECT COUNT(*) FROM audit_events WHERE experiment_id = ? AND event_type = 'final_evaluation.started'",
-                (experiment_id,),
-            ).fetchone()[0]
-            final = FinalEvaluationReport(
-                experiment_id=experiment_id, run_id=row["run_id"], task_id=row["task_id"],
-                task_hash=candidate.task_hash, policy_id=row["policy_id"], suite_id=suite.suite_id,
-                suite_hash=suite.suite_hash, data_hash=suite.data_hash, candidate_checkpoint_id=frozen,
-                control_checkpoint_id=base, same_checkpoint=frozen == base, candidate=candidate, control=control,
-                comparison=comparison, attempts=attempts, created_at=utc_now(),
-            )
-            for report in reports.values():
-                self.insert_report(conn, report)
-            conn.execute(
-                "INSERT INTO final_evaluations (experiment_id, candidate_report_id, control_report_id, final_hash, "
-                "final_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (experiment_id, candidate.report_id, control.report_id, json_hash(final.model_dump(mode="json")),
-                 final.canonical_json(), final.created_at),
-            )
-            conn.execute("UPDATE experiments SET state = 'CLOSED', ended_at = ? WHERE experiment_id = ? "
-                         "AND state = 'FROZEN'", (final.created_at, experiment_id))
-            record_event(conn, "final_evaluation.completed", experiment_id,
-                         {"candidate_report_id": candidate.report_id, "control_report_id": control.report_id,
-                          "suite_id": suite.suite_id, "data_hash": suite.data_hash, "attempts": attempts},
-                         experiment_id=experiment_id)
-            record_event(conn, "experiment.closed", experiment_id, {"selected_checkpoint_id": frozen},
-                         experiment_id=experiment_id)
+            else:
+                sealed_concurrently = False
+                final = self._seal(conn, row, suite, reports, comparison)
+        return self.get_final_report(experiment_id) if sealed_concurrently else final
+
+    def _seal(self, conn: sqlite3.Connection, row: sqlite3.Row, suite: EvaluationSuite,
+              reports: dict[str, EvaluationReport], comparison: ComparisonReport) -> FinalEvaluationReport:
+        """Write the reports and the final report and close the experiment, in the caller's transaction."""
+        experiment_id = row["experiment_id"]
+        frozen, base = row["selected_checkpoint_id"], row["base_checkpoint_id"]
+        candidate, control = reports[frozen], reports[base]
+        attempts = conn.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE experiment_id = ? AND event_type = 'final_evaluation.started'",
+            (experiment_id,),
+        ).fetchone()[0]
+        final = FinalEvaluationReport(
+            experiment_id=experiment_id, run_id=row["run_id"], task_id=row["task_id"],
+            task_hash=candidate.task_hash, policy_id=row["policy_id"], suite_id=suite.suite_id,
+            suite_hash=suite.suite_hash, data_hash=suite.data_hash, candidate_checkpoint_id=frozen,
+            control_checkpoint_id=base, same_checkpoint=frozen == base, candidate=candidate, control=control,
+            comparison=comparison, attempts=attempts, created_at=utc_now(),
+        )
+        for report in reports.values():
+            self.insert_report(conn, report)
+        conn.execute(
+            "INSERT INTO final_evaluations (experiment_id, candidate_report_id, control_report_id, final_hash, "
+            "final_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (experiment_id, candidate.report_id, control.report_id, json_hash(final.model_dump(mode="json")),
+             final.canonical_json(), final.created_at),
+        )
+        conn.execute("UPDATE experiments SET state = 'CLOSED', ended_at = ? WHERE experiment_id = ? "
+                     "AND state = 'FROZEN'", (final.created_at, experiment_id))
+        record_event(conn, "final_evaluation.completed", experiment_id,
+                     {"candidate_report_id": candidate.report_id, "control_report_id": control.report_id,
+                      "suite_id": suite.suite_id, "data_hash": suite.data_hash, "attempts": attempts},
+                     experiment_id=experiment_id)
+        record_event(conn, "experiment.closed", experiment_id, {"selected_checkpoint_id": frozen},
+                     experiment_id=experiment_id)
         return final
 
 
