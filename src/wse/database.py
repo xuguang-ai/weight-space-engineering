@@ -300,6 +300,41 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             """,
         ],
     ),
+    (
+        7,
+        [
+            # One controller per experiment: the strategy or agent adapter that
+            # drove it, its exact version and configuration, the tracing setting,
+            # the constraint status, and (once it ends) its termination record.
+            """
+            CREATE TABLE controller_runs (
+                experiment_id      TEXT PRIMARY KEY REFERENCES experiments (experiment_id),
+                kind               TEXT NOT NULL CHECK (kind IN ('strategy', 'agent')),
+                controller_id      TEXT NOT NULL,
+                controller_version TEXT NOT NULL,
+                config             TEXT NOT NULL,
+                config_hash        TEXT NOT NULL,
+                constraint_status  TEXT NOT NULL CHECK (constraint_status IN ('verified', 'unverified')),
+                tracing            TEXT NOT NULL,
+                started_at         TEXT NOT NULL,
+                ended_at           TEXT,
+                result             TEXT
+            )
+            """,
+            # The controller's normalized trace: tool calls and results, model
+            # responses with usage, stop conditions, and cancellations.
+            """
+            CREATE TABLE controller_events (
+                experiment_id  TEXT NOT NULL REFERENCES experiments (experiment_id),
+                seq            INTEGER NOT NULL,
+                created_at     TEXT NOT NULL,
+                kind           TEXT NOT NULL,
+                payload        TEXT NOT NULL,
+                PRIMARY KEY (experiment_id, seq)
+            )
+            """,
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

@@ -798,15 +798,20 @@ def test_openai_agents_sdk_stdio_client_connects_and_sees_verbatim_tools(trial, 
 # -- module boundaries and legacy hosts ---------------------------------------------------------------------------
 
 
-def test_only_the_mcp_module_imports_the_mcp_sdk_and_no_module_imports_an_agent_sdk():
-    sources = sorted((TESTS_DIR.parent / "src" / "wse").rglob("*.py"))
+def test_only_the_mcp_module_imports_the_mcp_sdk_and_only_the_openai_adapter_imports_an_agent_sdk_lazily():
+    root = TESTS_DIR.parent / "src" / "wse"
+    sources = sorted(root.rglob("*.py"))
     importers = {path.name for path in sources
                  if re.search(r"^\s*(?:from|import)\s+(?:mcp|mcp_types)\b", path.read_text(encoding="utf-8"), re.M)}
     assert importers == {"mcp_server.py"}
-    assert not [path for path in sources
-                if re.search(r"^\s*(?:from|import)\s+(?:agents|openai|claude_agent_sdk)\b",
-                             path.read_text(encoding="utf-8"), re.M)]
-    probe = subprocess.run([sys.executable, "-c", "import sys, wse.mcp_server; print(sorted(m for m in sys.modules "
+    agent_sdk = r"(?:from|import)\s+(?:agents|openai|claude_agent_sdk)\b"
+    importers = {path.relative_to(root).as_posix() for path in sources
+                 if re.search(r"^\s*" + agent_sdk, path.read_text(encoding="utf-8"), re.M)}
+    assert importers == {"agent_adapters/openai_agents.py"}
+    adapter = (root / "agent_adapters" / "openai_agents.py").read_text(encoding="utf-8")
+    assert not re.search(r"^" + agent_sdk, adapter, re.M)  # only inside functions: imported lazily
+    probe = subprocess.run([sys.executable, "-c", "import sys, wse, wse.mcp_server, wse.runner, wse.cli, "
+                            "wse.agent_adapters.openai_agents; print(sorted(m for m in sys.modules "
                             "if m.split('.')[0] in ('agents', 'openai', 'claude_agent_sdk')))"],
                            capture_output=True, text=True, env=_env(), timeout=60)
     assert probe.returncode == 0 and probe.stdout.strip() == "[]", probe.stderr

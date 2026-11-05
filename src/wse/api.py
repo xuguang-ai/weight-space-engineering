@@ -79,6 +79,7 @@ if TYPE_CHECKING:
         TensorSlice,
     )
     from wse.store import ArtifactStore, RecoveryReport
+    from wse.audit import ExportManifest, ReplayResult
 
 DEFAULT_MAX_MODEL_BYTES = 64 * 1024 * 1024
 DEFAULT_EVAL_BATCH_SIZE = 64
@@ -1060,3 +1061,23 @@ class Engine:
     def get_final_report(self, experiment_id: str) -> FinalEvaluationReport:
         """The sealed final report of a closed experiment."""
         return self.evaluation.get_final_report(experiment_id)
+
+    # -- exports ------------------------------------------------------------------------------
+
+    def export_experiment(self, experiment_id: str, output_dir: str | Path, *, include_base_weights: bool = True,
+                          include_final_data: bool = False) -> ExportManifest:
+        """Write an operator export of the experiment (see ``wse.audit.export_experiment``); return its manifest.
+
+        Final-set inputs, labels, and generation seeds are excluded unless
+        ``include_final_data`` is true.
+        """
+        from wse.audit import export_experiment
+
+        return export_experiment(self, experiment_id, output_dir, include_base_weights=include_base_weights,
+                                 include_final_data=include_final_data)
+
+    def replay_export(self, export_dir: str | Path) -> ReplayResult:
+        """Replay an export's exact patches into this workspace and verify byte-identical weights (operator only)."""
+        from wse.audit import replay_export
+
+        return replay_export(export_dir, self)

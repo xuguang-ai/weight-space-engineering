@@ -65,12 +65,18 @@ def _validate_evaluator(extension_id: str, version: str, implementation: Any) ->
     validate_evaluator(extension_id, version, implementation)
 
 
-# Per-kind compatibility checks run at registration time. A later milestone adds
-# a validator for strategies here.
+def _validate_strategy(extension_id: str, version: str, implementation: Any) -> None:
+    from wse.strategies.base import validate_strategy
+
+    validate_strategy(extension_id, version, implementation)
+
+
+# Per-kind compatibility checks run at registration time.
 KIND_VALIDATORS: dict[str, Validator] = {
     "adapter": _validate_adapter,
     "operator": _validate_operator,
     "evaluator": _validate_evaluator,
+    "strategy": _validate_strategy,
 }
 
 
@@ -198,6 +204,7 @@ def builtin_registry() -> Registry:
     from wse.evaluators.classification import ClassificationEvaluator
     from wse.evaluators.forward_batch import ForwardBatchEvaluator
     from wse.operators.tensor import BUILTIN_ANALYSES, BUILTIN_EDITS
+    from wse.strategies.scripted import ScriptedSearchStrategy
 
     registry = Registry()
     adapter = MLPAdapter()
@@ -207,4 +214,6 @@ def builtin_registry() -> Registry:
         registry.register("operator", operator.spec.operator_id, operator.spec.version, operator)
     for evaluator in (ForwardBatchEvaluator(), ClassificationEvaluator()):
         registry.register("evaluator", evaluator.evaluator_id, evaluator.version, evaluator)
+    registry.register("strategy", ScriptedSearchStrategy.strategy_id, ScriptedSearchStrategy.version,
+                      ScriptedSearchStrategy)
     return registry

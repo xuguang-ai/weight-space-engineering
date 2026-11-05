@@ -325,3 +325,74 @@ def test_operator_spec_rejects_malformed_identity_and_effects():
         _spec(effect="train")
     with pytest.raises(ValidationError):
         UsageContract(counter="free_lunch")
+
+
+# -- strategies ------------------------------------------------------------------------------------------------
+
+
+class InspectOnceStrategy:
+    """A separately supplied strategy: inspect the base checkpoint once, then stop."""
+
+    strategy_id = "inspect_once"
+    version = "1"
+
+    def __init__(self, label: str = "x") -> None:
+        self.label = label
+
+    def config(self):
+        return {"label": self.label}
+
+    def next_action(self, objective, observations, remaining_budget):
+        from wse.strategies.base import Action
+
+        description = observations[0].result
+        if len(observations) == 1:
+            return Action.call("wse_inspect_model", "Read the architecture.",
+                               experiment_id=description["experiment"]["experiment_id"],
+                               checkpoint_id=description["experiment"]["base_checkpoint_id"])
+        return Action.stop(f"inspected {len(observations[1].result['manifest']['tensors'])} tensors")
+
+
+def register_inspect_once(registry):
+    registry.register("strategy", "inspect_once", "1", InspectOnceStrategy)
+
+
+def test_builtin_registry_contains_the_scripted_strategy():
+    from wse.strategies.scripted import ScriptedSearchStrategy
+
+    registry = builtin_registry()
+    assert registry.resolve("strategy", "scripted_search", "1") is ScriptedSearchStrategy
+    with pytest.raises(WSEError) as excinfo:
+        registry.resolve_reference("strategy", "scripted_search")  # no alias: versions are explicit
+    assert excinfo.value.code == ErrorCode.NOT_FOUND
+
+
+def test_strategy_registration_validates_the_contract():
+    registry = Registry()
+    with pytest.raises(WSEError, match="declares inspect_once@1"):
+        registry.register("strategy", "inspect_once", "2", InspectOnceStrategy)
+
+    class NoNextAction:
+        strategy_id, version = "broken", "1"
+
+        def config(self):
+            return {}
+
+    with pytest.raises(WSEError, match="next_action"):
+        registry.register("strategy", "broken", "1", NoNextAction)
+
+
+def test_a_separately_supplied_strategy_runs_without_core_changes(engine, workspace, signed_sum, tmp_path):
+    from wse.runner import ReferenceRunner
+
+    ids = signed_sum.setup_workspace(engine, tmp_path / "bundles", final_seed=1)
+    run_id = engine.grant_run(ids["task_id"], "small_model_weights_only_v1", ids["task_checkpoint_id"]).run_id
+    runner = ReferenceRunner(workspace, setup=["test_registry:register_inspect_once"])
+    eid = runner.run_experiment(run_id, ids["task_id"], "small_model_weights_only_v1",
+                                {"kind": "strategy", "strategy": "inspect_once@1", "parameters": {"label": "y"}})
+    record = runner.last_result
+    assert record["controller"] == {"extension_id": "inspect_once", "version": "1"}
+    assert record["config"]["resolved_config"] == {"label": "y"}
+    assert record["result"]["status"] == "completed" and record["result"]["reason"].endswith("inspected 4 tensors")
+    experiment = engine.get_experiment(eid)
+    assert experiment.state == "FROZEN" and experiment.selected_checkpoint_id == experiment.base_checkpoint_id

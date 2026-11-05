@@ -19,9 +19,10 @@ import os
 import sys
 from collections.abc import Sequence
 
-from wse.schemas import WSEError
+from wse.schemas import ErrorCode, WSEError
 
 DEFAULT_WORKSPACE = "workspace"
+TEST_DOUBLE = "wse-test-double:"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -50,6 +51,31 @@ def _parser() -> argparse.ArgumentParser:
                        help="extra options for the worker process, as one shell-quoted string")
     serve.add_argument("--constraint-status", choices=("unverified", "verified"), default="unverified",
                        help="'verified' only when the operator removed every other execution channel of the host")
+    serve.add_argument("--log-file", default=None,
+                       help="append the server's and its worker's stderr (logs) to this file instead of stderr")
+    runner = commands.add_parser("run", help="run one controller on a run grant's experiment, then settle and freeze")
+    runner.add_argument("--run-id", required=True, help="the persisted run grant to use")
+    runner.add_argument("--controller", choices=("scripted", "openai-agents"), default="scripted")
+    runner.add_argument("--strategy", default="scripted_search@1", help="scripted: the registered strategy")
+    runner.add_argument("--param", action="append", default=[], metavar="NAME=JSON",
+                        help="scripted: a strategy parameter (repeatable)")
+    runner.add_argument("--model", default=None,
+                        help="openai-agents: the operator-chosen model name (credentials come from the SDK's "
+                             f"environment), or '{TEST_DOUBLE}<strategy>' for the offline SDK test double")
+    runner.add_argument("--max-turns", type=int, default=100, help="openai-agents: SDK turn limit (default 100)")
+    runner.add_argument("--wall-clock-seconds", type=float, default=900.0,
+                        help="controller wall-clock limit in seconds (default 900)")
+    runner.add_argument("--setup", action="append", default=[],
+                        help="operator setup hook 'module:function' for the runner, server, and worker (repeatable)")
+    runner.add_argument("--worker-args", default="", help="extra worker options, as one shell-quoted string")
+    exporter = commands.add_parser("export", help="export an experiment (hashes, patches, reports, traces, costs)")
+    exporter.add_argument("experiment_id")
+    exporter.add_argument("--output", required=True, help="a new or empty export directory")
+    exporter.add_argument("--no-base-weights", action="store_true", help="omit the base model bundle")
+    exporter.add_argument("--include-final-data", action="store_true",
+                          help="also export the final set's inputs, labels, and generation seed (excluded by default)")
+    replay = commands.add_parser("replay", help="replay an export's exact patches into this workspace")
+    replay.add_argument("export_dir")
     experiment = commands.add_parser("experiment", help="print an experiment's state and budget")
     experiment.add_argument("experiment_id")
     patch = commands.add_parser("patch", help="print a stored patch: its frozen spec and exact materialized patch")
@@ -101,6 +127,11 @@ def _serve(args: argparse.Namespace) -> int:
     from wse.registry import builtin_registry
     from wse.worker import _load_setup
 
+    if args.log_file:
+        # Redirect fd 2 so the worker process, which inherits it, logs to the same file.
+        log = os.open(args.log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        os.dup2(log, 2)
+        os.close(log)
     registry = builtin_registry()
     worker_args: list[str] = []
     for spec in args.setup:
@@ -114,6 +145,37 @@ def _serve(args: argparse.Namespace) -> int:
         return _error(exc)
 
 
+def _run(args: argparse.Namespace) -> int:
+    """``wse run``: the reference runner; prints the controller record as JSON."""
+    import shlex
+
+    from wse.runner import ReferenceRunner
+
+    if args.controller == "scripted":
+        parameters = {}
+        for item in args.param:
+            name, _, value = item.partition("=")
+            try:
+                parameters[name] = json.loads(value)
+            except ValueError:
+                parameters[name] = value
+        config: dict = {"kind": "strategy", "strategy": args.strategy, "parameters": parameters,
+                        "wall_clock_seconds": args.wall_clock_seconds}
+    else:
+        if not args.model:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, "--model is required for --controller openai-agents")
+        config = {"kind": "agent", "model": args.model, "max_turns": args.max_turns,
+                  "wall_clock_seconds": args.wall_clock_seconds}
+    runner = ReferenceRunner(args.workspace, setup=args.setup, worker_args=shlex.split(args.worker_args))
+    from wse.api import Engine
+
+    with Engine(args.workspace, registry=runner.registry) as engine:
+        grant = engine.experiments.get_run_grant(args.run_id)
+    runner.run_experiment(args.run_id, grant.task_id, grant.policy_id, config)
+    print(json.dumps(runner.last_result, indent=2, sort_keys=True))
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args, extra = parser.parse_known_args(argv)
@@ -125,6 +187,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error(f"unrecognized arguments: {' '.join(extra)}")
     if args.command == "serve":
         return _serve(args)
+    if args.command == "run":
+        try:
+            return _run(args)
+        except WSEError as exc:
+            return _error(exc)
     from wse.api import Engine
 
     try:
@@ -148,6 +215,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _emit(engine.final_evaluate(args.experiment_id), args.format, args.output)
             elif args.command == "report":
                 _emit(engine.get_report(args.experiment_id, args.report_id), args.format, args.output)
+            elif args.command == "export":
+                exported = engine.export_experiment(args.experiment_id, args.output,
+                                                    include_base_weights=not args.no_base_weights,
+                                                    include_final_data=args.include_final_data)
+                print(json.dumps(exported.model_dump(mode="json"), indent=2, sort_keys=True))
+            elif args.command == "replay":
+                print(json.dumps(engine.replay_export(args.export_dir).model_dump(mode="json"), indent=2,
+                                 sort_keys=True))
     except WSEError as exc:
         return _error(exc)
     return 0
