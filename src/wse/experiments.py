@@ -28,8 +28,15 @@ Rules implemented here (Sections 4.1, 5.1-5.3, and 6.2 of the plan):
   ownership, use the experiment policy's operations and limits, and charge
   ``tensor_read_calls`` or the operator's usage-contract counter plus compute
   seconds through ``wse.budget``; previews and applies charge compute seconds.
-* Rejected mutations (creation, previews, applies, selections) are recorded
-  as audit events and leave state unchanged.
+* Rejected mutations (creation, previews, applies, selections, freezing) are
+  recorded as audit events and leave state unchanged.
+* ``freeze`` (operator only) is a compare-and-swap on the selected ID that
+  moves an OPEN experiment to FROZEN. In one ``BEGIN IMMEDIATE`` transaction
+  it checks that no job is queued or running and no reservation is held;
+  otherwise it returns ``VERSION_CONFLICT`` so the caller can wait for or
+  cancel that work and retry. Job submission re-checks the state in its own
+  transaction, so freezing and submission cannot race. A frozen experiment
+  accepts no previews, candidates, selections, jobs, or metered reads.
 """
 
 from __future__ import annotations
@@ -317,6 +324,7 @@ class ExperimentService:
             state=row["state"],
             budget=budget,
             created_at=row["created_at"],
+            frozen_at=row["frozen_at"],
             ended_at=row["ended_at"],
         )
 
@@ -455,7 +463,8 @@ class ExperimentService:
         never overdraw: a request that loses the race returns
         ``BUDGET_EXCEEDED`` and its result is discarded.
         """
-        self._experiment_row(experiment_id)
+        # A frozen ledger stays fixed: metered reads need an OPEN experiment.
+        self._require_open(self._experiment_row(experiment_id))
         self._owned_checkpoint(self.db.conn, experiment_id, checkpoint_id)
         policy = self.experiment_policy(experiment_id)
         self.ledger.require(self.db.conn, experiment_id, {counter: units, "compute_seconds": 0})
@@ -803,3 +812,58 @@ class ExperimentService:
             result = self._experiment(self._experiment_row(experiment_id, conn), conn)
             self._remember(conn, experiment_id, key, "select_checkpoint", request_hash, result.canonical_json())
             return result
+
+    # -- freezing -----------------------------------------------------------------
+
+    def freeze(self, experiment_id: str, expected_selected_id: str) -> Experiment:
+        """Freeze the selected checkpoint (operator only); a retry of a completed freeze returns it."""
+        self._require_operator("freezing an experiment")
+        self._experiment_row(experiment_id)
+        request_hash = json_hash({"operation": "freeze", "expected_selected_id": _hashable(expected_selected_id)})
+        return self._guarded("experiment.freeze", experiment_id, request_hash, str(expected_selected_id),
+                             lambda: self._freeze(experiment_id, expected_selected_id))
+
+    def _freeze(self, experiment_id: str, expected: Any) -> Experiment:
+        if not isinstance(expected, str):
+            raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                           "expected_selected_id must be a checkpoint ID string; read the experiment and pass its "
+                           "selected_checkpoint_id")
+        self.engine.jobs.recover_lost_jobs()
+        with self.db.transaction() as conn:
+            row = self._experiment_row(experiment_id, conn)
+            if row["selected_checkpoint_id"] != expected:
+                raise WSEError(
+                    ErrorCode.VERSION_CONFLICT,
+                    f"the selected checkpoint is {row['selected_checkpoint_id']}, not {expected!r}; read the "
+                    "experiment and retry with the current selected ID",
+                    details={"expected_selected_id": expected,
+                             "selected_checkpoint_id": row["selected_checkpoint_id"]},
+                )
+            if row["state"] != "OPEN":
+                return self._experiment(row, conn)  # already frozen with this selection
+            active = [r["job_id"] for r in conn.execute(
+                "SELECT job_id FROM jobs WHERE experiment_id = ? AND state IN ('queued', 'running') "
+                "ORDER BY created_at, rowid", (experiment_id,))]
+            held = [r["reservation_id"] for r in conn.execute(
+                "SELECT reservation_id FROM reservations WHERE experiment_id = ? AND state = 'HELD' "
+                "ORDER BY created_at, rowid", (experiment_id,))]
+            if active or held:
+                raise WSEError(
+                    ErrorCode.VERSION_CONFLICT,
+                    f"experiment {experiment_id} has {len(active)} active jobs and {len(held)} unsettled "
+                    "reservations; wait for or cancel them, then retry the freeze",
+                    retryable=True,
+                    details={"active_jobs": active, "held_reservations": held},
+                )
+            now = utc_now()
+            conn.execute(
+                "UPDATE experiments SET state = 'FROZEN', frozen_at = ? "
+                "WHERE experiment_id = ? AND state = 'OPEN' AND selected_checkpoint_id = ?",
+                (now, experiment_id, expected),
+            )
+            frozen = self._experiment(self._experiment_row(experiment_id, conn), conn)
+            record_event(conn, "experiment.frozen", experiment_id,
+                         {"selected_checkpoint_id": expected,
+                          "consumed": {name: entry.consumed for name, entry in frozen.budget.items()}},
+                         experiment_id=experiment_id)
+            return frozen

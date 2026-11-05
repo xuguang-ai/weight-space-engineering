@@ -75,7 +75,8 @@ def test_core_imports_no_mcp_or_agent_sdk():
         import sys
         import wse, wse.api, wse.cli, wse.store, wse.database, wse.registry, wse.adapters.mlp
         import wse.analysis, wse.policy, wse.operators.base, wse.operators.tensor
-        import wse.patches, wse.experiments, wse.audit
+        import wse.patches, wse.experiments, wse.audit, wse.evaluation, wse.evaluators.classification
+        import wse.evaluators.datasets, wse.jobs, wse.worker, wse.budget
         loaded = sorted(m for m in sys.modules
                         if m.split(".")[0] in ("mcp", "agents", "openai", "claude_agent_sdk"))
         print(loaded)
@@ -319,3 +320,72 @@ def test_direct_edit_result_contract(signed_sum):
     assert [d.tensor for d in result.diff] == list(model.tensor_names())
     assert result.candidate.tensor("layers.1.weight")[0].tolist() == [-2.0, 2.0, -2.0, 2.0]
     assert model.tensor("layers.1.weight")[0].tolist() == [-1.0, 1.0, -1.0, 1.0]
+
+
+# -- direct evaluation and parity with managed evaluation (Task 5) ---------------------------------------
+
+
+def test_direct_acceptance_path_needs_no_sqlite_job_service_or_mcp(tmp_path):
+    # load -> operator -> candidate -> evaluation, with SQLite and MCP blocked before importing wse.
+    result = _run_isolated(
+        f"""
+        import sys, os
+        for blocked in ("sqlite3", "_sqlite3", "mcp", "agents", "openai", "claude_agent_sdk"):
+            sys.modules[blocked] = None
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("fixture", {str(FIXTURE_SCRIPT)!r})
+        fixture = importlib.util.module_from_spec(spec); spec.loader.exec_module(fixture)
+        os.chdir({str(tmp_path)!r})
+        from wse import apply_operator, evaluate_candidate, load_model
+        model = load_model(fixture.task_tensors(), "mlp", fixture.CONFIG)
+        row = [dict(start=1, stop=2, step=1), dict(start=0, stop=4, step=1)]
+        edit = apply_operator(model, "scale_slice", dict(tensor="layers.1.weight", selection=row, factor=-1.0))
+        suite = fixture.development_suite(data=fixture.suite_data(fixture.DEV_PAIRS, fixture.DEV_SEED))
+        config = dict(sample_count=64, seed=0)
+        before, after = (evaluate_candidate(m, suite, config) for m in (model, edit.candidate))
+        assert (before.metrics["accuracy"], after.metrics["accuracy"]) == (0.5, 1.0)
+        assert before.management == after.management == "unmanaged"
+        assert after.usage.model_forward_calls == 1 and after.clusters.fully_correct == 32
+        assert "wse.jobs" not in sys.modules and "wse.worker" not in sys.modules
+        assert os.listdir(".") == [], os.listdir(".")
+        print("ok")
+        """
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
+
+
+def test_direct_and_managed_evaluation_agree_on_metrics_and_identities(tmp_path, signed_sum):
+    from wse.api import evaluate_candidate
+    from wse.worker import Worker
+
+    workspace = tmp_path / "workspace"
+    suite = signed_sum.development_suite(data=signed_sum.suite_data(signed_sum.DEV_PAIRS, signed_sum.DEV_SEED))
+    config = {"sample_count": 64, "seed": 0}
+    row = [{"start": 1, "stop": 2, "step": 1}, {"start": 0, "stop": 4, "step": 1}]
+    direct_model = load_model(signed_sum.task_tensors(), "mlp@1", signed_sum.CONFIG)
+    direct_candidate = apply_operator(direct_model, "scale_slice@1",
+                                      {"tensor": "layers.1.weight", "selection": row, "factor": -1.0}).candidate
+    direct = [evaluate_candidate(m, suite, config) for m in (direct_model, direct_candidate)]
+    with Engine(workspace) as engine:
+        ids = signed_sum.setup_workspace(engine, tmp_path / "bundles", final_seed=1)
+        grant = engine.grant_run(ids["task_id"], ids["policy_id"], ids["task_checkpoint_id"])
+        eid = engine.create_experiment(grant.run_id, ids["task_id"], ids["policy_id"], "c").experiment_id
+        spec = {"base_checkpoint_id": ids["task_checkpoint_id"], "hypothesis": "h",
+                "operations": [{"op": "scale_slice", "tensor": "layers.1.weight", "selection": row, "factor": -1.0}]}
+        candidate = engine.apply_patch(eid, engine.preview_patch(eid, spec, "p").patch_id, "a")
+        jobs = [engine.submit_evaluation(eid, checkpoint, ids["development_suite_id"], config, f"e{i}")
+                for i, checkpoint in enumerate((ids["task_checkpoint_id"], candidate.checkpoint_id))]
+        with Worker(workspace) as worker:
+            worker.run(max_jobs=2, idle_exit_seconds=5)
+        managed = [engine.get_report(eid, engine.get_job(eid, job.job_id).report_id) for job in jobs]
+    for result, report in zip(direct, managed, strict=True):
+        assert dict(result.metrics) == report.metrics
+        assert result.model == report.model
+        assert (result.data_hash, result.evaluator, result.evaluator_config_hash) == (
+            report.data_hash, report.evaluator, report.evaluator_config_hash)
+        assert result.execution == report.execution
+        assert list(result.scores) == report.scores and list(result.cluster_ids) == report.cluster_ids
+        assert dict(result.intervals) == report.intervals and result.clusters == report.clusters
+        assert (result.management, report.management) == ("unmanaged", "managed")
+    assert direct_candidate.identity == candidate.identity

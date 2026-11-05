@@ -1,0 +1,34 @@
+{
+  "schema_version": "1",
+  "policy_id": "small_model_v1",
+  "mode": "bounded_eval",
+  "budget": {
+    "candidate_commits": 20,
+    "analysis_calls": 50,
+    "tensor_read_calls": 100,
+    "evaluation_batches": 10,
+    "examples_per_batch": 64,
+    "evaluated_examples": 640,
+    "model_forward_calls": 10,
+    "seconds_per_operation": 30.0,
+    "compute_seconds": 300.0
+  },
+  "operations": {
+    "analyses": {
+      "stats": "tensor_stats@1",
+      "norm": "tensor_norm@1",
+      "top_k": "tensor_top_k@1"
+    },
+    "edits": {
+      "set_slice": "set_slice@1",
+      "scale_slice": "scale_slice@1"
+    },
+    "limits": {
+      "max_read_elements": 2048,
+      "max_inline_json_bytes": 32768,
+      "max_analysis_elements": 16777216,
+      "max_patch_operations": 32,
+      "max_patch_elements": 65536
+    }
+  }
+}

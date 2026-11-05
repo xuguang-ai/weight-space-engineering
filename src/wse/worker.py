@@ -24,6 +24,12 @@ code: it runs registered evaluators over registered adapters only.
 * **Settlement.** Started batches, examples, and forward calls are charged,
   with compute seconds measured from the start of execution (queue time is
   excluded) and capped at the reservation; unstarted work is released.
+* **Reports.** The job body is the core ``evaluate_candidate`` with the
+  metered forward callable. A successful result is persisted as an
+  ``EvaluationReport`` bound to the checkpoint, task, suite, data, and
+  execution configuration, in the transaction that settles the job; the job
+  carries its summary inline. Stored examples are read from evaluator
+  storage only here.
 """
 
 from __future__ import annotations
@@ -45,10 +51,11 @@ from typing import Any
 
 import torch
 
+from wse.api import evaluate_candidate
 from wse.audit import record_event
 from wse.database import Database, utc_now
 from wse.jobs import queued_cancel_usage
-from wse.schemas import ErrorCode, EvalConfig, JobProgress, Usage, WSEError, canonical_json
+from wse.schemas import ErrorCode, EvalConfig, JobProgress, Usage, WSEError
 
 EXIT_HARD_STOP = 70
 DEFAULT_LEASE_SECONDS = 10.0
@@ -141,6 +148,9 @@ class _Execution:
 
     def __init__(self, job_id: str, meter: ForwardMeter, batches_total: int, limit: float) -> None:
         self.job_id = job_id
+        self.experiment_id: str | None = None
+        self.checkpoint_id: str | None = None
+        self.suite: Any = None
         self.meter = meter
         self.batches_total = batches_total
         self.limit = limit
@@ -275,10 +285,11 @@ class Worker:
                              max_examples=int(requested.get("evaluated_examples", 0)),
                              deadline=time.monotonic() + limit)
         execution = _Execution(row["job_id"], meter, progress.batches_total, limit)
+        execution.experiment_id, execution.checkpoint_id = row["experiment_id"], row["checkpoint_id"]
         monitor = threading.Thread(target=self._monitor, args=(execution,), daemon=True,
                                    name=f"wse-monitor-{row['job_id']}")
         monitor.start()
-        result: dict[str, Any] | None = None
+        result: Any = None
         error: WSEError | None = None
         try:
             if experiment["mode"] != "bounded_eval":
@@ -292,16 +303,12 @@ class Worker:
             if policy.policy_hash != experiment["policy_hash"]:
                 raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"policy of experiment {experiment['experiment_id']} changed")
             meter.batch_size = policy.budget.examples_per_batch
-            suite = self.jobs.load_suite(row["suite_id"])
-            config = EvalConfig.model_validate_json(row["config_json"])
-            evaluator = self.engine.registry.resolve_ref("evaluator", suite.evaluator)
-            handle = self.engine.open_checkpoint(row["checkpoint_id"])
-            meter.bind(lambda inputs: handle.adapter.forward(handle._tensors, inputs))
-            summary = evaluator.evaluate(meter, suite, config, batch_size=meter.batch_size)
+            execution.suite = self.jobs.load_suite(row["suite_id"])
+            result = self.evaluate(row["checkpoint_id"], row["suite_id"],
+                                   EvalConfig.model_validate_json(row["config_json"]), meter)
             meter.check()  # a stop requested while the evaluator swallowed it still wins
             if time.monotonic() - execution.started > limit:
                 raise JobStopped("timeout")
-            result = json_summary(summary)
         except JobStopped as stop:
             error = _stop_error(stop.reason, limit)
         except WSEError as exc:
@@ -317,12 +324,41 @@ class Worker:
                                                    else "failed")
         self._finish(self.db, execution, state, result, error)
 
-    def _finish(self, db: Database, execution: _Execution, state: str, result: dict[str, Any] | None,
+    def evaluate(self, checkpoint_id: str, suite_id: str, config: EvalConfig, meter: ForwardMeter) -> Any:
+        """Evaluate a checkpoint on a suite through ``meter`` (worker-internal only).
+
+        Stored examples are read from evaluator storage, the evaluator runs
+        the core ``evaluate_candidate`` with the metered forward callable, and
+        the returned ``EvaluationResult`` becomes the job's
+        ``EvaluationReport`` when the job is settled.
+        """
+        suite = self.jobs.load_suite(suite_id)
+        if suite.data is None:
+            suite = suite.resolved(self.engine.datasets.load(suite.dataset))
+        self.engine.registry.resolve_ref("evaluator", suite.evaluator)
+        handle = self.engine.open_checkpoint(checkpoint_id)
+
+        def run_forward(inputs: torch.Tensor) -> torch.Tensor:
+            with torch.inference_mode():
+                return handle.adapter.forward(handle._tensors, inputs)
+
+        meter.bind(run_forward)
+        return evaluate_candidate(handle, suite, config, registry=self.engine.registry, forward=meter,
+                                  batch_size=meter.batch_size)
+
+    def _finish(self, db: Database, execution: _Execution, state: str, result: Any,
                 error: WSEError | None) -> bool:
+        usage = execution.usage()
+        report = None
+        if result is not None and state == "succeeded":
+            report = self.engine.evaluation.build_report(
+                result, experiment_id=execution.experiment_id, job_id=execution.job_id,
+                checkpoint_id=execution.checkpoint_id, suite=execution.suite, usage=usage, keep_scores=True)
         with db.transaction() as conn:
-            return self.jobs.finish(conn, execution.job_id, state, execution.usage(), result=result, error=error,
+            return self.jobs.finish(conn, execution.job_id, state, usage,
+                                    result=report.summary() if report is not None else None, error=error,
                                     progress=execution.meter.progress(execution.batches_total),
-                                    lease_owner=self.worker_id)
+                                    lease_owner=self.worker_id, report=report)
 
     def _monitor(self, execution: _Execution) -> None:
         db = Database(self.db.path)
@@ -373,18 +409,6 @@ class Worker:
                 self.hard_exit(EXIT_HARD_STOP)
                 return False
         return True
-
-
-def json_summary(summary: Any) -> dict[str, Any]:
-    """Validate an evaluator summary as plain JSON with a ``metrics`` object."""
-    import json
-
-    if not isinstance(summary, Mapping) or not isinstance(summary.get("metrics"), Mapping):
-        raise WSEError(ErrorCode.WORKER_FAILED, "the evaluator must return an object with a metrics object")
-    try:
-        return json.loads(canonical_json(dict(summary)))
-    except WSEError as exc:
-        raise WSEError(ErrorCode.WORKER_FAILED, f"the evaluator returned a non-JSON summary: {exc.message}") from exc
 
 
 # ---------------------------------------------------------------------------

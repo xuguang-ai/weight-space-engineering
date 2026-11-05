@@ -837,6 +837,7 @@ class Experiment(_Frozen):
     state: ExperimentState
     budget: dict[str, BudgetEntry]
     created_at: str
+    frozen_at: str | None = None
     ended_at: str | None = None
 
 
@@ -859,10 +860,18 @@ SuiteSplit = Literal["development", "final"]
 
 
 class SuiteData(_Frozen):
-    """Inline examples of a minimal suite: row-major float inputs and optional class labels."""
+    """Examples of a suite: row-major float inputs, optional class labels, and optional clusters.
+
+    ``clusters`` gives the cluster ID of every example (for example the pair
+    of an ``x, -x`` fixture); examples of one cluster are contiguous.
+    ``cluster_unit`` names the unit (``"pair"``). Without clusters every
+    example is its own cluster, as for independent examples.
+    """
 
     inputs: list[list[float]] = Field(min_length=1)
     labels: list[StrictInt] | None = None
+    clusters: list[StrictInt] | None = None
+    cluster_unit: str | None = Field(default=None, pattern=r"^[a-z][a-z_]{0,31}$")
 
     @model_validator(mode="after")
     def _check_rows(self) -> SuiteData:
@@ -874,17 +883,80 @@ class SuiteData(_Frozen):
         for row in self.inputs:
             if not all(math.isfinite(value) for value in row):
                 raise ValueError("inputs must be finite")
+        if (self.clusters is None) != (self.cluster_unit is None):
+            raise ValueError("clusters and cluster_unit must be given together")
+        if self.clusters is not None:
+            if len(self.clusters) != len(self.inputs):
+                raise ValueError("clusters must have one entry per input row")
+            seen: set[int] = set()
+            for index, cluster in enumerate(self.clusters):
+                if index and cluster == self.clusters[index - 1]:
+                    continue
+                if cluster in seen:
+                    raise ValueError("the examples of each cluster must be contiguous")
+                seen.add(cluster)
         return self
+
+    @property
+    def example_count(self) -> int:
+        return len(self.inputs)
+
+    def cluster_ids(self) -> list[int]:
+        """The cluster of every example; independent examples are their own clusters."""
+        return list(self.clusters) if self.clusters is not None else list(range(len(self.inputs)))
+
+    def cuts_clusters(self, sample_count: int) -> bool:
+        """Whether evaluating the first ``sample_count`` examples would split a cluster."""
+        ids = self.cluster_ids()
+        return 0 < sample_count < len(ids) and ids[sample_count - 1] == ids[sample_count]
+
+    @property
+    def data_hash(self) -> str:
+        return json_hash(self.model_dump(mode="json"))
+
+
+class DatasetManifest(_Frozen):
+    """Description of a dataset held in evaluator storage, without its examples.
+
+    The examples, and how they were generated (including any seed), stay in
+    evaluator storage; suites, reports, and comparisons carry only this
+    manifest and its ``data_hash``.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    data_hash: str = Field(pattern=HASH_PATTERN.pattern)
+    example_count: int = Field(ge=1)
+    input_width: int = Field(ge=1)
+    label_classes: list[int] | None = None
+    cluster_unit: str | None = None
+    cluster_count: int = Field(ge=1)
+
+    @classmethod
+    def from_data(cls, data: SuiteData) -> DatasetManifest:
+        return cls(
+            data_hash=data.data_hash,
+            example_count=data.example_count,
+            input_width=len(data.inputs[0]),
+            label_classes=sorted(set(data.labels)) if data.labels is not None else None,
+            cluster_unit=data.cluster_unit,
+            cluster_count=len(set(data.cluster_ids())),
+        )
 
 
 class EvaluationSuite(_Frozen):
-    """An operator-registered evaluation suite (Task 4 minimal form).
+    """An operator-registered evaluation suite.
 
     ``sample_counts`` and ``seeds`` are the preregistered ``eval_config``
     values; a submission with any other value is rejected. A sample count of
     ``n`` evaluates the first ``n`` examples. ``evaluator`` is the exact
     registered evaluator that runs the suite, and ``parameters`` are passed
     to it unchanged. Only ``development`` suites accept agent submissions.
+
+    The examples are either inline (``data``; development suites only) or
+    held in evaluator storage and described by ``dataset``. A registered
+    suite never carries both; the worker and final evaluator *resolve* a
+    stored suite by attaching its verified examples in memory
+    (``resolved``). Final suites always use evaluator storage.
     """
 
     schema_version: Literal["1"] = SCHEMA_VERSION
@@ -895,7 +967,8 @@ class EvaluationSuite(_Frozen):
     parameters: dict[str, Any] = Field(default_factory=dict)
     sample_counts: list[StrictInt] = Field(min_length=1)
     seeds: list[StrictInt] = Field(min_length=1)
-    data: SuiteData
+    data: SuiteData | None = None
+    dataset: DatasetManifest | None = None
 
     @field_validator("parameters")
     @classmethod
@@ -904,20 +977,43 @@ class EvaluationSuite(_Frozen):
 
     @model_validator(mode="after")
     def _check_preregistration(self) -> EvaluationSuite:
-        size = len(self.data.inputs)
+        if self.data is None and self.dataset is None:
+            raise ValueError("a suite needs inline data or a dataset manifest")
+        if self.data is not None and self.dataset is not None \
+                and DatasetManifest.from_data(self.data) != self.dataset:
+            raise ValueError("the attached examples do not match the suite's dataset manifest")
+        size = self.example_count
         if any(not 1 <= count <= size for count in self.sample_counts):
             raise ValueError(f"sample_counts must lie between 1 and the {size} examples of the suite")
         if len(set(self.sample_counts)) != len(self.sample_counts) or len(set(self.seeds)) != len(self.seeds):
             raise ValueError("sample_counts and seeds must not repeat")
+        if self.data is not None and any(self.data.cuts_clusters(count) for count in self.sample_counts):
+            raise ValueError("every preregistered sample count must end at a cluster boundary")
         return self
 
     @property
+    def example_count(self) -> int:
+        return self.dataset.example_count if self.dataset is not None else self.data.example_count
+
+    @property
     def suite_hash(self) -> str:
-        return json_hash(self.model_dump(mode="json"))
+        """Hash of the registered form (examples detached when they live in evaluator storage)."""
+        dumped = self.model_dump(mode="json")
+        if self.dataset is not None:
+            dumped["data"] = None
+        return json_hash(dumped)
 
     @property
     def data_hash(self) -> str:
-        return json_hash(self.data.model_dump(mode="json"))
+        return self.dataset.data_hash if self.dataset is not None else self.data.data_hash
+
+    def registered(self) -> EvaluationSuite:
+        """The form stored at registration: stored examples are detached."""
+        return self.model_copy(update={"data": None}) if self.dataset is not None else self
+
+    def resolved(self, data: SuiteData) -> EvaluationSuite:
+        """This suite with its stored examples attached (in memory only)."""
+        return EvaluationSuite.model_validate({**self.model_dump(mode="json"), "data": data.model_dump(mode="json")})
 
 
 class EvalConfig(_Frozen):
@@ -997,3 +1093,209 @@ class Job(_Frozen):
     @property
     def terminal(self) -> bool:
         return self.state in TERMINAL_JOB_STATES
+
+
+# ---------------------------------------------------------------------------
+# Tasks, evaluation reports, comparisons, and final evaluations
+# ---------------------------------------------------------------------------
+
+REPORT_ID_PATTERN = re.compile(r"^report_[0-9a-f]{32}$")
+OBJECT_ID_PATTERNS["report"] = REPORT_ID_PATTERN
+EVALUATION_DEVICE = "cpu"
+
+
+class TaskDefinition(_Frozen):
+    """The agent-visible definition of a task (``task.json``).
+
+    It states the behavior to achieve and how it is measured, never how the
+    task model was built: it names no reference checkpoint, fault, or patch.
+    ``target_accuracy`` is met only by a successful report covering every
+    example of the development suite.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    task_id: str = Field(pattern=LABEL_PATTERN)
+    title: str = Field(min_length=1, max_length=256)
+    description: str = Field(min_length=1, max_length=4096)
+    input_description: str = Field(default="", max_length=1024)
+    output_description: str = Field(default="", max_length=1024)
+    objective: ObjectiveSpec
+    target_accuracy: float | None = Field(default=None, ge=0, le=1)
+    development_suite_id: str = Field(pattern=LABEL_PATTERN)
+    development_examples: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def _consistent(self) -> TaskDefinition:
+        if self.objective.task_id != self.task_id:
+            raise ValueError("the objective must name the same task_id")
+        if self.target_accuracy is not None:
+            gates = [g for g in self.objective.acceptance_gates if g.metric == "accuracy" and g.min_value is not None]
+            if [g.min_value for g in gates] != [self.target_accuracy]:
+                raise ValueError("target_accuracy must equal the objective's accuracy min_value gate")
+        return self
+
+    @property
+    def task_hash(self) -> str:
+        return json_hash(self.model_dump(mode="json"))
+
+
+class ExecutionConfig(_Frozen):
+    """Everything that determines how an evaluator scores a model, except the model and data.
+
+    Its hash is a report's ``evaluator_config_hash``: two reports are
+    comparable only when it, the data, and the suite agree.
+    """
+
+    evaluator: ExtensionRef
+    parameters: dict[str, Any]
+    eval_config: EvalConfig
+    batch_size: int = Field(ge=1)
+    device: Literal["cpu"] = EVALUATION_DEVICE
+
+    @property
+    def config_hash(self) -> str:
+        return json_hash(self.model_dump(mode="json"))
+
+
+class IntervalEstimate(_Frozen):
+    """A 95% interval around ``estimate``.
+
+    ``cluster_bootstrap``: percentile interval over ``resamples`` resamples of
+    whole clusters with ``seed``. ``clopper_pearson``: exact binomial interval
+    on ``successes`` of ``trials`` (fully correct clusters).
+    """
+
+    method: Literal["cluster_bootstrap", "clopper_pearson"]
+    level: float = 0.95
+    estimate: float
+    lower: float
+    upper: float
+    cluster_unit: str
+    resamples: int | None = None
+    seed: int | None = None
+    successes: int | None = None
+    trials: int | None = None
+
+
+class ClusterSummary(_Frozen):
+    """Clusters covered by an evaluation and how many were scored fully correct."""
+
+    unit: str
+    count: int
+    fully_correct: int
+
+
+class EvaluationReport(_Frozen):
+    """A persisted, managed evaluation bound to exact model, data, and configuration identities.
+
+    ``scores`` (per example, 1 = correct) and ``cluster_ids`` are kept for
+    development reports so paired comparisons can be computed; final reports
+    carry only aggregates. ``target_met`` is ``None`` when the task declares
+    no accuracy target, else whether the report covers the whole
+    development suite and meets the target.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    report_id: str = Field(pattern=REPORT_ID_PATTERN.pattern)
+    experiment_id: str
+    job_id: str | None
+    checkpoint_id: str
+    model: ModelIdentity
+    task_id: str
+    task_hash: str | None
+    suite_id: str
+    suite_hash: str
+    split: SuiteSplit
+    data_hash: str
+    evaluator: ExtensionRef
+    evaluator_config_hash: str
+    execution: ExecutionConfig
+    seed: int
+    sample_count: int
+    metrics: dict[str, float]
+    clusters: ClusterSummary | None
+    intervals: dict[str, IntervalEstimate]
+    scores: list[int] | None = None
+    cluster_ids: list[int] | None = None
+    target_met: bool | None = None
+    elapsed_seconds: float
+    usage: Usage
+    errors: list[str]
+    truncation_count: int = 0
+    management: Management = "managed"
+    created_at: str
+
+    @property
+    def report_uri(self) -> str:
+        return f"wse://reports/{self.report_id}"
+
+    def summary(self) -> dict[str, Any]:
+        """The inline summary carried by a job: metrics, sample count, errors, and the reference."""
+        return {"report_id": self.report_id, "report_uri": self.report_uri, "metrics": dict(self.metrics),
+                "sample_count": self.sample_count, "errors": list(self.errors),
+                "truncation_count": self.truncation_count, "target_met": self.target_met}
+
+
+class ComparisonReport(_Frozen):
+    """Paired difference between two reports on the same examples and configuration.
+
+    ``difference`` is candidate minus base accuracy, with a paired
+    cluster-bootstrap interval; ``base_fully_correct`` and
+    ``candidate_fully_correct`` are exact Clopper-Pearson intervals on the
+    number of fully correct clusters. Clusters are counted as improved,
+    worsened, or unchanged by their number of correct examples.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    experiment_id: str
+    base_report_id: str
+    candidate_report_id: str
+    base_checkpoint_id: str
+    candidate_checkpoint_id: str
+    split: SuiteSplit
+    suite_id: str
+    suite_hash: str
+    data_hash: str
+    evaluator_config_hash: str
+    sample_count: int
+    seed: int
+    metric: Literal["accuracy"] = "accuracy"
+    base_value: float
+    candidate_value: float
+    difference: float
+    difference_interval: IntervalEstimate
+    base_fully_correct: IntervalEstimate
+    candidate_fully_correct: IntervalEstimate
+    clusters_improved: int
+    clusters_worsened: int
+    clusters_unchanged: int
+    management: Management = "managed"
+
+
+class FinalEvaluationReport(_Frozen):
+    """The sealed result of an experiment: the frozen candidate against the base-checkpoint control.
+
+    Both checkpoints are evaluated on the same final examples and
+    configuration; when the frozen selection is the base checkpoint, one
+    evaluation serves both (``same_checkpoint``). The final examples and
+    their generation seed are never included.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    experiment_id: str
+    run_id: str
+    task_id: str
+    task_hash: str | None
+    policy_id: str
+    suite_id: str
+    suite_hash: str
+    data_hash: str
+    candidate_checkpoint_id: str
+    control_checkpoint_id: str
+    same_checkpoint: bool
+    candidate: EvaluationReport
+    control: EvaluationReport
+    comparison: ComparisonReport
+    attempts: int
+    created_at: str
+    management: Management = "managed"

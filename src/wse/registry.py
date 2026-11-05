@@ -195,6 +195,7 @@ class Registry:
 def builtin_registry() -> Registry:
     """Return a new registry containing the built-in M1 extensions."""
     from wse.adapters.mlp import MLPAdapter
+    from wse.evaluators.classification import ClassificationEvaluator
     from wse.evaluators.forward_batch import ForwardBatchEvaluator
     from wse.operators.tensor import BUILTIN_ANALYSES, BUILTIN_EDITS
 
@@ -204,6 +205,6 @@ def builtin_registry() -> Registry:
     registry.register_alias("adapter", adapter.adapter_id, f"{adapter.adapter_id}@{adapter.version}")
     for operator in [*BUILTIN_ANALYSES.values(), *BUILTIN_EDITS.values()]:
         registry.register("operator", operator.spec.operator_id, operator.spec.version, operator)
-    evaluator = ForwardBatchEvaluator()
-    registry.register("evaluator", evaluator.evaluator_id, evaluator.version, evaluator)
+    for evaluator in (ForwardBatchEvaluator(), ClassificationEvaluator()):
+        registry.register("evaluator", evaluator.evaluator_id, evaluator.version, evaluator)
     return registry

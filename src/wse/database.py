@@ -229,6 +229,49 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ALTER TABLE jobs ADD COLUMN lease_pid INTEGER",
         ],
     ),
+    (
+        5,
+        [
+            # Immutable task definitions (task.json); task_json is canonical JSON.
+            """
+            CREATE TABLE tasks (
+                task_id     TEXT PRIMARY KEY,
+                task_hash   TEXT NOT NULL,
+                task_json   TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            )
+            """,
+            # Evaluation reports. Development reports are written with the job
+            # that produced them; final reports with the final evaluation.
+            """
+            CREATE TABLE reports (
+                report_id      TEXT PRIMARY KEY,
+                experiment_id  TEXT NOT NULL REFERENCES experiments (experiment_id),
+                job_id         TEXT UNIQUE REFERENCES jobs (job_id),
+                checkpoint_id  TEXT NOT NULL REFERENCES checkpoints (checkpoint_id),
+                suite_id       TEXT NOT NULL REFERENCES suites (suite_id),
+                split          TEXT NOT NULL CHECK (split IN ('development', 'final')),
+                report_hash    TEXT NOT NULL,
+                report_json    TEXT NOT NULL,
+                created_at     TEXT NOT NULL
+            )
+            """,
+            "CREATE INDEX reports_experiment ON reports (experiment_id, created_at)",
+            # One sealed final evaluation per experiment, written when it closes.
+            """
+            CREATE TABLE final_evaluations (
+                experiment_id        TEXT PRIMARY KEY REFERENCES experiments (experiment_id),
+                candidate_report_id  TEXT NOT NULL REFERENCES reports (report_id),
+                control_report_id    TEXT NOT NULL REFERENCES reports (report_id),
+                final_hash           TEXT NOT NULL,
+                final_json           TEXT NOT NULL,
+                created_at           TEXT NOT NULL
+            )
+            """,
+            "ALTER TABLE jobs ADD COLUMN report_id TEXT REFERENCES reports (report_id)",
+            "ALTER TABLE experiments ADD COLUMN frozen_at TEXT",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

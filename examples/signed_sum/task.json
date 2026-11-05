@@ -1,0 +1,17 @@
+{
+  "schema_version": "1",
+  "task_id": "signed_sum_v1",
+  "title": "Signed-sum classification",
+  "description": "The registered model reads two real inputs x = (x0, x1) and returns logits for two classes; its prediction is the class with the larger logit. It should predict class 1 when x0 + x1 > 0 and class 0 otherwise. Using only the permitted inspection and editing operations, produce a candidate checkpoint that follows this rule, and select it.",
+  "input_description": "x = (x0, x1), two float32 values",
+  "output_description": "logits for class 0 and class 1; the predicted class is the argmax",
+  "objective": {
+    "schema_version": "1",
+    "task_id": "signed_sum_v1",
+    "description": "Predict class 1 exactly when x0 + x1 > 0, measured as accuracy on the development suite.",
+    "gates": [{"metric": "accuracy", "min_value": 1.0}]
+  },
+  "target_accuracy": 1.0,
+  "development_suite_id": "signed_sum_dev_v1",
+  "development_examples": 64
+}

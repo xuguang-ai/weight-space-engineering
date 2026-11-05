@@ -50,6 +50,7 @@ from wse.schemas import (
     DomainError,
     ErrorCode,
     EvalConfig,
+    EvaluationReport,
     EvaluationSuite,
     Job,
     JobProgress,
@@ -131,15 +132,48 @@ class JobService:
     # -- suites (operator) ------------------------------------------------------
 
     def register_suite(self, suite: EvaluationSuite | Mapping[str, Any]) -> EvaluationSuite:
-        """Register an immutable evaluation suite (operator only)."""
+        """Register an immutable evaluation suite (operator only) and return its registered form.
+
+        Examples of a final suite are always moved into evaluator storage, so
+        the registered suite carries only their ``DatasetManifest``; a
+        development suite may keep inline examples or reference stored ones.
+        A suite that references stored examples is verified against them. A
+        final suite must preregister its full size as a sample count (final
+        evaluation always covers every example), and each task has at most
+        one final suite.
+        """
         self.experiments._require_operator("registering an evaluation suite")
         try:
             parsed = suite if isinstance(suite, EvaluationSuite) else EvaluationSuite.model_validate(dict(suite))
         except (ValidationError, TypeError) as exc:
             raise WSEError(ErrorCode.INVALID_ARGUMENT, f"invalid evaluation suite: {exc}") from exc
         self.engine.registry.resolve_ref("evaluator", parsed.evaluator)
+        if parsed.split == "final" and parsed.dataset is None:
+            parsed = parsed.model_copy(update={"dataset": self.engine.datasets.put(parsed.data)})
+        elif parsed.dataset is not None and parsed.data is not None:
+            self.engine.datasets.put(parsed.data)
+        if parsed.dataset is not None:
+            try:
+                parsed.resolved(self.engine.datasets.load(parsed.dataset))  # verifies data and preregistration
+            except ValidationError as exc:
+                raise WSEError(ErrorCode.INVALID_ARGUMENT, f"invalid evaluation suite: {exc}") from exc
+        if parsed.split == "final" and parsed.example_count not in parsed.sample_counts:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                           f"a final suite must preregister its full size ({parsed.example_count}) as a sample count")
+        parsed = parsed.registered()
         with self.db.transaction() as conn:
             row = conn.execute("SELECT suite_hash FROM suites WHERE suite_id = ?", (parsed.suite_id,)).fetchone()
+            other_final = conn.execute(
+                "SELECT suite_id FROM suites WHERE task_id = ? AND split = 'final' AND suite_id != ?",
+                (parsed.task_id, parsed.suite_id),
+            ).fetchone() if parsed.split == "final" else None
+            if other_final is not None:
+                raise WSEError(
+                    ErrorCode.VERSION_CONFLICT,
+                    f"task {parsed.task_id} already has the final suite {other_final['suite_id']}; a task's final "
+                    "set is fixed, so new final data needs a new task",
+                    details={"task_id": parsed.task_id, "final_suite_id": other_final["suite_id"]},
+                )
             if row is None:
                 conn.execute(
                     "INSERT INTO suites (suite_id, task_id, split, suite_hash, suite_json, created_at) "
@@ -325,6 +359,7 @@ class JobService:
             progress=JobProgress.model_validate_json(row["progress_json"]),
             usage=Usage.model_validate_json(row["usage_json"]) if row["usage_json"] else None,
             result=json.loads(row["result_json"]) if row["result_json"] else None,
+            report_id=row["report_id"],
             error=DomainError.model_validate_json(row["error_json"]) if row["error_json"] else None,
             attempts=row["attempts"],
             created_at=row["created_at"],
@@ -404,8 +439,12 @@ class JobService:
         from_state: str = "running",
         lease_owner: str | None = None,
         lease_expired_before: float | None = None,
+        report: EvaluationReport | None = None,
     ) -> bool:
         """Move a job to a terminal state and settle its reservation, in the caller's transaction.
+
+        ``report``, for a successful evaluation, is persisted and linked to
+        the job in the same transaction.
 
         The update is conditional on the job still being in ``from_state``
         (and, when given, held by ``lease_owner`` or with a lease expired
@@ -436,6 +475,11 @@ class JobService:
             return False
         row = conn.execute("SELECT experiment_id, reservation_id FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
         reservation = self.ledger.settle(row["reservation_id"], usage, state, conn=conn)
+        if report is not None:
+            if state != "succeeded" or report.job_id != job_id or report.experiment_id != row["experiment_id"]:
+                raise WSEError(ErrorCode.INVALID_ARGUMENT, "only a successful job stores its own report")
+            self.engine.evaluation.insert_report(conn, report.model_copy(update={"usage": usage}))
+            conn.execute("UPDATE jobs SET report_id = ? WHERE job_id = ?", (report.report_id, job_id))
         record_event(conn, f"job.{state}", job_id,
                      {"charged": reservation.charged, "error": error.code.value if error else None,
                       "reason": error.details.get("reason") if error else None},

@@ -1,8 +1,10 @@
 """Direct library functions and the managed ``Engine`` facade.
 
-Direct use (``load_model``) works in memory: it needs no service, database, or
-MCP, and its handles carry no experiment IDs. Results of direct use are
-labeled ``unmanaged`` and cannot support managed-enforcement claims.
+Direct use (``load_model``, ``apply_operator``, ``evaluate_candidate``) works
+in memory: it needs no service, database, or MCP, and its handles and results
+carry no experiment IDs. Results of direct use are labeled ``unmanaged`` and
+cannot support managed-enforcement claims (a verified no-forward or
+fixed-budget setting); managed reports are labeled ``managed``.
 
 The ``Engine`` wraps the same implementations with persistence: it imports
 models into the content-addressed store, assigns checkpoint IDs, and serves
@@ -13,6 +15,7 @@ never loads SQLite.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -26,9 +29,14 @@ from wse.adapters.base import Architecture, ModelAdapter
 from wse.registry import Registry, builtin_registry
 from wse.schemas import (
     BundleManifest,
+    ClusterSummary,
     ErrorCode,
+    EvalConfig,
+    EvaluationSuite,
+    ExecutionConfig,
     ExtensionRef,
     ImportManifest,
+    IntervalEstimate,
     Management,
     MaterializedPatch,
     ModelIdentity,
@@ -47,23 +55,30 @@ if TYPE_CHECKING:
     from wse.experiments import ExperimentService
     from wse.jobs import JobService
     from wse.policy import ExperimentPolicy, OperationPolicy
+    from wse.evaluation import EvaluationService
+    from wse.evaluators.datasets import DatasetStore
     from wse.schemas import (
         AnalysisResult,
-        EvalConfig,
-        EvaluationSuite,
+        ComparisonReport,
+        DatasetManifest,
+        EvaluationReport,
         Experiment,
         ExperimentCheckpoint,
         Job,
         PatchArtifact,
         PatchPreview,
         PatchSpec,
+        FinalEvaluationReport,
         Reservation,
         RunGrant,
+        SuiteData,
+        TaskDefinition,
         TensorSlice,
     )
     from wse.store import ArtifactStore, RecoveryReport
 
 DEFAULT_MAX_MODEL_BYTES = 64 * 1024 * 1024
+DEFAULT_EVAL_BATCH_SIZE = 64
 MAX_CONFIG_BYTES = 1024 * 1024
 BUNDLE_MANIFEST_NAME = "wse_bundle.json"
 
@@ -135,7 +150,16 @@ class EditResult:
 
 @dataclass(frozen=True)
 class EvaluationResult:
-    """Outcome of a direct evaluation, bound to its input and config identities."""
+    """Outcome of an evaluation, bound to its model, data, and configuration identities.
+
+    ``evaluator_config_hash`` is the hash of ``execution`` (evaluator,
+    parameters, ``eval_config``, batch size, device). ``scores`` holds one
+    score per example (1 = correct) when the evaluator reports them, with
+    ``cluster_ids`` the cluster of every example; ``intervals`` holds the
+    cluster-bootstrap accuracy interval and the Clopper-Pearson interval on
+    fully correct clusters. The managed worker persists this result as an
+    ``EvaluationReport``; direct results stay ``unmanaged``.
+    """
 
     metrics: Mapping[str, float]
     sample_count: int
@@ -144,6 +168,16 @@ class EvaluationResult:
     evaluator_config_hash: str
     data_hash: str
     usage: Usage
+    split: str
+    suite_id: str
+    execution: ExecutionConfig
+    clusters: ClusterSummary | None
+    intervals: Mapping[str, IntervalEstimate]
+    scores: tuple[int, ...] | None
+    cluster_ids: tuple[int, ...] | None
+    errors: tuple[str, ...]
+    truncation_count: int
+    elapsed_seconds: float
     management: Management = "unmanaged"
 
 
@@ -280,6 +314,158 @@ def apply_operator(
     return _apply_operator(model, operator_id, parameters, registry=registry, policy=policy)
 
 
+class _CountingForward:
+    """Unmetered forward for direct evaluation: counts calls and examples, enforces the batch size."""
+
+    def __init__(self, model: ModelHandle, batch_size: int) -> None:
+        self.model = model
+        self.batch_size = batch_size
+        self.started_calls = 0
+        self.started_examples = 0
+
+    def check(self) -> None:
+        return None
+
+    def __call__(self, inputs: torch.Tensor) -> torch.Tensor:
+        if not isinstance(inputs, torch.Tensor) or inputs.dim() < 1 or not 1 <= inputs.shape[0] <= self.batch_size:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, f"a forward batch must have between 1 and {self.batch_size} rows")
+        self.started_calls += 1
+        self.started_examples += int(inputs.shape[0])
+        with torch.inference_mode():
+            return self.model.forward(inputs)
+
+
+def _as_suite(evaluator: EvaluationSuite | Mapping[str, Any]) -> EvaluationSuite:
+    if isinstance(evaluator, EvaluationSuite):
+        return evaluator
+    try:
+        return EvaluationSuite.model_validate(dict(evaluator))
+    except (ValidationError, TypeError, ValueError) as exc:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, f"invalid evaluation suite: {exc}") from exc
+
+
+def _as_eval_config(config: EvalConfig | Mapping[str, Any]) -> EvalConfig:
+    if isinstance(config, EvalConfig):
+        return config
+    try:
+        return EvalConfig.model_validate(config)
+    except (ValidationError, TypeError, ValueError) as exc:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                       "eval_config must be an object with exactly sample_count (integer) and seed (integer)") from exc
+
+
+def _parse_summary(summary: Any, sample_count: int) -> tuple[dict[str, float], list[str], list[int] | None, int]:
+    """Validate an evaluator's summary: metrics, errors, optional per-example scores, truncation count."""
+    import math
+
+    def bad(reason: str) -> WSEError:
+        return WSEError(ErrorCode.WORKER_FAILED, f"the evaluator returned an invalid summary: {reason}")
+
+    if not isinstance(summary, Mapping) or not isinstance(summary.get("metrics"), Mapping):
+        raise bad("it must be an object with a metrics object")
+    metrics: dict[str, float] = {}
+    for name, value in summary["metrics"].items():
+        if not isinstance(name, str) or isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not math.isfinite(value):
+            raise bad("metrics must map names to finite numbers")
+        metrics[name] = float(value)
+    if summary.get("sample_count", sample_count) != sample_count:
+        raise bad(f"it covers {summary.get('sample_count')!r} examples, not the requested {sample_count}")
+    errors = summary.get("errors", [])
+    if not isinstance(errors, list) or not all(isinstance(error, str) for error in errors):
+        raise bad("errors must be a list of strings")
+    scores = summary.get("scores")
+    if scores is not None:
+        if not isinstance(scores, list) or len(scores) != sample_count \
+                or any(isinstance(s, bool) or s not in (0, 1) for s in scores):
+            raise bad("scores must hold one 0 or 1 per evaluated example")
+        scores = [int(s) for s in scores]
+    truncation = summary.get("truncation_count", 0)
+    if isinstance(truncation, bool) or not isinstance(truncation, int) or truncation < 0:
+        raise bad("truncation_count must be a nonnegative integer")
+    return metrics, list(errors), scores, truncation
+
+
+def evaluate_candidate(
+    model: ModelHandle,
+    evaluator: EvaluationSuite | Mapping[str, Any],
+    config: EvalConfig | Mapping[str, Any],
+    *,
+    registry: Registry | None = None,
+    forward: Any = None,
+    batch_size: int = DEFAULT_EVAL_BATCH_SIZE,
+) -> EvaluationResult:
+    """Evaluate a model on a suite's examples (direct use, unmanaged).
+
+    ``evaluator`` is an ``EvaluationSuite`` with its examples attached: it
+    names the exact registered evaluator, its parameters, and the data.
+    ``config`` is the ``eval_config`` (``sample_count`` examples from the
+    start of the suite, ending at a cluster boundary, and a ``seed``).
+    Batches hold at most ``batch_size`` rows; the managed server fixes it to
+    the policy's ``examples_per_batch`` (64 under ``small_model_v1``), which
+    is also the default here, so the configuration identities agree.
+
+    The managed worker calls this same function with ``forward`` set to its
+    metered forward callable and persists the result as a report. Requires
+    neither SQLite, a job service, nor MCP.
+    """
+    from wse.evaluators.classification import accuracy_interval, fully_correct_interval
+
+    suite = _as_suite(evaluator)
+    eval_config = _as_eval_config(config)
+    if suite.data is None:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                       f"suite {suite.suite_id} has no examples attached; direct evaluation needs inline data")
+    count = eval_config.sample_count
+    if not 1 <= count <= suite.data.example_count:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                       f"sample_count must lie between 1 and the {suite.data.example_count} examples of the suite")
+    if suite.data.cuts_clusters(count):
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, f"sample_count {count} would split a {suite.data.cluster_unit}")
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, "batch_size must be a positive integer")
+    registry = registry or builtin_registry()
+    implementation = registry.resolve_ref("evaluator", suite.evaluator)
+    meter = forward if forward is not None else _CountingForward(model, batch_size)
+    start = time.perf_counter()
+    summary = implementation.evaluate(meter, suite, eval_config, batch_size=batch_size)
+    elapsed = time.perf_counter() - start
+    metrics, errors, scores, truncation = _parse_summary(summary, count)
+    execution = ExecutionConfig(evaluator=suite.evaluator, parameters=suite.parameters, eval_config=eval_config,
+                                batch_size=batch_size)
+    cluster_ids = suite.data.cluster_ids()[:count]
+    unit = suite.data.cluster_unit or "example"
+    clusters, intervals = None, {}
+    if scores is not None:
+        fully = fully_correct_interval(scores, cluster_ids, unit)
+        clusters = ClusterSummary(unit=unit, count=fully.trials, fully_correct=fully.successes)
+        intervals = {"accuracy": accuracy_interval(scores, cluster_ids, unit), "fully_correct_clusters": fully}
+    calls, examples = int(meter.started_calls), int(meter.started_examples)
+    usage = Usage(evaluation_batches=calls, evaluated_examples=examples, model_forward_calls=calls,
+                  compute_seconds=round(elapsed, 6), analysis_calls=0, tensor_read_calls=0, candidate_commits=0,
+                  artifact_bytes=0, peak_memory_bytes=None,
+                  unavailable={"peak_memory_bytes": "measured only for whole evaluation processes"})
+    return EvaluationResult(
+        metrics=MappingProxyType(metrics),
+        sample_count=count,
+        model=model.identity,
+        evaluator=suite.evaluator,
+        evaluator_config_hash=execution.config_hash,
+        data_hash=suite.data.data_hash,
+        usage=usage,
+        split=suite.split,
+        suite_id=suite.suite_id,
+        execution=execution,
+        clusters=clusters,
+        intervals=MappingProxyType(intervals),
+        scores=tuple(scores) if scores is not None else None,
+        cluster_ids=tuple(cluster_ids) if scores is not None else None,
+        errors=tuple(errors),
+        truncation_count=truncation,
+        elapsed_seconds=round(elapsed, 6),
+    )
+
+
 def _import_manifest(value: ImportManifest | Mapping[str, Any]) -> ImportManifest:
     if isinstance(value, ImportManifest):
         return value
@@ -378,10 +564,13 @@ class Engine:
     can see only the grant's base checkpoint and the candidates created in
     that experiment: listings omit every other checkpoint, and any other
     checkpoint ID fails with the same ``NOT_FOUND`` error as an ID that does
-    not exist. Operator actions (imports, policy registration, run grants,
-    suite registration, direct reservations and settlements) fail with
-    ``POLICY_DENIED``. Opening an engine with ``recover=True`` also settles
-    jobs lost in a crash (``recover_jobs``).
+    not exist. Operator actions (imports, policy, task, dataset, and suite
+    registration, run grants, direct reservations and settlements, freezing,
+    and final evaluation) fail with ``POLICY_DENIED``. Its evaluator storage
+    is sealed, so no agent-facing operation can read evaluation examples, and
+    final reports stay withheld until the experiment is closed. Opening an
+    engine with ``recover=True`` also settles jobs lost in a crash
+    (``recover_jobs``).
     """
 
     def __init__(
@@ -394,6 +583,8 @@ class Engine:
         policy: OperationPolicy | None = None,
         run_id: str | None = None,
     ) -> None:
+        from wse.evaluation import EvaluationService
+        from wse.evaluators.datasets import DatasetStore
         from wse.experiments import ExperimentService
         from wse.jobs import JobService
         from wse.policy import default_operation_policy
@@ -404,11 +595,13 @@ class Engine:
         self.max_bytes = max_bytes
         self.bound_run_id = run_id
         self.store: ArtifactStore = ArtifactStore(workspace)
+        self.datasets: DatasetStore = DatasetStore(workspace, sealed=run_id is not None)
         try:
             self.last_recovery: RecoveryReport | None = self.store.recover() if recover else None
             self.experiments: ExperimentService = ExperimentService(self, bound_run_id=run_id)
             self.budget: BudgetLedger = self.experiments.ledger
             self.jobs: JobService = JobService(self)
+            self.evaluation: EvaluationService = EvaluationService(self)
             if recover:
                 self.jobs.recover_lost_jobs()
         except BaseException:
@@ -745,3 +938,46 @@ class Engine:
     def recover_jobs(self) -> list[str]:
         """Settle jobs whose worker lease expired; return their IDs."""
         return self.jobs.recover_lost_jobs()
+
+    # -- tasks, datasets, reports, freezing, and final evaluation ------------------------
+
+    def register_task(self, task: TaskDefinition | Mapping[str, Any]) -> TaskDefinition:
+        """Register an immutable task definition such as ``task.json`` (operator only)."""
+        return self.evaluation.register_task(task)
+
+    def get_task(self, task_id: str) -> TaskDefinition:
+        """A registered task definition; a run-bound engine sees only its run's task."""
+        return self.evaluation.get_task(task_id)
+
+    def register_dataset(self, data: SuiteData | Mapping[str, Any], *,
+                         generation: Mapping[str, Any] | None = None) -> DatasetManifest:
+        """Store examples in evaluator storage and return their manifest (operator only)."""
+        self._require_operator("storing evaluation data")
+        return self.datasets.put(data, generation=generation)
+
+    def get_report(self, experiment_id: str, report_id: str) -> EvaluationReport:
+        """An evaluation report of the experiment; final reports are withheld until it is closed."""
+        return self.evaluation.get_report(experiment_id, report_id)
+
+    def list_reports(self, experiment_id: str) -> list[EvaluationReport]:
+        return self.evaluation.list_reports(experiment_id)
+
+    def compare(self, experiment_id: str, base_report_id: str, candidate_report_id: str) -> ComparisonReport:
+        """Paired difference and intervals of two development reports on the same examples and configuration."""
+        return self.evaluation.compare(experiment_id, base_report_id, candidate_report_id)
+
+    def freeze(self, experiment_id: str, expected_selected_id: str) -> Experiment:
+        """Freeze the selected checkpoint once no job or reservation is outstanding (operator only)."""
+        return self.experiments.freeze(experiment_id, expected_selected_id)
+
+    def final_evaluate(self, experiment_id: str, checkpoint_id: str | None = None) -> FinalEvaluationReport:
+        """Evaluate the frozen candidate and the base-checkpoint control on the final set, then close (operator only).
+
+        ``checkpoint_id``, when given, must be the frozen selection: final
+        evaluation accepts no other checkpoint.
+        """
+        return self.evaluation.final_evaluate(experiment_id, checkpoint_id)
+
+    def get_final_report(self, experiment_id: str) -> FinalEvaluationReport:
+        """The sealed final report of a closed experiment."""
+        return self.evaluation.get_final_report(experiment_id)
