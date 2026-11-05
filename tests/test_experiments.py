@@ -465,17 +465,18 @@ def test_a_run_bound_engine_exposes_only_its_grant_base_and_own_candidates(works
         for visible in (base.checkpoint_id, own.checkpoint_id):
             assert bound.inspect(visible).checkpoint_id == visible
             assert bound.load_manifest(visible).checkpoint_id == visible
-            assert bound.read_tensor_slice(visible, weight, ROW1).element_count == 4
-            assert bound.analyze(visible, "stats", weight, ROW1).result["count"] == 4
-            assert bound.open_checkpoint(visible).weights_hash == bound.load_manifest(visible).weights_hash
+            # Weights are reached only through the metered, experiment-scoped operations
+            # (tests/test_run_surfaces.py covers the denied unmetered ones).
+            assert bound.read_model_tensor(eid, visible, weight, ROW1).element_count == 4
+            assert bound.analyze_model(eid, visible, "stats", weight, ROW1).result["count"] == 4
+            assert bound.inspect_model_details(eid, visible).checkpoint_id == visible
         # Other checkpoints fail exactly like an ID that does not exist, so existence is not confirmed.
         calls = [
             lambda c: bound.inspect(c),
             lambda c: bound.load_manifest(c),
-            lambda c: bound.read_tensor_slice(c, weight, ROW1),
-            lambda c: bound.read_tensor(c, weight, ROW1),
-            lambda c: bound.analyze(c, "stats", weight, ROW1),
-            lambda c: bound.open_checkpoint(c),
+            lambda c: bound.read_model_tensor(eid, c, weight, ROW1),
+            lambda c: bound.analyze_model(eid, c, "stats", weight, ROW1),
+            lambda c: bound.inspect_model_details(eid, c),
         ]
         for call in calls:
             expected = _not_found_message(call, missing)

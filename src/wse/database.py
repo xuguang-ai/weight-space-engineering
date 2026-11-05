@@ -272,6 +272,34 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "ALTER TABLE experiments ADD COLUMN frozen_at TEXT",
         ],
     ),
+    (
+        6,
+        [
+            # Previews are a ledger counter. Experiments created before it existed
+            # get the default allowance of 50 (raised to their preview count when
+            # larger), with their stored previews counted as consumed.
+            """
+            INSERT INTO budget_ledger (experiment_id, counter, limit_value, consumed)
+            SELECT e.experiment_id, 'patch_previews',
+                   MAX(50, (SELECT COUNT(*) FROM patches p WHERE p.experiment_id = e.experiment_id)),
+                   (SELECT COUNT(*) FROM patches p WHERE p.experiment_id = e.experiment_id)
+            FROM experiments e
+            WHERE NOT EXISTS (SELECT 1 FROM budget_ledger b
+                              WHERE b.experiment_id = e.experiment_id AND b.counter = 'patch_previews')
+            """,
+            # Which experiment produced a stored large analysis result. The files
+            # are content-addressed, so one URI can belong to several experiments;
+            # a run may read a URI only when its own experiment produced it.
+            """
+            CREATE TABLE analysis_results (
+                uri            TEXT NOT NULL,
+                experiment_id  TEXT NOT NULL REFERENCES experiments (experiment_id),
+                created_at     TEXT NOT NULL,
+                PRIMARY KEY (uri, experiment_id)
+            )
+            """,
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

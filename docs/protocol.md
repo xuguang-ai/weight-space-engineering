@@ -53,7 +53,10 @@ does not exist. `wse_create_experiment` accepts only the grant's `run_id`,
 `task_id`, and `policy_id`, and the run has at most one experiment: retries,
 even with a new idempotency key, return it unchanged and never reset its
 budget. Operator actions (imports, grants, freezing, final evaluation,
-exports) are not exposed through MCP. Final reports are withheld until the
+exports) are not exposed through MCP. A run-bound Engine in Python follows
+the same rules: it cannot open checkpoints or read weights outside the
+metered experiment operations, and it cannot read the exact materialized
+patch. Final reports are withheld until the
 experiment is closed.
 
 ### Protocol versions
@@ -83,10 +86,10 @@ with different input fails with `IDEMPOTENCY_CONFLICT`.
 | `wse_list_models` | `cursor` (optional) | One page (50) of model summaries and `next_cursor`; only checkpoints of this run. |
 | `wse_create_experiment` | `run_id, task_id, policy_id, idempotency_key` | The experiment description (below). |
 | `wse_get_experiment` | `experiment_id` | The experiment description: state, task definition and `ObjectiveSpec`, selected checkpoint, budget, permitted operations and limits, development suites, checkpoints, `constraint_status`. |
-| `wse_inspect_model` | `experiment_id, checkpoint_id` | The manifest and whole-tensor statistics by layer, from the policy's registered `stats` analysis (not charged). |
+| `wse_inspect_model` | `experiment_id, checkpoint_id` | The manifest and whole-tensor statistics by layer, from the policy's registered `stats` analysis. The manifest is free; the statistics are charged as compute seconds (not analysis calls), need an OPEN experiment, and stop at the per-operation time limit. |
 | `wse_read_tensor` | `experiment_id, checkpoint_id, tensor, selection` | A bounded slice (at most 2,048 elements); charges one `tensor_read_calls`. |
 | `wse_analyze` | `experiment_id, checkpoint_id, kind, tensor, selection, k` (optional) | A permitted analysis (`stats`, `norm`, `top_k` in M1), charged under its operator's usage contract. |
-| `wse_preview_patch` | `experiment_id, patch_spec, idempotency_key` | An immutable preview with `patch_id`; the selected checkpoint does not change. |
+| `wse_preview_patch` | `experiment_id, patch_spec, idempotency_key` | An immutable preview with `patch_id`; the selected checkpoint does not change. Each new preview charges one `patch_previews`, because its deltas reveal the base values of the edited region. |
 | `wse_apply_patch` | `experiment_id, patch_id, idempotency_key` | The candidate's manifest; charges one `candidate_commits`. |
 | `wse_submit_evaluation` | `experiment_id, checkpoint_id, suite_id, eval_config, idempotency_key` | The queued job, returned immediately; development suites only. |
 | `wse_get_job` | `experiment_id, job_id, wait_seconds` (0-10) | The job; `wait_seconds` holds the call until the job is terminal or the wait expires. A succeeded job carries its report summary (metrics, sample count, errors, `target_met`, report URI) inline. |
@@ -164,7 +167,8 @@ body. Protocol failures remain JSON-RPC errors.
 | `wse://models/{checkpoint_id}/manifest{?page}` | A checkpoint's manifest. |
 | `wse://experiments/{experiment_id}/policy{?page}` | The experiment's immutable policy. |
 | `wse://reports/{report_id}{?page}` | An evaluation report; final reports only after the experiment is closed. |
-| `wse://patches/{patch_id}{?page}` | `{"preview", "artifact"}`: the preview and the stored frozen spec with its exact materialized patch. |
+| `wse://patches/{patch_id}{?page}` | `{"preview", "spec", "steps", "result_weights_hash"}`: the preview, the frozen spec, and per-step summaries (tensor, selection, before/after hashes, changed elements). The materialized after-values are omitted because they reproduce base weights; the exact patch is an operator view (`wse patch`). |
+| `wse://analyses/{digest}{?page}` | A large analysis result referenced by an analysis `result_uri`; readable only by the run whose experiment produced it. |
 
 Resource reads use the same bound Engine, and so the same authorization, as
 tools. A failed read is a JSON-RPC error whose message is the domain error

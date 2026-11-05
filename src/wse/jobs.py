@@ -82,7 +82,7 @@ def _wait_seconds(value: Any) -> float:
 def queued_cancel_usage() -> Usage:
     """Usage of a job cancelled before any worker started it."""
     return Usage(evaluation_batches=0, evaluated_examples=0, model_forward_calls=0, compute_seconds=0.0,
-                 analysis_calls=0, tensor_read_calls=0, candidate_commits=0, artifact_bytes=0,
+                 analysis_calls=0, tensor_read_calls=0, candidate_commits=0, patch_previews=0, artifact_bytes=0,
                  peak_memory_bytes=None,
                  unavailable={"peak_memory_bytes": "no worker executed this job, so no memory was measured"})
 
@@ -92,7 +92,7 @@ def lost_job_usage(requested: Mapping[str, Any]) -> Usage:
     return Usage.model_validate({
         "evaluation_batches": 0, "evaluated_examples": 0, "model_forward_calls": 0, "compute_seconds": 0.0,
         **requested,
-        "analysis_calls": 0, "tensor_read_calls": 0, "candidate_commits": 0, "artifact_bytes": 0,
+        "analysis_calls": 0, "tensor_read_calls": 0, "candidate_commits": 0, "patch_previews": 0, "artifact_bytes": 0,
         "peak_memory_bytes": None,
         "unavailable": {"peak_memory_bytes": "the worker was lost before reporting usage"},
     })

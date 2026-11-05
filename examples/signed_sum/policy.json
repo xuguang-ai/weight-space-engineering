@@ -4,6 +4,7 @@
   "mode": "bounded_eval",
   "budget": {
     "candidate_commits": 20,
+    "patch_previews": 50,
     "analysis_calls": 50,
     "tensor_read_calls": 100,
     "evaluation_batches": 10,

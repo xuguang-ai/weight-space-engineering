@@ -446,7 +446,7 @@ def evaluate_candidate(
     calls, examples = int(meter.started_calls), int(meter.started_examples)
     usage = Usage(evaluation_batches=calls, evaluated_examples=examples, model_forward_calls=calls,
                   compute_seconds=round(elapsed, 6), analysis_calls=0, tensor_read_calls=0, candidate_commits=0,
-                  artifact_bytes=0, peak_memory_bytes=None,
+                  patch_previews=0, artifact_bytes=0, peak_memory_bytes=None,
                   unavailable={"peak_memory_bytes": "measured only for whole evaluation processes"})
     return EvaluationResult(
         metrics=MappingProxyType(metrics),
@@ -766,11 +766,28 @@ class Engine:
         At most 2,048 elements and 32 KiB of canonical JSON; oversized requests
         fail with the largest permitted selection.
         """
+        self._require_unbound("read_tensor_slice")
         return self._bounded_read(checkpoint_id, tensor, selection)[0]
 
     def read_tensor(self, checkpoint_id: str, tensor: str, selection: Any) -> torch.Tensor:
         """Read an exact-name tensor region from a READY checkpoint (same bounds)."""
+        self._require_unbound("read_tensor")
         return self._bounded_read(checkpoint_id, tensor, selection)[1]
+
+    def _require_unbound(self, method: str) -> None:
+        """Deny an unmetered weight access to a run-bound engine.
+
+        A run reaches weights only through the metered, experiment-scoped
+        operations, so the same denial applies to every checkpoint ID and
+        confirms nothing about which ones exist.
+        """
+        if self.bound_run_id is not None:
+            raise WSEError(
+                ErrorCode.POLICY_DENIED,
+                f"{method} is unmetered and is not available to a run; use the experiment-scoped "
+                "read_model_tensor, analyze_model, or inspect_model_details, which the policy meters",
+                details={"method": method},
+            )
 
     def analyze(
         self,
@@ -788,6 +805,7 @@ class Engine:
         ``norm``, ``top_k`` by default). An omitted ``k`` for top-k resolves to
         ``min(16, element_count)``; other kinds do not accept ``k``.
         """
+        self._require_unbound("analyze")
         return self._analyze(checkpoint_id, kind, tensor, selection, k, parameters=parameters)
 
     def _analyze(
@@ -822,17 +840,30 @@ class Engine:
         )
 
     def read_analysis_result(self, uri: str) -> dict[str, Any]:
-        """Return a large analysis result stored behind ``AnalysisResult.result_uri``."""
-        return json.loads(self.store.read_analysis_result(uri))
+        """Return a large analysis result stored behind ``AnalysisResult.result_uri``.
+
+        A run-bound engine reads only results its own experiment produced.
+        """
+        return self.experiments.find_analysis_result(uri)
 
     def open_checkpoint(self, checkpoint_id: str) -> ModelHandle:
         """Load a READY checkpoint into an in-memory handle (hash-verified).
 
-        Operator use only. The returned handle's ``forward`` runs the adapter
-        directly with no policy or budget check, so this method must never be
-        reachable from an agent-facing path; managed inference goes through
-        the worker.
+        Operator use only: the handle reads every weight and its ``forward``
+        runs the adapter with no policy or budget check. A run-bound engine
+        is denied; managed inference goes through the worker.
         """
+        if self.bound_run_id is not None:
+            raise WSEError(
+                ErrorCode.POLICY_DENIED,
+                "open_checkpoint returns an unmetered handle (every weight and forward) and is not available to a "
+                "run; managed inference goes through evaluation jobs",
+                details={"method": "open_checkpoint"},
+            )
+        return self._open_checkpoint(checkpoint_id)
+
+    def _open_checkpoint(self, checkpoint_id: str) -> ModelHandle:
+        """Internal: load a checkpoint for service code (previews, applies, workers, final evaluation)."""
         manifest = self._manifest(checkpoint_id)
         adapter_ref, adapter = _resolve_adapter(self.registry, manifest.adapter)
         handle = _build_handle(adapter_ref, adapter, manifest, self.store.load_tensors(checkpoint_id))
@@ -920,7 +951,7 @@ class Engine:
         )
 
     def inspect_model_details(self, experiment_id: str, checkpoint_id: str) -> ModelInspection:
-        """An owned checkpoint's manifest with whole-tensor statistics by layer (not charged)."""
+        """An owned checkpoint's manifest with whole-tensor statistics by layer (charged as compute time)."""
         return self.experiments.inspect_details(experiment_id, checkpoint_id)
 
     def find_patch(self, patch_id: str) -> PatchDocument:

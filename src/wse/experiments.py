@@ -27,7 +27,13 @@ Rules implemented here (Sections 4.1, 5.1-5.3, and 6.2 of the plan):
 * Experiment-scoped reads and analyses (``read_tensor``, ``analyze``) check
   ownership, use the experiment policy's operations and limits, and charge
   ``tensor_read_calls`` or the operator's usage-contract counter plus compute
-  seconds through ``wse.budget``; previews and applies charge compute seconds.
+  seconds through ``wse.budget``. Each new preview charges one
+  ``patch_previews`` (its deltas reveal the edited region's base values) plus
+  compute seconds; applies charge compute seconds; inspection statistics
+  charge compute seconds only.
+* A run sees a patch without its materialized after-values; the exact patch
+  is an operator view. A run reads a large analysis result only when its own
+  experiment produced it.
 * Rejected mutations (creation, previews, applies, selections, freezing) are
   recorded as audit events and leave state unchanged.
 * ``freeze`` (operator only) is a compare-and-swap on the selected ID that
@@ -73,6 +79,7 @@ from wse.schemas import (
     PatchOperationSummary,
     PatchPreview,
     PatchSpec,
+    PatchStepSummary,
     Provenance,
     RunGrant,
     StorageCost,
@@ -458,19 +465,46 @@ class ExperimentService:
         return self.load_manifest(experiment_id, checkpoint_id)
 
     def inspect_details(self, experiment_id: str, checkpoint_id: str) -> ModelInspection:
-        """The manifest of an owned checkpoint with whole-tensor statistics by layer (not charged).
+        """The manifest of an owned checkpoint with whole-tensor statistics by layer.
 
         Statistics come from the experiment policy's registered ``stats``
-        analysis, so no separate algorithm runs here; a tensor larger than
-        the policy's ``max_analysis_elements`` (or a policy without a
-        ``stats`` kind) reports why its statistics are unavailable.
+        analysis, so no separate algorithm runs here. Computing them is a
+        managed computation: it needs an OPEN experiment with compute time
+        left, stops at the policy's per-operation time limit, and is charged
+        as compute seconds (not as analysis calls). The manifest itself is
+        free. A tensor without statistics reports why: the experiment is not
+        OPEN, compute time is exhausted, the time limit was reached, the
+        tensor exceeds ``max_analysis_elements``, or the policy has no
+        ``stats`` kind.
         """
         manifest = self.load_manifest(experiment_id, checkpoint_id)
+        row = self._experiment_row(experiment_id)
         role = self._owned_checkpoint(self.db.conn, experiment_id, checkpoint_id)["role"]
-        policy = self.experiment_policy(experiment_id).operations
+        experiment_policy = self.experiment_policy(experiment_id)
+        policy = experiment_policy.operations
+        limit = experiment_policy.budget.seconds_per_operation
+        blocked: str | None = None
+        if row["state"] != "OPEN":
+            blocked = f"statistics are computed only while the experiment is OPEN; it is {row['state']}"
+        else:
+            try:
+                self.ledger.require(self.db.conn, experiment_id, {"compute_seconds": 0})
+            except WSEError as exc:
+                if exc.code != ErrorCode.BUDGET_EXCEEDED:
+                    raise
+                blocked = "the experiment's compute_seconds budget is exhausted"
+        metered = blocked is None
+        start = time.perf_counter()
         statistics = []
         for info in manifest.tensors:
             entry: dict[str, Any] = {"tensor": info.name, "shape": list(info.shape), "dtype": info.dtype}
+            if blocked is None and time.perf_counter() - start >= limit:
+                blocked = (f"the per-operation time limit of {limit:g} s was reached; analyze the remaining "
+                           "tensors individually")
+            if blocked is not None:
+                entry.update(statistics=None, unavailable=blocked)
+                statistics.append(TensorStatistics.model_validate(entry))
+                continue
             selection = [{"start": 0, "stop": extent, "step": 1} for extent in info.shape]
             try:
                 result = self.engine._analyze(checkpoint_id, "stats", info.name, selection, policy=policy)
@@ -483,15 +517,23 @@ class ExperimentService:
                 entry.update(statistics=result.result, operator=result.operator,
                              unavailable=None if result.result is not None else "stored by reference")
             statistics.append(TensorStatistics.model_validate(entry))
+        usage = None
+        if metered:
+            elapsed = time.perf_counter() - start
+            with self.db.transaction() as conn:
+                self._require_open(self._experiment_row(experiment_id, conn))
+                charged = self.ledger.charge_compute(conn, experiment_id, elapsed)
+            usage = Usage(compute_seconds=charged, analysis_calls=0, tensor_read_calls=0, model_forward_calls=0)
         return ModelInspection(experiment_id=experiment_id, checkpoint_id=checkpoint_id, role=role,
                                manifest=manifest, tensor_statistics=statistics,
-                               manifest_uri=f"wse://models/{checkpoint_id}/manifest")
+                               manifest_uri=f"wse://models/{checkpoint_id}/manifest", usage=usage)
 
     def find_patch(self, patch_id: Any) -> PatchDocument:
         """A patch by ID alone (for resource reads), scoped like every other lookup.
 
         Patches of experiments this service may not see are reported exactly
-        like patches that do not exist.
+        like patches that do not exist. The document omits the materialized
+        after-values (see ``PatchDocument``).
         """
         row = None
         if isinstance(patch_id, str) and OBJECT_ID_PATTERNS["patch"].fullmatch(patch_id):
@@ -505,11 +547,17 @@ class ExperimentService:
             if exc.code == ErrorCode.NOT_FOUND:
                 raise missing from None
             raise
-        return PatchDocument(preview=self.get_patch(row["experiment_id"], patch_id),
-                             artifact=self.read_patch(row["experiment_id"], patch_id))
+        artifact = self._artifact(row["experiment_id"], patch_id)
+        steps = [PatchStepSummary(op=step.op, operator=step.operator, tensor=step.tensor, selection=step.selection,
+                                  dtype=step.dtype, before_hash=step.before_hash, after_hash=step.after_hash,
+                                  changed_elements=step.changed_elements)
+                 for step in artifact.patch.steps]
+        return PatchDocument(preview=self.get_patch(row["experiment_id"], patch_id), spec=artifact.spec,
+                             steps=steps, result_weights_hash=artifact.patch.result_weights_hash)
 
     def _metered(self, experiment_id: str, checkpoint_id: Any, counter: str, units: int,
-                 compute: Callable[[ExperimentPolicy], Any]) -> Any:
+                 compute: Callable[[ExperimentPolicy], Any],
+                 record: Callable[[sqlite3.Connection, Any], None] | None = None) -> Any:
         """Run a synchronous read or analysis and charge it to the experiment.
 
         Invalid requests fail before anything is charged. The charge is a
@@ -527,6 +575,8 @@ class ExperimentService:
         with self.db.transaction() as conn:
             self.ledger.charge(conn, experiment_id, counter, units)
             self.ledger.charge_compute(conn, experiment_id, time.perf_counter() - start)
+            if record is not None:
+                record(conn, result)
         return result
 
     def read_tensor(self, experiment_id: str, checkpoint_id: str, tensor: str, selection: Any) -> TensorSlice:
@@ -541,11 +591,38 @@ class ExperimentService:
         """A permitted analysis of an owned checkpoint, charged under its operator's usage contract."""
         policy = self.experiment_policy(experiment_id)
         spec = self.engine.registry.resolve_ref("operator", policy.operations.analysis_operator(kind)).spec
+        def record(conn: sqlite3.Connection, result: AnalysisResult) -> None:
+            if result.result_uri:
+                conn.execute("INSERT OR IGNORE INTO analysis_results (uri, experiment_id, created_at) VALUES (?, ?, ?)",
+                             (result.result_uri, experiment_id, utc_now()))
+
         return self._metered(
             experiment_id, checkpoint_id, spec.usage.counter, spec.usage.units_per_call,
             lambda policy: self.engine._analyze(checkpoint_id, kind, tensor, selection, k, parameters=parameters,
                                                 policy=policy.operations),
+            record,
         )
+
+    def find_analysis_result(self, uri: Any) -> dict[str, Any]:
+        """A stored large analysis result (``AnalysisResult.result_uri``).
+
+        A service bound to a run reads only results its own experiment
+        produced; any other URI is reported exactly like one that does not
+        exist. The operator reads any stored result.
+        """
+        missing = WSEError(ErrorCode.NOT_FOUND, f"analysis result {uri!r} does not exist", details={"uri": str(uri)})
+        if self.bound_run_id is not None:
+            owned = isinstance(uri, str) and self.db.conn.execute(
+                "SELECT 1 FROM analysis_results a JOIN experiments e ON e.experiment_id = a.experiment_id "
+                "WHERE a.uri = ? AND e.run_id = ?", (uri, self.bound_run_id)).fetchone()
+            if not owned:
+                raise missing
+        try:
+            return json.loads(self.store.read_analysis_result(uri))
+        except WSEError as exc:
+            if exc.code == ErrorCode.NOT_FOUND:
+                raise missing from None
+            raise
 
     def _patch_row(self, experiment_id: str, patch_id: Any) -> sqlite3.Row:
         row = None
@@ -563,7 +640,15 @@ class ExperimentService:
         return PatchPreview.model_validate_json(self._patch_row(experiment_id, patch_id)["preview_json"])
 
     def read_patch(self, experiment_id: str, patch_id: str) -> PatchArtifact:
-        """The stored frozen spec and materialized patch (hash-verified)."""
+        """The stored frozen spec and exact materialized patch (operator view; hash-verified).
+
+        Not available to a run: the after-values reproduce base weights, so a
+        run sees patches through ``find_patch`` instead.
+        """
+        self._require_operator("reading the exact materialized patch")
+        return self._artifact(experiment_id, patch_id)
+
+    def _artifact(self, experiment_id: str, patch_id: str) -> PatchArtifact:
         self._experiment_row(experiment_id)
         return PatchArtifact.model_validate_json(self.store.read_patch(self._patch_row(experiment_id, patch_id)))
 
@@ -621,11 +706,11 @@ class ExperimentService:
         start = time.perf_counter()
         experiment_id = row["experiment_id"]
         self._require_open(row)
-        self.ledger.require(self.db.conn, experiment_id, {"compute_seconds": 0})
+        self.ledger.require(self.db.conn, experiment_id, {"patch_previews": 1, "compute_seconds": 0})
         parsed = self._parse_spec(raw)
         policy = self.experiment_policy(experiment_id)
         self._owned_checkpoint(self.db.conn, experiment_id, parsed.base_checkpoint_id)
-        base = self.engine.open_checkpoint(parsed.base_checkpoint_id)
+        base = self.engine._open_checkpoint(parsed.base_checkpoint_id)
         edit = materialize_patch(
             base,
             [{"op": operation.op, **operation.operator_request()} for operation in parsed.operations],
@@ -678,7 +763,7 @@ class ExperimentService:
             all_finite=all(diff.all_finite for diff in diffs),
             storage=StorageCost(patch_bytes=size, candidate_bytes=candidate_bytes),
             patch_uri=PATCH_URI_PREFIX + patch_id,
-            usage=Usage(model_forward_calls=0, candidate_commits=0, artifact_bytes=size,
+            usage=Usage(model_forward_calls=0, candidate_commits=0, patch_previews=1, artifact_bytes=size,
                         compute_seconds=round(time.perf_counter() - start, 6)),
         )
         preview_json = preview.canonical_json()
@@ -688,6 +773,7 @@ class ExperimentService:
                 return PatchPreview.model_validate_json(recorded)
             self._require_open(self._experiment_row(experiment_id, conn))
             self.store.require_published(relpath)
+            self.ledger.charge(conn, experiment_id, "patch_previews", 1)
             self.ledger.charge_compute(conn, experiment_id, preview.usage.compute_seconds or 0.0)
             conn.execute(
                 "INSERT INTO patches (patch_id, experiment_id, state, spec_hash, base_checkpoint_id, "
@@ -747,7 +833,7 @@ class ExperimentService:
         self.ledger.require(self.db.conn, experiment_id, {"compute_seconds": 0})
         artifact = PatchArtifact.model_validate_json(self.store.read_patch(patch_row))
         self._owned_checkpoint(self.db.conn, experiment_id, artifact.spec.base_checkpoint_id)
-        base = self.engine.open_checkpoint(artifact.spec.base_checkpoint_id)
+        base = self.engine._open_checkpoint(artifact.spec.base_checkpoint_id)
         if base.weights_hash != artifact.spec.base_weights_hash:
             raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"base of patch {patch_id} no longer matches its frozen hash")
         candidate = replay_patch(base, artifact.patch)  # stored values only; no editing operator runs

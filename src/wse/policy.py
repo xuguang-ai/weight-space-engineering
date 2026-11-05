@@ -189,6 +189,7 @@ WEIGHTS_ONLY_POLICY_ID = "small_model_weights_only_v1"
 # ``seconds_per_operation`` are per-operation limits, not cumulative counters.
 LEDGER_COUNTERS = (
     "candidate_commits",
+    "patch_previews",
     "analysis_calls",
     "tensor_read_calls",
     "evaluation_batches",
@@ -199,9 +200,15 @@ LEDGER_COUNTERS = (
 
 
 class BudgetLimits(_Frozen):
-    """Per-experiment allowances (Section 6.2 of the plan)."""
+    """Per-experiment allowances (Section 6.2 of the plan).
+
+    ``patch_previews`` is counted separately because a preview's deltas
+    reveal the base values of the edited region: two single-element previews
+    determine one weight exactly.
+    """
 
     candidate_commits: int = Field(default=20, ge=0)
+    patch_previews: int = Field(default=50, ge=0)
     analysis_calls: int = Field(default=50, ge=0)
     tensor_read_calls: int = Field(default=100, ge=0)
     evaluation_batches: int = Field(default=10, ge=0)

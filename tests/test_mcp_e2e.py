@@ -44,7 +44,8 @@ TOOL_NAMES = {
 MUTATIONS = {"wse_create_experiment", "wse_preview_patch", "wse_apply_patch", "wse_submit_evaluation",
              "wse_cancel_job", "wse_select_checkpoint"}
 RESOURCE_TEMPLATES = {"wse://models/{checkpoint_id}/manifest{?page}", "wse://experiments/{experiment_id}/policy{?page}",
-                      "wse://reports/{report_id}{?page}", "wse://patches/{patch_id}{?page}"}
+                      "wse://reports/{report_id}{?page}", "wse://patches/{patch_id}{?page}",
+                      "wse://analyses/{digest}{?page}"}
 ROW1 = [{"start": 1, "stop": 2, "step": 1}, {"start": 0, "stop": 4, "step": 1}]
 ORACLE = {"op": "scale_slice", "tensor": "layers.1.weight", "selection": ROW1, "factor": -1.0}
 DEV = {"sample_count": 64, "seed": 0}
@@ -196,7 +197,7 @@ def test_discovery_lists_every_tool_and_resource_with_schemas(trial, tmp_path):
                 jsonschema.Draft202012Validator.check_schema(tool.output_schema)
                 assert ("idempotency_key" in tool.input_schema.get("required", [])) == (name in MUTATIONS)
                 assert tool.annotations.read_only_hint == (name in {"wse_list_models", "wse_get_experiment",
-                                                                    "wse_inspect_model", "wse_get_job", "wse_compare"})
+                                                                    "wse_get_job", "wse_compare"})
             patch_schema = tools["wse_preview_patch"].input_schema["properties"]["patch_spec"]
             assert set(patch_schema["required"]) == {"base_checkpoint_id", "hypothesis", "operations"}
             assert "$ref" not in json.dumps(tools["wse_read_tensor"].input_schema)
@@ -306,7 +307,8 @@ def test_scripted_client_repairs_rolls_back_and_survives_a_reconnect(engine, tri
             assert report["content"]["metrics"] == {"accuracy": 1.0} and report["page_count"] == 1
             patch = await session.read(preview["patch_uri"])
             assert patch["content"]["preview"] == preview
-            assert patch["content"]["artifact"]["patch"]["result_weights_hash"] == preview["result_weights_hash"]
+            assert patch["content"]["result_weights_hash"] == preview["result_weights_hash"]
+            assert all("values" not in step for step in patch["content"]["steps"])  # after-values stay operator-only
             state.update(candidate=candidate, budget=(await session.call("wse_get_experiment",
                                                                          experiment_id=eid))["result"])
 
@@ -389,7 +391,7 @@ def test_cancellation_and_budget_exhaustion_through_mcp(engine, trial, tmp_path,
             final = (await session.call("wse_get_experiment", experiment_id=eid))["result"]
             assert _consumed(final["experiment"]["budget"]) | {"compute_seconds": 0} == {
                 "analysis_calls": 0, "candidate_commits": 1, "compute_seconds": 0, "evaluated_examples": 128,
-                "evaluation_batches": 2, "model_forward_calls": 2, "tensor_read_calls": 2}
+                "evaluation_batches": 2, "model_forward_calls": 2, "patch_previews": 2, "tensor_read_calls": 2}
             assert [c["role"] for c in final["checkpoints"]] == ["base", "candidate"]  # no partial candidate
 
     run(body)
@@ -436,7 +438,8 @@ def test_tools_and_resources_enforce_the_same_object_boundaries(engine, trial, t
             # Resources: the same boundaries, as JSON-RPC invalid-params errors carrying the domain error.
             for uri in (f"wse://models/{other_candidate}/manifest", f"wse://models/{reference}/manifest",
                         f"wse://models/{missing}/manifest", f"wse://experiments/{other_eid}/policy",
-                        f"wse://patches/{other_patch.patch_id}", f"wse://reports/{other_report}"):
+                        f"wse://patches/{other_patch.patch_id}", f"wse://reports/{other_report}",
+                        "wse://analyses/" + "0" * 64):
                 error = await session.read_fails(uri)
                 assert error.error.code == -32602
                 assert json.loads(error.error.message)["error"]["code"] == "NOT_FOUND"
@@ -576,7 +579,7 @@ def test_the_largest_permitted_read_stays_within_64_kib_with_its_text_mirror(eng
             chunks.append(page["chunk"])
             assert len(json.dumps(page).encode()) <= 32 * 1024
         document = json.loads("".join(chunks))
-        assert document["preview"] == preview and document["artifact"]["patch"]["steps"][0]["tensor"] == tensor
+        assert document["preview"] == preview and document["steps"][0]["tensor"] == tensor
         return region["element_count"], slice_bytes, _wire_bytes(result)
 
     sizes = {}

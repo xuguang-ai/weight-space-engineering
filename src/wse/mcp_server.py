@@ -60,6 +60,7 @@ from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema
 from wse.api import Engine
 from wse.jobs import MAX_WAIT_SECONDS
 from wse.jobs import _wait_seconds as wait_seconds_value
+from wse.store import ANALYSIS_URI_PREFIX
 from wse.schemas import (
     AnalysisResult,
     AxisSlice,
@@ -236,7 +237,7 @@ def _parse_cursor(cursor: Any) -> int:
                    "start from the first page")
 
 
-def _paged(uri: str, document: BaseModel, page: Any) -> str:
+def _paged(uri: str, document: BaseModel | dict[str, Any], page: Any) -> str:
     """A bounded resource read: the whole document, or one page of its JSON text.
 
     A document whose whole read fits in ``RESOURCE_PAGE_BYTES`` of canonical
@@ -249,7 +250,7 @@ def _paged(uri: str, document: BaseModel, page: Any) -> str:
     """
     if isinstance(page, bool) or not isinstance(page, int) or page < 0:
         raise WSEError(ErrorCode.INVALID_ARGUMENT, "page must be a nonnegative integer")
-    data = document.model_dump(mode="json")
+    data = document.model_dump(mode="json") if isinstance(document, BaseModel) else document
     whole = canonical_json({"uri": uri, "page": 0, "page_count": 1, "next_uri": None, "content": data})
     if len(whole.encode("utf-8")) <= RESOURCE_PAGE_BYTES:
         if page != 0:
@@ -350,7 +351,7 @@ class WSEMCPServer:
             (self.wse_list_models, READ_ONLY),
             (self.wse_create_experiment, MUTATION),
             (self.wse_get_experiment, READ_ONLY),
-            (self.wse_inspect_model, READ_ONLY),
+            (self.wse_inspect_model, METERED),
             (self.wse_read_tensor, METERED),
             (self.wse_analyze, METERED),
             (self.wse_preview_patch, MUTATION),
@@ -412,13 +413,17 @@ class WSEMCPServer:
 
     def wse_inspect_model(self, experiment_id: IdArg, checkpoint_id: IdArg,
                           ) -> Annotated[CallToolResult, ToolResponse[ModelInspection]]:
-        """The manifest of a checkpoint of this experiment and whole-tensor statistics by layer (not charged)."""
+        """The manifest of a checkpoint of this experiment and whole-tensor statistics by layer.
+
+        The manifest is free; computing the statistics is charged as compute time.
+        """
         def run() -> ToolResponse[ModelInspection]:
             inspection = self.engine.inspect_model_details(experiment_id, checkpoint_id)
             return ToolResponse[ModelInspection](
                 summary=f"{inspection.role} checkpoint {checkpoint_id}: {len(inspection.manifest.tensors)} tensors, "
                         f"{inspection.manifest.parameter_count} parameters",
-                uris=[inspection.manifest_uri], usage=self._usage(experiment_id, None), result=inspection)
+                uris=[inspection.manifest_uri], usage=self._usage(experiment_id, inspection.usage),
+                result=inspection)
         return _respond(self._call(run))
 
     def wse_read_tensor(self, experiment_id: IdArg, checkpoint_id: IdArg,
@@ -566,10 +571,18 @@ class WSEMCPServer:
             return self._read(lambda: _paged(_report_uri(report_id), self.engine.find_report(report_id), page))
 
         @server.resource("wse://patches/{patch_id}{?page}", name="patch",
-                         description="A patch preview with its frozen spec and exact materialized patch.",
+                         description="A patch of this run's experiment: its preview, frozen spec, and per-step "
+                                     "summaries (the materialized after-values are not included).",
                          mime_type="application/json")
         def patch(patch_id: str, page: int = 0) -> str:
             return self._read(lambda: _paged(_patch_uri(patch_id), self.engine.find_patch(patch_id), page))
+
+        @server.resource("wse://analyses/{digest}{?page}", name="analysis_result",
+                         description="A large analysis result of this run's experiment, referenced by an analysis "
+                                     "result_uri.", mime_type="application/json")
+        def analysis_result(digest: str, page: int = 0) -> str:
+            uri = f"{ANALYSIS_URI_PREFIX}{digest}"
+            return self._read(lambda: _paged(uri, self.engine.read_analysis_result(uri), page))
 
 
 def _package_version() -> str:

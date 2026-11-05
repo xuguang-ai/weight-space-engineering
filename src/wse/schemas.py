@@ -469,6 +469,7 @@ class Usage(_Frozen):
     analysis_calls: int | None = None
     tensor_read_calls: int | None = None
     candidate_commits: int | None = None
+    patch_previews: int | None = None
     artifact_bytes: int | None = None
     peak_memory_bytes: int | None = None
     unavailable: dict[str, str] = Field(default_factory=dict)
@@ -1386,12 +1387,34 @@ class ModelInspection(_Frozen):
     manifest: ModelManifest
     tensor_statistics: list[TensorStatistics]
     manifest_uri: str
+    usage: Usage | None = None
     management: Management = "managed"
 
 
+class PatchStepSummary(_Frozen):
+    """One materialized step without its after-values: what it changed, not the resulting weights."""
+
+    op: str
+    operator: ExtensionRef
+    tensor: str
+    selection: list[AxisSlice]
+    dtype: str
+    before_hash: str
+    after_hash: str
+    changed_elements: int
+
+
 class PatchDocument(_Frozen):
-    """A stored patch as a resource: its preview summary and its frozen spec and exact patch."""
+    """A stored patch as a run sees it: its preview, its frozen spec, and per-step summaries.
+
+    The materialized after-values are omitted: with a known factor they
+    reproduce the base weights of the edited region, so they would bypass
+    the read budget. The exact patch remains an operator view
+    (``Engine.read_patch``, ``wse patch``) for replay and export.
+    """
 
     schema_version: Literal["1"] = SCHEMA_VERSION
     preview: PatchPreview
-    artifact: PatchArtifact
+    spec: FrozenPatchSpec
+    steps: list[PatchStepSummary]
+    result_weights_hash: str

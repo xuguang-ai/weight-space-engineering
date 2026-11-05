@@ -168,6 +168,7 @@ class _Execution:
             analysis_calls=0,
             tensor_read_calls=0,
             candidate_commits=0,
+            patch_previews=0,
             artifact_bytes=0,
             peak_memory_bytes=peak_memory_bytes(),
         )
