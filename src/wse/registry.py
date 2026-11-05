@@ -2,8 +2,12 @@
 
 The operator registers each adapter, operator, evaluator, or strategy under an
 exact ``(kind, extension_id, version)``. Resolution is exact: an unknown or
-missing version is rejected rather than replaced by the latest one. Agents
-invoke registered extensions; they never install them.
+missing version is rejected rather than replaced by the latest one. A
+reference without a version (``"mlp"``) resolves only through an alias the
+operator declares with ``register_alias`` (the built-in registry maps ``mlp``
+to ``mlp@1``), never to the latest registered version; callers record the
+resolved exact reference. Agents invoke registered extensions; they never
+install them.
 """
 
 from __future__ import annotations
@@ -12,7 +16,7 @@ import threading
 from collections.abc import Callable
 from typing import Any, Literal, get_args
 
-from wse.schemas import ErrorCode, ExtensionRef, WSEError
+from wse.schemas import EXTENSION_ID_PATTERN, ErrorCode, ExtensionRef, WSEError
 
 ExtensionKind = Literal["adapter", "operator", "evaluator", "strategy"]
 EXTENSION_KINDS: tuple[str, ...] = get_args(ExtensionKind)
@@ -65,6 +69,7 @@ class Registry:
 
     def __init__(self) -> None:
         self._entries: dict[tuple[str, str, str], Any] = {}
+        self._aliases: dict[tuple[str, str], ExtensionRef] = {}
         self._lock = threading.Lock()
 
     @staticmethod
@@ -114,6 +119,57 @@ class Registry:
                      "registered_versions": versions},
         )
 
+    def register_alias(self, kind: str, alias: str, target: str | ExtensionRef) -> None:
+        """Declare that the version-less reference ``alias`` means exactly ``target``.
+
+        ``target`` must be an exact, registered reference. Aliases are
+        immutable: redeclaring one with a different target is rejected.
+        """
+        self._key(kind, "x", "1")  # validates the kind
+        if not isinstance(alias, str) or not EXTENSION_ID_PATTERN.fullmatch(alias):
+            raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                           f"alias {alias!r} must match {EXTENSION_ID_PATTERN.pattern}")
+        ref = ExtensionRef.parse(target)
+        self.resolve(kind, ref.extension_id, ref.version)
+        with self._lock:
+            existing = self._aliases.get((kind, alias))
+            if existing is not None and existing != ref:
+                raise WSEError(
+                    ErrorCode.VERSION_CONFLICT,
+                    f"{kind} alias {alias!r} already means {existing}; aliases cannot be redirected",
+                    details={"alias": alias, "target": str(existing)},
+                )
+            self._aliases[(kind, alias)] = ref
+
+    def aliases(self, kind: str) -> dict[str, ExtensionRef]:
+        self._key(kind, "x", "1")
+        with self._lock:
+            return {alias: ref for (k, alias), ref in sorted(self._aliases.items()) if k == kind}
+
+    def resolve_reference(self, kind: str, reference: str | ExtensionRef) -> ExtensionRef:
+        """Return the exact, registered reference that ``reference`` names.
+
+        An exact reference (``"mlp@1"``) must be registered; a version-less
+        one (``"mlp"``) must be a declared alias. Unknown aliases and unknown
+        versions are rejected with ``NOT_FOUND``; nothing is substituted.
+        """
+        if isinstance(reference, str) and "@" not in reference and EXTENSION_ID_PATTERN.fullmatch(reference):
+            self._key(kind, reference, "1")
+            with self._lock:
+                ref = self._aliases.get((kind, reference))
+                declared = sorted(alias for (k, alias) in self._aliases if k == kind)
+            if ref is None:
+                raise WSEError(
+                    ErrorCode.NOT_FOUND,
+                    f"{kind} {reference!r} has no declared alias; use an exact reference '<id>@<version>' "
+                    f"or one of the declared aliases {declared}",
+                    details={"kind": kind, "reference": reference, "declared_aliases": declared},
+                )
+        else:
+            ref = ExtensionRef.parse(reference)
+        self.resolve(kind, ref.extension_id, ref.version)
+        return ref
+
     def resolve_ref(self, kind: str, ref: str | ExtensionRef) -> Any:
         parsed = ExtensionRef.parse(ref)
         return self.resolve(kind, parsed.extension_id, parsed.version)
@@ -134,6 +190,7 @@ def builtin_registry() -> Registry:
     registry = Registry()
     adapter = MLPAdapter()
     registry.register("adapter", adapter.adapter_id, adapter.version, adapter)
+    registry.register_alias("adapter", adapter.adapter_id, f"{adapter.adapter_id}@{adapter.version}")
     for operator in [*BUILTIN_ANALYSES.values(), *BUILTIN_EDITS.values()]:
         registry.register("operator", operator.spec.operator_id, operator.spec.version, operator)
     return registry

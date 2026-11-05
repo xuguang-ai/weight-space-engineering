@@ -142,8 +142,16 @@ class EvaluationResult:
 
 
 def _resolve_adapter(registry: Registry, adapter: str | ExtensionRef) -> tuple[ExtensionRef, ModelAdapter]:
-    ref = ExtensionRef.parse(adapter)
+    """Resolve an exact adapter reference or a declared alias to its exact version."""
+    ref = registry.resolve_reference("adapter", adapter)
     return ref, registry.resolve("adapter", ref.extension_id, ref.version)
+
+
+def _with_resolved_adapter(value: Any, registry: Registry) -> Any:
+    """Replace a version-less adapter alias in a raw manifest with its exact reference."""
+    if isinstance(value, Mapping) and isinstance(value.get("adapter"), str) and "@" not in value["adapter"]:
+        return {**value, "adapter": str(registry.resolve_reference("adapter", value["adapter"]))}
+    return value
 
 
 def canonical_config(adapter: ModelAdapter, config: Mapping[str, Any]) -> dict[str, Any]:
@@ -228,7 +236,11 @@ def load_model(
 
     ``source`` is a mapping of tensor name to ``torch.Tensor``/``numpy.ndarray``
     or the path of a ``.safetensors`` file. ``adapter`` is an exact reference
-    such as ``"mlp@1"``; unknown adapters and versions are rejected.
+    such as ``"mlp@1"`` or a version-less alias declared in the registry
+    (``"mlp"`` means ``mlp@1`` in the built-in registry); an alias never
+    resolves to the latest registered version, and the handle records the
+    resolved exact reference. Unknown adapters, aliases, and versions are
+    rejected.
     ``config`` is the adapter configuration or the path of a JSON file.
     Requires neither SQLite nor MCP.
     """
@@ -311,11 +323,15 @@ def _bundle_member(root: Path, relative: str, *, what: str) -> Path:
     return resolved
 
 
-def read_bundle(path: str | Path, *, max_bytes: int = DEFAULT_MAX_MODEL_BYTES) -> tuple[ImportManifest, dict[str, torch.Tensor]]:
+def read_bundle(
+    path: str | Path, *, max_bytes: int = DEFAULT_MAX_MODEL_BYTES, registry: Registry | None = None
+) -> tuple[ImportManifest, dict[str, torch.Tensor]]:
     """Read a bundle directory (or its ``wse_bundle.json``) into an import request.
 
     The bundle's filesystem location is never recorded in the manifest;
-    provenance comes only from the bundle file's operator-supplied labels.
+    provenance comes only from the bundle file's operator-supplied labels. A
+    version-less adapter alias is resolved through ``registry`` (the built-in
+    registry by default) and recorded as its exact reference.
     """
     path = Path(path)
     if not path.exists():
@@ -331,7 +347,9 @@ def read_bundle(path: str | Path, *, max_bytes: int = DEFAULT_MAX_MODEL_BYTES) -
         raise WSEError(ErrorCode.NOT_FOUND, f"bundle directory {path.parent} does not exist") from None
     bundle_file = _bundle_member(root, path.name, what="bundle manifest")
     try:
-        bundle = BundleManifest.model_validate(_read_json_file(bundle_file, what="bundle manifest"))
+        raw = _with_resolved_adapter(_read_json_file(bundle_file, what="bundle manifest"),
+                                     registry or builtin_registry())
+        bundle = BundleManifest.model_validate(raw)
     except ValidationError as exc:
         raise WSEError(ErrorCode.INVALID_ARGUMENT, f"invalid {BUNDLE_MANIFEST_NAME}: {exc}") from exc
     config = _as_config(_bundle_member(root, bundle.config, what="config"))
@@ -437,7 +455,7 @@ class Engine:
         identical weights are stored once.
         """
         self._require_operator("importing a model")
-        request = _import_manifest(manifest)
+        request = _import_manifest(_with_resolved_adapter(manifest, self.registry))
         adapter_ref, adapter = _resolve_adapter(self.registry, request.adapter)
         normalized = normalize_tensors(tensors)
         size = sum(t.numel() * t.element_size() for t in normalized.values())
@@ -485,7 +503,7 @@ class Engine:
     def import_bundle(self, path: str | Path) -> ModelManifest:
         """Import a bundle directory (operator only)."""
         self._require_operator("importing a model")
-        manifest, tensors = read_bundle(path, max_bytes=self.max_bytes)
+        manifest, tensors = read_bundle(path, max_bytes=self.max_bytes, registry=self.registry)
         return self.import_model(manifest, tensors)
 
     def load_manifest(self, checkpoint_id: str) -> ModelManifest:

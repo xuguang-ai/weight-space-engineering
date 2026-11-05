@@ -83,6 +83,34 @@ def test_registering_new_version_keeps_old_one_resolvable():
     assert registry.resolve("adapter", "mlp", "2").version == "2"
 
 
+def test_aliases_are_declared_explicitly_and_resolve_exactly():
+    registry = builtin_registry()
+    assert registry.resolve_reference("adapter", "mlp") == ExtensionRef.parse("mlp@1")
+    assert registry.resolve_reference("adapter", "mlp@1") == ExtensionRef.parse("mlp@1")
+    assert registry.aliases("adapter") == {"mlp": ExtensionRef.parse("mlp@1")}
+
+    class MLPv2(MLPAdapter):
+        version = "2"
+
+    registry.register("adapter", "mlp", "2", MLPv2())
+    assert registry.resolve_reference("adapter", "mlp") == ExtensionRef.parse("mlp@1")
+    registry.register_alias("adapter", "mlp", "mlp@1")  # identical declaration: no-op
+    for alias, target, code in (
+        ("mlp", "mlp@2", ErrorCode.VERSION_CONFLICT),  # aliases are immutable
+        ("fresh", "mlp@9", ErrorCode.NOT_FOUND),  # target must be registered
+        ("Bad-Alias", "mlp@1", ErrorCode.INVALID_ARGUMENT),
+        ("fresh", "mlp", ErrorCode.INVALID_ARGUMENT),  # target must be exact
+    ):
+        with pytest.raises(WSEError) as excinfo:
+            registry.register_alias("adapter", alias, target)
+        assert excinfo.value.code == code, (alias, target)
+    for reference, code in (("other", ErrorCode.NOT_FOUND), ("mlp@9", ErrorCode.NOT_FOUND),
+                            ("mlp@x", ErrorCode.INVALID_ARGUMENT)):
+        with pytest.raises(WSEError) as excinfo:
+            registry.resolve_reference("adapter", reference)
+        assert excinfo.value.code == code, reference
+
+
 def test_duplicate_registration_is_rejected():
     registry = builtin_registry()
     with pytest.raises(WSEError) as excinfo:

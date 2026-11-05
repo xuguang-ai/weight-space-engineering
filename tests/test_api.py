@@ -14,7 +14,7 @@ import torch
 from pydantic import ValidationError
 from safetensors.torch import save_file
 
-from wse.api import EditResult, Engine, EvaluationResult, load_model
+from wse.api import EditResult, Engine, EvaluationResult, apply_operator, load_model
 from wse.schemas import ErrorCode, MetricGate, ObjectiveSpec, Usage, WSEError
 from wse.tensors import weights_hash
 
@@ -124,11 +124,62 @@ def test_load_model_rejects_unknown_adapter_versions(signed_sum, adapter):
     assert excinfo.value.code == ErrorCode.NOT_FOUND
 
 
-@pytest.mark.parametrize("adapter", ["mlp", "mlp@", "mlp@latest", "mlp@1@2"])
-def test_load_model_requires_an_exact_adapter_version(signed_sum, adapter):
+@pytest.mark.parametrize("adapter", ["mlp@", "mlp@latest", "mlp@1@2", "MLP", ""])
+def test_load_model_rejects_malformed_adapter_references(signed_sum, adapter):
     with pytest.raises(WSEError) as excinfo:
         load_model(signed_sum.task_tensors(), adapter, signed_sum.CONFIG)
     assert excinfo.value.code == ErrorCode.INVALID_ARGUMENT
+
+
+def test_an_adapter_alias_resolves_to_the_declared_exact_version(signed_sum):
+    handle = load_model(signed_sum.task_tensors(), "mlp", signed_sum.CONFIG)
+    assert str(handle.adapter_ref) == "mlp@1" and str(handle.identity.adapter) == "mlp@1"
+    assert handle.identity == load_model(signed_sum.task_tensors(), "mlp@1", signed_sum.CONFIG).identity
+    edit = apply_operator(handle, "scale_slice", {"tensor": "layers.1.weight",
+                                                  "selection": [{"start": 1, "stop": 2}, {"start": 0, "stop": 4}],
+                                                  "factor": -1.0})
+    assert str(edit.patch.base.adapter) == "mlp@1"
+
+
+def test_an_alias_never_resolves_to_the_latest_version(signed_sum):
+    from wse.adapters.mlp import MLPAdapter
+    from wse.registry import Registry, builtin_registry
+
+    class MLPv2(MLPAdapter):
+        version = "2"
+
+    registry = builtin_registry()
+    registry.register("adapter", "mlp", "2", MLPv2())
+    assert str(load_model(signed_sum.task_tensors(), "mlp", signed_sum.CONFIG, registry=registry).adapter_ref) == \
+        "mlp@1"
+    # Without a declared alias, a bare ID is rejected even when versions are registered.
+    bare = Registry()
+    bare.register("adapter", "mlp", "1", MLPAdapter())
+    bare.register("adapter", "mlp", "2", MLPv2())
+    for registry, reference in ((bare, "mlp"), (builtin_registry(), "other")):
+        with pytest.raises(WSEError) as excinfo:
+            load_model(signed_sum.task_tensors(), reference, signed_sum.CONFIG, registry=registry)
+        assert excinfo.value.code == ErrorCode.NOT_FOUND
+        assert "alias" in excinfo.value.message
+
+
+def test_managed_imports_record_the_resolved_adapter(tmp_path, signed_sum):
+    import json
+
+    bundles = signed_sum.build(tmp_path / "bundles")
+    bundle_file = bundles["task"] / "wse_bundle.json"
+    data = json.loads(bundle_file.read_text())
+    bundle_file.chmod(0o644)
+    bundle_file.write_text(json.dumps({**data, "adapter": "mlp"}))
+    with Engine(tmp_path / "ws") as engine:
+        imported = engine.import_bundle(bundles["task"])
+        assert str(imported.adapter) == "mlp@1"
+        assert str(engine.load_manifest(imported.checkpoint_id).adapter) == "mlp@1"
+        direct = engine.import_model({"adapter": "mlp", "config": signed_sum.CONFIG}, signed_sum.task_tensors())
+        assert str(direct.adapter) == "mlp@1" and direct.identity == imported.identity
+        with pytest.raises(WSEError) as excinfo:
+            engine.import_model({"adapter": "unknown", "config": signed_sum.CONFIG}, signed_sum.task_tensors())
+        assert excinfo.value.code == ErrorCode.NOT_FOUND
 
 
 def test_weights_hash_ignores_dict_insertion_order(signed_sum):
