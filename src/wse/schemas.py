@@ -1190,9 +1190,10 @@ class EvaluationReport(_Frozen):
 
     ``scores`` (per example, 1 = correct) and ``cluster_ids`` are kept for
     development reports so paired comparisons can be computed; final reports
-    carry only aggregates. ``target_met`` is ``None`` when the task declares
-    no accuracy target, else whether the report covers the whole
-    development suite and meets the target.
+    carry only aggregates. ``target_met`` is ``None`` for final reports and
+    when the task declares no accuracy target; otherwise it is whether the
+    report is of the task's own development suite, covers all of its
+    ``development_examples``, and meets the target.
     """
 
     schema_version: Literal["1"] = SCHEMA_VERSION

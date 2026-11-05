@@ -249,6 +249,27 @@ def test_development_reports_bind_identities_and_meet_the_target_only_with_full_
     assert partial.result["metrics"] == {"accuracy": 1.0} and partial.result["target_met"] is False
 
 
+def test_only_the_tasks_own_full_development_suite_can_meet_the_target(engine, workspace, ids, signed_sum):
+    experiment = _experiment(engine, ids)
+    eid = experiment.experiment_id
+    candidate = _repair(engine, ids, experiment)
+    # A smaller development suite of the same task, evaluated in full, still cannot meet the target.
+    engine.register_suite({**signed_sum.development_suite(data=signed_sum.suite_data(2, 5)),
+                           "suite_id": "signed_sum_dev_small", "sample_counts": [4]})
+    small = _evaluate(engine, workspace, eid, candidate.checkpoint_id, "e1", "signed_sum_dev_small",
+                      {"sample_count": 4, "seed": 0})
+    assert small.result["metrics"] == {"accuracy": 1.0} and small.result["sample_count"] == 4
+    assert small.result["target_met"] is False
+    full = _evaluate(engine, workspace, eid, candidate.checkpoint_id, "e2")
+    assert full.result["target_met"] is True
+    # Final reports carry no development-target verdict, so their Markdown never claims one.
+    engine.select_checkpoint(eid, candidate.checkpoint_id, ids["task_checkpoint_id"], "s1")
+    engine.freeze(eid, candidate.checkpoint_id)
+    final = engine.final_evaluate(eid)
+    assert final.candidate.target_met is None and final.control.target_met is None
+    assert "target met" not in render_markdown(final.candidate)
+
+
 def test_compare_reports_paired_differences_and_rejects_mismatched_reports(engine, workspace, ids, signed_sum):
     experiment = _experiment(engine, ids)
     eid, base = experiment.experiment_id, ids["task_checkpoint_id"]

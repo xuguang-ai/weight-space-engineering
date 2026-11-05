@@ -120,8 +120,13 @@ class EvaluationService:
         """Bind an evaluation result to its experiment, checkpoint, task, and suite as a managed report."""
         task = self._task_definition(suite.task_id)
         target_met = None
-        if task is not None and task.target_accuracy is not None and "accuracy" in result.metrics:
-            target_met = (result.sample_count == suite.example_count
+        # The development target is a property of the task's own development suite only: a
+        # report of another (for example smaller) suite cannot meet it, and final reports carry
+        # no development-target verdict at all.
+        if suite.split == "development" and task is not None and task.target_accuracy is not None \
+                and "accuracy" in result.metrics:
+            target_met = (suite.suite_id == task.development_suite_id
+                          and result.sample_count == suite.example_count == task.development_examples
                           and result.metrics["accuracy"] >= task.target_accuracy and not result.errors)
         return EvaluationReport(
             report_id=_new_report_id(),
