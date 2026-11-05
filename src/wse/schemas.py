@@ -658,6 +658,8 @@ OBJECT_ID_PATTERNS = {
     "run": re.compile(r"^run_[0-9a-f]{32}$"),
     "experiment": re.compile(r"^exp_[0-9a-f]{32}$"),
     "patch": re.compile(r"^patch_[0-9a-f]{32}$"),
+    "job": re.compile(r"^job_[0-9a-f]{32}$"),
+    "reservation": re.compile(r"^resv_[0-9a-f]{32}$"),
 }
 IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9_.:\-]{1,128}$")
 LABEL_PATTERN = r"^[A-Za-z0-9_.\-]{1,128}$"
@@ -803,10 +805,15 @@ class RunGrant(_Frozen):
 
 
 class BudgetEntry(_Frozen):
-    """One counter of an experiment's budget ledger."""
+    """One counter of an experiment's budget ledger.
+
+    ``reserved`` is held by queued or running jobs and not yet settled;
+    ``remaining`` is ``limit - consumed - reserved``.
+    """
 
     limit: int | float
     consumed: int | float
+    reserved: int | float = 0
     remaining: int | float
 
 
@@ -842,3 +849,151 @@ class ExperimentCheckpoint(_Frozen):
     patch_id: str | None
     weights_hash: str
     created_at: str
+
+
+# ---------------------------------------------------------------------------
+# Evaluation suites, budget reservations, and jobs
+# ---------------------------------------------------------------------------
+
+SuiteSplit = Literal["development", "final"]
+
+
+class SuiteData(_Frozen):
+    """Inline examples of a minimal suite: row-major float inputs and optional class labels."""
+
+    inputs: list[list[float]] = Field(min_length=1)
+    labels: list[StrictInt] | None = None
+
+    @model_validator(mode="after")
+    def _check_rows(self) -> SuiteData:
+        widths = {len(row) for row in self.inputs}
+        if len(widths) != 1 or 0 in widths:
+            raise ValueError("every input row must have the same nonzero length")
+        if self.labels is not None and len(self.labels) != len(self.inputs):
+            raise ValueError("labels must have one entry per input row")
+        for row in self.inputs:
+            if not all(math.isfinite(value) for value in row):
+                raise ValueError("inputs must be finite")
+        return self
+
+
+class EvaluationSuite(_Frozen):
+    """An operator-registered evaluation suite (Task 4 minimal form).
+
+    ``sample_counts`` and ``seeds`` are the preregistered ``eval_config``
+    values; a submission with any other value is rejected. A sample count of
+    ``n`` evaluates the first ``n`` examples. ``evaluator`` is the exact
+    registered evaluator that runs the suite, and ``parameters`` are passed
+    to it unchanged. Only ``development`` suites accept agent submissions.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    suite_id: str = Field(pattern=LABEL_PATTERN)
+    task_id: str = Field(pattern=LABEL_PATTERN)
+    split: SuiteSplit
+    evaluator: ExtensionRef
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    sample_counts: list[StrictInt] = Field(min_length=1)
+    seeds: list[StrictInt] = Field(min_length=1)
+    data: SuiteData
+
+    @field_validator("parameters")
+    @classmethod
+    def _plain_parameters(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _check_json_object(value)
+
+    @model_validator(mode="after")
+    def _check_preregistration(self) -> EvaluationSuite:
+        size = len(self.data.inputs)
+        if any(not 1 <= count <= size for count in self.sample_counts):
+            raise ValueError(f"sample_counts must lie between 1 and the {size} examples of the suite")
+        if len(set(self.sample_counts)) != len(self.sample_counts) or len(set(self.seeds)) != len(self.seeds):
+            raise ValueError("sample_counts and seeds must not repeat")
+        return self
+
+    @property
+    def suite_hash(self) -> str:
+        return json_hash(self.model_dump(mode="json"))
+
+    @property
+    def data_hash(self) -> str:
+        return json_hash(self.data.model_dump(mode="json"))
+
+
+class EvalConfig(_Frozen):
+    """The MVP ``eval_config``: a preregistered sample count and seed.
+
+    The server fixes the execution device and batch size.
+    """
+
+    sample_count: StrictInt = Field(ge=1)
+    seed: StrictInt
+
+
+ReservationState = Literal["HELD", "SETTLED"]
+JobState = Literal["queued", "running", "succeeded", "failed", "cancelled"]
+TerminalJobState = Literal["succeeded", "failed", "cancelled"]
+TERMINAL_JOB_STATES: tuple[str, ...] = ("succeeded", "failed", "cancelled")
+
+
+class Reservation(_Frozen):
+    """Allowance held for one job until it settles.
+
+    ``requested`` maps ledger counters to the reserved amounts. Settlement
+    charges ``charged`` (never more than was reserved) and releases the rest.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    reservation_id: str
+    experiment_id: str
+    job_id: str
+    state: ReservationState
+    requested: dict[str, int | float]
+    charged: dict[str, int | float] | None = None
+    terminal_state: TerminalJobState | None = None
+    created_at: str
+    settled_at: str | None = None
+
+
+class JobProgress(_Frozen):
+    """Batches of a job: planned, started (charged if the job stops), and completed."""
+
+    batches_total: int
+    batches_started: int = 0
+    batches_completed: int = 0
+    examples_started: int = 0
+
+
+class Job(_Frozen):
+    """An asynchronous evaluation job.
+
+    ``usage`` is the settled usage once the job is terminal and ``None``
+    before. ``result`` carries the report summary (metrics, sample count,
+    errors) inline; ``report_id`` references a persisted report once
+    evaluation reports exist. ``cancel_requested`` is set when a running job
+    was asked to stop; computation already performed remains charged.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    job_id: str
+    experiment_id: str
+    kind: Literal["evaluation"]
+    checkpoint_id: str
+    suite_id: str
+    config: EvalConfig
+    state: JobState
+    cancel_requested: bool
+    reservation: Reservation
+    progress: JobProgress
+    usage: Usage | None = None
+    result: dict[str, Any] | None = None
+    report_id: str | None = None
+    error: DomainError | None = None
+    attempts: int
+    created_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+
+    @property
+    def terminal(self) -> bool:
+        return self.state in TERMINAL_JOB_STATES

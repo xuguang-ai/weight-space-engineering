@@ -43,15 +43,21 @@ from wse.tensors import normalize_tensors, weights_hash
 
 if TYPE_CHECKING:
     from wse.adapters.base import AdapterCapabilities
+    from wse.budget import BudgetLedger, UsageLike
     from wse.experiments import ExperimentService
+    from wse.jobs import JobService
     from wse.policy import ExperimentPolicy, OperationPolicy
     from wse.schemas import (
         AnalysisResult,
+        EvalConfig,
+        EvaluationSuite,
         Experiment,
         ExperimentCheckpoint,
+        Job,
         PatchArtifact,
         PatchPreview,
         PatchSpec,
+        Reservation,
         RunGrant,
         TensorSlice,
     )
@@ -373,7 +379,9 @@ class Engine:
     that experiment: listings omit every other checkpoint, and any other
     checkpoint ID fails with the same ``NOT_FOUND`` error as an ID that does
     not exist. Operator actions (imports, policy registration, run grants,
-    suite registration) fail with ``POLICY_DENIED``.
+    suite registration, direct reservations and settlements) fail with
+    ``POLICY_DENIED``. Opening an engine with ``recover=True`` also settles
+    jobs lost in a crash (``recover_jobs``).
     """
 
     def __init__(
@@ -387,6 +395,7 @@ class Engine:
         run_id: str | None = None,
     ) -> None:
         from wse.experiments import ExperimentService
+        from wse.jobs import JobService
         from wse.policy import default_operation_policy
         from wse.store import ArtifactStore
 
@@ -398,6 +407,10 @@ class Engine:
         try:
             self.last_recovery: RecoveryReport | None = self.store.recover() if recover else None
             self.experiments: ExperimentService = ExperimentService(self, bound_run_id=run_id)
+            self.budget: BudgetLedger = self.experiments.ledger
+            self.jobs: JobService = JobService(self)
+            if recover:
+                self.jobs.recover_lost_jobs()
         except BaseException:
             self.store.close()
             raise
@@ -532,7 +545,9 @@ class Engine:
         _, adapter = _resolve_adapter(self.registry, manifest.adapter)
         return adapter.capabilities()
 
-    def _bounded_read(self, checkpoint_id: str, tensor: str, selection: Any) -> tuple[TensorSlice, torch.Tensor]:
+    def _bounded_read(
+        self, checkpoint_id: str, tensor: str, selection: Any, policy: OperationPolicy | None = None
+    ) -> tuple[TensorSlice, torch.Tensor]:
         from wse.analysis import bounded_read
 
         manifest = self._manifest(checkpoint_id)
@@ -540,7 +555,7 @@ class Engine:
         return bounded_read(
             info=info,
             selection=selection,
-            policy=self.policy,
+            policy=policy or self.policy,
             capabilities=self._capabilities(manifest),
             adapter=manifest.adapter,
             read_region=lambda slices: self.store.read_slice(checkpoint_id, info.name, slices),
@@ -577,12 +592,25 @@ class Engine:
         ``norm``, ``top_k`` by default). An omitted ``k`` for top-k resolves to
         ``min(16, element_count)``; other kinds do not accept ``k``.
         """
+        return self._analyze(checkpoint_id, kind, tensor, selection, k, parameters=parameters)
+
+    def _analyze(
+        self,
+        checkpoint_id: str,
+        kind: str,
+        tensor: str,
+        selection: Any,
+        k: int | None = None,
+        *,
+        parameters: Mapping[str, Any] | None = None,
+        policy: OperationPolicy | None = None,
+    ) -> AnalysisResult:
         from wse.analysis import run_analysis
 
         manifest = self._manifest(checkpoint_id)
         return run_analysis(
             registry=self.registry,
-            policy=self.policy,
+            policy=policy or self.policy,
             kind=kind,
             info_for=manifest.tensor_info,
             tensor=tensor,
@@ -661,3 +689,55 @@ class Engine:
 
     def audit_log(self, experiment_id: str) -> list[dict[str, Any]]:
         return self.experiments.audit_log(experiment_id)
+
+    # -- metered experiment reads ---------------------------------------------------
+
+    def inspect_model(self, experiment_id: str, checkpoint_id: str) -> ModelManifest:
+        """The manifest of a checkpoint the experiment owns (not charged)."""
+        return self.experiments.inspect_model(experiment_id, checkpoint_id)
+
+    def read_model_tensor(self, experiment_id: str, checkpoint_id: str, tensor: str, selection: Any) -> TensorSlice:
+        """A bounded read of an owned checkpoint, charged to ``tensor_read_calls``."""
+        return self.experiments.read_tensor(experiment_id, checkpoint_id, tensor, selection)
+
+    def analyze_model(self, experiment_id: str, checkpoint_id: str, kind: str, tensor: str, selection: Any,
+                      k: int | None = None) -> AnalysisResult:
+        """A permitted analysis of an owned checkpoint, charged under its operator's usage contract."""
+        return self.experiments.analyze(experiment_id, checkpoint_id, kind, tensor, selection, k)
+
+    # -- budgets, suites, and jobs ----------------------------------------------------
+
+    def reserve(self, experiment_id: str, job_id: str, requested_usage: UsageLike) -> Reservation:
+        """Atomically reserve allowance for a job (operator and service use only)."""
+        self._require_operator("reserving budget directly")
+        return self.budget.reserve(experiment_id, job_id, requested_usage)
+
+    def settle(self, reservation_id: str, actual_usage: UsageLike, terminal_state: str) -> Reservation:
+        """Charge a reservation's executed work and release the rest (operator and service use only)."""
+        self._require_operator("settling a reservation directly")
+        return self.budget.settle(reservation_id, actual_usage, terminal_state)
+
+    def register_suite(self, suite: EvaluationSuite | Mapping[str, Any]) -> EvaluationSuite:
+        """Register an immutable evaluation suite (operator only)."""
+        self._require_operator("registering an evaluation suite")
+        return self.jobs.register_suite(suite)
+
+    def submit_evaluation(self, experiment_id: str, checkpoint_id: str, suite_id: str,
+                          config: EvalConfig | Mapping[str, Any], key: str) -> Job:
+        """Queue a development evaluation; returns the job immediately."""
+        return self.jobs.submit_evaluation(experiment_id, checkpoint_id, suite_id, config, key)
+
+    def get_job(self, experiment_id: str, job_id: str, wait_seconds: float = 0) -> Job:
+        """A job's state; ``wait_seconds`` (0-10) waits for a terminal state."""
+        return self.jobs.get_job(experiment_id, job_id, wait_seconds)
+
+    def cancel_job(self, experiment_id: str, job_id: str, key: str) -> Job:
+        """Request a stop; computation already performed remains charged."""
+        return self.jobs.cancel_job(experiment_id, job_id, key)
+
+    def list_jobs(self, experiment_id: str) -> list[Job]:
+        return self.jobs.list_jobs(experiment_id)
+
+    def recover_jobs(self) -> list[str]:
+        """Settle jobs whose worker lease expired; return their IDs."""
+        return self.jobs.recover_lost_jobs()

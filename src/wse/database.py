@@ -159,6 +159,67 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "CREATE INDEX audit_events_experiment ON audit_events (experiment_id, event_id)",
         ],
     ),
+    (
+        3,
+        [
+            # Allowance held by unsettled reservations. Every reservation is a
+            # conditional UPDATE (consumed + reserved + amount <= limit_value)
+            # inside BEGIN IMMEDIATE, so concurrent requests cannot overallocate.
+            "ALTER TABLE budget_ledger ADD COLUMN reserved NUMERIC NOT NULL DEFAULT 0 CHECK (reserved >= 0)",
+            """
+            CREATE TABLE suites (
+                suite_id     TEXT PRIMARY KEY,
+                task_id      TEXT NOT NULL,
+                split        TEXT NOT NULL CHECK (split IN ('development', 'final')),
+                suite_hash   TEXT NOT NULL,
+                suite_json   TEXT NOT NULL,
+                created_at   TEXT NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE reservations (
+                reservation_id  TEXT PRIMARY KEY,
+                experiment_id   TEXT NOT NULL REFERENCES experiments (experiment_id),
+                job_id          TEXT NOT NULL UNIQUE,
+                state           TEXT NOT NULL CHECK (state IN ('HELD', 'SETTLED')),
+                requested_json  TEXT NOT NULL,
+                charged_json    TEXT,
+                terminal_state  TEXT CHECK (terminal_state IN ('succeeded', 'failed', 'cancelled')),
+                created_at      TEXT NOT NULL,
+                settled_at      TEXT
+            )
+            """,
+            "CREATE INDEX reservations_experiment ON reservations (experiment_id, state)",
+            # lease_expires_at is a Unix timestamp shared by every process.
+            """
+            CREATE TABLE jobs (
+                job_id               TEXT PRIMARY KEY,
+                experiment_id        TEXT NOT NULL REFERENCES experiments (experiment_id),
+                kind                 TEXT NOT NULL CHECK (kind IN ('evaluation')),
+                checkpoint_id        TEXT NOT NULL REFERENCES checkpoints (checkpoint_id),
+                suite_id             TEXT NOT NULL REFERENCES suites (suite_id),
+                config_json          TEXT NOT NULL,
+                state                TEXT NOT NULL
+                                     CHECK (state IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+                reservation_id       TEXT NOT NULL UNIQUE REFERENCES reservations (reservation_id),
+                cancel_requested_at  TEXT,
+                progress_json        TEXT NOT NULL,
+                usage_json           TEXT,
+                result_json          TEXT,
+                error_json           TEXT,
+                lease_owner          TEXT,
+                lease_expires_at     REAL,
+                heartbeat_at         TEXT,
+                attempts             INTEGER NOT NULL DEFAULT 0,
+                created_at           TEXT NOT NULL,
+                started_at           TEXT,
+                finished_at          TEXT
+            )
+            """,
+            "CREATE INDEX jobs_state ON jobs (state, created_at)",
+            "CREATE INDEX jobs_experiment ON jobs (experiment_id, created_at)",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
@@ -174,8 +235,11 @@ class Database:
     def __init__(self, path: Path, *, busy_timeout_ms: int = 10_000) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # A connection may be handed to another thread (a worker built in one
+        # thread and run in another) but is never used by two threads at once;
+        # concurrent threads open their own Database.
         self.conn = sqlite3.connect(
-            str(self.path), isolation_level=None, timeout=busy_timeout_ms / 1000
+            str(self.path), isolation_level=None, timeout=busy_timeout_ms / 1000, check_same_thread=False
         )
         self.conn.row_factory = sqlite3.Row
         self.conn.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")

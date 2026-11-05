@@ -4,9 +4,12 @@
 exact registered operator versions and bounds single reads, analyses, and
 patches. ``ExperimentPolicy`` adds the immutable experiment mode and budget
 limits; ``small_model_v1`` and ``small_model_weights_only_v1`` are built in.
-Budget limits are recorded in every experiment's ledger; this milestone
-enforces the candidate-commit limit, and the reservation layer enforces the
-other counters.
+Budget limits are recorded in every experiment's ledger and enforced by
+``wse.budget``: candidate commits, tensor reads, and analyses are charged when
+they run; evaluation batches, examples, forward calls, and compute seconds
+are reserved before a job is queued and settled by the worker. Every
+synchronous managed operation also charges its elapsed compute seconds.
+``examples_per_batch`` and ``seconds_per_operation`` bound each job.
 
 Response-size rules (Section 4.1 of the plan): a read returns at most 2,048
 elements, and the canonical compact JSON of a read or analysis result must not

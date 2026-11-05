@@ -59,9 +59,19 @@ def _validate_operator(extension_id: str, version: str, implementation: Any) -> 
     validate_operator(extension_id, version, implementation)
 
 
-# Per-kind compatibility checks run at registration time. Later milestones add
-# validators for evaluators and strategies here.
-KIND_VALIDATORS: dict[str, Validator] = {"adapter": _validate_adapter, "operator": _validate_operator}
+def _validate_evaluator(extension_id: str, version: str, implementation: Any) -> None:
+    from wse.evaluators.base import validate_evaluator
+
+    validate_evaluator(extension_id, version, implementation)
+
+
+# Per-kind compatibility checks run at registration time. A later milestone adds
+# a validator for strategies here.
+KIND_VALIDATORS: dict[str, Validator] = {
+    "adapter": _validate_adapter,
+    "operator": _validate_operator,
+    "evaluator": _validate_evaluator,
+}
 
 
 class Registry:
@@ -185,6 +195,7 @@ class Registry:
 def builtin_registry() -> Registry:
     """Return a new registry containing the built-in M1 extensions."""
     from wse.adapters.mlp import MLPAdapter
+    from wse.evaluators.forward_batch import ForwardBatchEvaluator
     from wse.operators.tensor import BUILTIN_ANALYSES, BUILTIN_EDITS
 
     registry = Registry()
@@ -193,4 +204,6 @@ def builtin_registry() -> Registry:
     registry.register_alias("adapter", adapter.adapter_id, f"{adapter.adapter_id}@{adapter.version}")
     for operator in [*BUILTIN_ANALYSES.values(), *BUILTIN_EDITS.values()]:
         registry.register("operator", operator.spec.operator_id, operator.spec.version, operator)
+    evaluator = ForwardBatchEvaluator()
+    registry.register("evaluator", evaluator.evaluator_id, evaluator.version, evaluator)
     return registry

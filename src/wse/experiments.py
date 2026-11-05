@@ -24,6 +24,10 @@ Rules implemented here (Sections 4.1, 5.1-5.3, and 6.2 of the plan):
   exceed the policy's limit.
 * ``select_checkpoint`` is a compare-and-swap on the selected ID; selecting an
   ancestor is a rollback, which deletes no history and refunds nothing.
+* Experiment-scoped reads and analyses (``read_tensor``, ``analyze``) check
+  ownership, use the experiment policy's operations and limits, and charge
+  ``tensor_read_calls`` or the operator's usage-contract counter plus compute
+  seconds through ``wse.budget``; previews and applies charge compute seconds.
 * Rejected mutations (creation, previews, applies, selections) are recorded
   as audit events and leave state unchanged.
 """
@@ -41,6 +45,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import ValidationError
 
 from wse.audit import experiment_events, record_event, record_failure
+from wse.budget import BudgetLedger, budget_error
 from wse.database import utc_now
 from wse.patches import materialize_patch, replay_patch
 from wse.policy import LEDGER_COUNTERS, ExperimentPolicy, builtin_experiment_policies
@@ -70,6 +75,7 @@ from wse.schemas import (
 
 if TYPE_CHECKING:
     from wse.api import Engine
+    from wse.schemas import AnalysisResult, TensorSlice
 
 PATCH_URI_PREFIX = "wse://patches/"
 TASK_ID_PATTERN = r"^[A-Za-z0-9_.\-]{1,128}$"
@@ -126,6 +132,7 @@ class ExperimentService:
         self.store = engine.store
         self.db = engine.store.db
         self.bound_run_id = bound_run_id
+        self.ledger = BudgetLedger(self.db)
         for policy in builtin_experiment_policies().values():
             self._ensure_policy(policy)
         if bound_run_id is not None:
@@ -286,15 +293,18 @@ class ExperimentService:
         ledger = {
             entry["counter"]: entry
             for entry in conn.execute(
-                "SELECT counter, limit_value, consumed FROM budget_ledger WHERE experiment_id = ?",
+                "SELECT counter, limit_value, consumed, reserved FROM budget_ledger WHERE experiment_id = ?",
                 (row["experiment_id"],),
             )
         }
         budget = {}
         for counter in LEDGER_COUNTERS:
             if counter in ledger:
-                limit, consumed = _number(ledger[counter]["limit_value"]), _number(ledger[counter]["consumed"])
-                budget[counter] = BudgetEntry(limit=limit, consumed=consumed, remaining=_number(limit - consumed))
+                entry = ledger[counter]
+                limit, consumed = _number(entry["limit_value"]), _number(entry["consumed"])
+                reserved = _number(entry["reserved"])
+                budget[counter] = BudgetEntry(limit=limit, consumed=consumed, reserved=reserved,
+                                              remaining=_number(max(limit - consumed - reserved, 0)))
         return Experiment(
             experiment_id=row["experiment_id"],
             run_id=row["run_id"],
@@ -428,6 +438,50 @@ class ExperimentService:
         self._owned_checkpoint(self.db.conn, experiment_id, checkpoint_id)
         return self.store.load_manifest(checkpoint_id)
 
+    # -- experiment-scoped reads (metered) ---------------------------------------
+
+    def inspect_model(self, experiment_id: str, checkpoint_id: str) -> ModelManifest:
+        """The manifest of an owned checkpoint (no tensor data; not charged)."""
+        return self.load_manifest(experiment_id, checkpoint_id)
+
+    def _metered(self, experiment_id: str, checkpoint_id: Any, counter: str, units: int,
+                 compute: Callable[[ExperimentPolicy], Any]) -> Any:
+        """Run a synchronous read or analysis and charge it to the experiment.
+
+        Invalid requests fail before anything is charged. The charge is a
+        conditional UPDATE after the computation, so concurrent requests can
+        never overdraw: a request that loses the race returns
+        ``BUDGET_EXCEEDED`` and its result is discarded.
+        """
+        self._experiment_row(experiment_id)
+        self._owned_checkpoint(self.db.conn, experiment_id, checkpoint_id)
+        policy = self.experiment_policy(experiment_id)
+        self.ledger.require(self.db.conn, experiment_id, {counter: units, "compute_seconds": 0})
+        start = time.perf_counter()
+        result = compute(policy)
+        with self.db.transaction() as conn:
+            self.ledger.charge(conn, experiment_id, counter, units)
+            self.ledger.charge_compute(conn, experiment_id, time.perf_counter() - start)
+        return result
+
+    def read_tensor(self, experiment_id: str, checkpoint_id: str, tensor: str, selection: Any) -> TensorSlice:
+        """Bounded read of an owned checkpoint; charges one ``tensor_read_calls``."""
+        return self._metered(
+            experiment_id, checkpoint_id, "tensor_read_calls", 1,
+            lambda policy: self.engine._bounded_read(checkpoint_id, tensor, selection, policy.operations)[0],
+        )
+
+    def analyze(self, experiment_id: str, checkpoint_id: str, kind: str, tensor: str, selection: Any,
+                k: int | None = None, *, parameters: Mapping[str, Any] | None = None) -> AnalysisResult:
+        """A permitted analysis of an owned checkpoint, charged under its operator's usage contract."""
+        policy = self.experiment_policy(experiment_id)
+        spec = self.engine.registry.resolve_ref("operator", policy.operations.analysis_operator(kind)).spec
+        return self._metered(
+            experiment_id, checkpoint_id, spec.usage.counter, spec.usage.units_per_call,
+            lambda policy: self.engine._analyze(checkpoint_id, kind, tensor, selection, k, parameters=parameters,
+                                                policy=policy.operations),
+        )
+
     def _patch_row(self, experiment_id: str, patch_id: Any) -> sqlite3.Row:
         row = None
         if isinstance(patch_id, str) and OBJECT_ID_PATTERNS["patch"].fullmatch(patch_id):
@@ -502,6 +556,7 @@ class ExperimentService:
         start = time.perf_counter()
         experiment_id = row["experiment_id"]
         self._require_open(row)
+        self.ledger.require(self.db.conn, experiment_id, {"compute_seconds": 0})
         parsed = self._parse_spec(raw)
         policy = self.experiment_policy(experiment_id)
         self._owned_checkpoint(self.db.conn, experiment_id, parsed.base_checkpoint_id)
@@ -568,6 +623,7 @@ class ExperimentService:
                 return PatchPreview.model_validate_json(recorded)
             self._require_open(self._experiment_row(experiment_id, conn))
             self.store.require_published(relpath)
+            self.ledger.charge_compute(conn, experiment_id, preview.usage.compute_seconds or 0.0)
             conn.execute(
                 "INSERT INTO patches (patch_id, experiment_id, state, spec_hash, base_checkpoint_id, "
                 "result_weights_hash, relpath, file_sha256, size_bytes, preview_json, created_at) "
@@ -599,34 +655,14 @@ class ExperimentService:
         return self.store.load_manifest(json.loads(result_json)["checkpoint_id"])
 
     def _remaining(self, conn: sqlite3.Connection, experiment_id: str, counter: str) -> int | float:
-        row = conn.execute(
-            "SELECT limit_value - consumed AS remaining FROM budget_ledger WHERE experiment_id = ? AND counter = ?",
-            (experiment_id, counter),
-        ).fetchone()
-        return _number(row["remaining"]) if row else 0
+        return self.ledger.remaining(conn, experiment_id, counter)
 
     def _charge(self, conn: sqlite3.Connection, experiment_id: str, counter: str, amount: int) -> None:
         """Atomically consume ``amount``; never exceeds the limit (single conditional UPDATE)."""
-        updated = conn.execute(
-            "UPDATE budget_ledger SET consumed = consumed + ? "
-            "WHERE experiment_id = ? AND counter = ? AND consumed + ? <= limit_value",
-            (amount, experiment_id, counter, amount),
-        ).rowcount
-        if not updated:
-            raise self._budget_error(conn, experiment_id, counter, amount)
+        self.ledger.charge(conn, experiment_id, counter, amount)
 
     def _budget_error(self, conn: sqlite3.Connection, experiment_id: str, counter: str, amount: int) -> WSEError:
-        row = conn.execute(
-            "SELECT limit_value, consumed FROM budget_ledger WHERE experiment_id = ? AND counter = ?",
-            (experiment_id, counter),
-        ).fetchone()
-        limit, consumed = (_number(row["limit_value"]), _number(row["consumed"])) if row else (0, 0)
-        return WSEError(
-            ErrorCode.BUDGET_EXCEEDED,
-            f"the experiment's {counter} budget is exhausted ({consumed} of {limit} used); "
-            "select among existing checkpoints or stop",
-            details={"counter": counter, "limit": limit, "consumed": consumed, "requested": amount},
-        )
+        return budget_error(conn, experiment_id, counter, amount)
 
     def _apply(self, experiment_id: str, patch_id: Any, key: str, request_hash: str) -> ModelManifest:
         row = self._experiment_row(experiment_id)
@@ -640,8 +676,10 @@ class ExperimentService:
                     self._remember(conn, experiment_id, key, "apply_patch", request_hash,
                                    canonical_json({"checkpoint_id": manifest.checkpoint_id}))
             return manifest
+        start = time.perf_counter()
         if self._remaining(self.db.conn, experiment_id, "candidate_commits") < 1:
             raise self._budget_error(self.db.conn, experiment_id, "candidate_commits", 1)
+        self.ledger.require(self.db.conn, experiment_id, {"compute_seconds": 0})
         artifact = PatchArtifact.model_validate_json(self.store.read_patch(patch_row))
         self._owned_checkpoint(self.db.conn, experiment_id, artifact.spec.base_checkpoint_id)
         base = self.engine.open_checkpoint(artifact.spec.base_checkpoint_id)
@@ -669,6 +707,7 @@ class ExperimentService:
                 raise _Recorded(canonical_json({"checkpoint_id": current["applied_checkpoint_id"]}))
             self._require_open(self._experiment_row(experiment_id, conn))
             self._charge(conn, experiment_id, "candidate_commits", 1)
+            self.ledger.charge_compute(conn, experiment_id, time.perf_counter() - start)
             conn.execute(
                 "INSERT INTO experiment_checkpoints (experiment_id, checkpoint_id, role, patch_id, created_at) "
                 "VALUES (?, ?, 'candidate', ?, ?)",

@@ -14,7 +14,7 @@ import textwrap
 import pytest
 
 from wse.api import Engine
-from wse.database import MIGRATIONS
+from wse.database import LATEST_SCHEMA_VERSION, MIGRATIONS
 from wse.policy import SMALL_MODEL_POLICY_ID
 from wse.schemas import ErrorCode, WSEError
 from wse.tensors import weights_hash
@@ -272,5 +272,5 @@ def test_version_1_databases_are_migrated_in_place(workspace, bundles):
         base = engine.import_bundle(bundles["task"])
         grant = engine.grant_run(TASK, SMALL_MODEL_POLICY_ID, base.checkpoint_id)
         experiment = engine.create_experiment(grant.run_id, TASK, SMALL_MODEL_POLICY_ID, "create-1")
-        assert engine.store.db.schema_version() == 2
+        assert engine.store.db.schema_version() == LATEST_SCHEMA_VERSION
         assert engine.audit_log(experiment.experiment_id)[0]["event_type"] == "experiment.created"

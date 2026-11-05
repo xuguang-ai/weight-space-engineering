@@ -379,12 +379,12 @@ def test_missing_file_detected_on_load_marks_checkpoint_corrupt(workspace, bundl
 
 def test_migrations_create_schema_once(workspace):
     with Engine(workspace) as engine:
-        assert engine.store.db.schema_version() == LATEST_SCHEMA_VERSION == 2
+        assert engine.store.db.schema_version() == LATEST_SCHEMA_VERSION == 3
         tables = {row[0] for row in engine.store.db.conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert {"artifacts", "checkpoints", "audit_events"} <= tables
         assert {"policies", "run_grants", "experiments", "budget_ledger", "patches",
-                "experiment_checkpoints", "idempotency_records"} <= tables
+                "experiment_checkpoints", "idempotency_records", "suites", "reservations", "jobs"} <= tables
     Database(workspace / "metadata.sqlite").close()  # reapplying is a no-op
     with sqlite3.connect(workspace / "metadata.sqlite") as conn:
         conn.execute("PRAGMA user_version = 99")
