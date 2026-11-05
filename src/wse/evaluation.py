@@ -194,6 +194,28 @@ class EvaluationService:
     def get_report(self, experiment_id: str, report_id: str) -> EvaluationReport:
         return self._load_report(self.experiments._experiment_row(experiment_id), report_id)
 
+    def find_report(self, report_id: Any) -> EvaluationReport:
+        """A report by ID alone (for resource reads), with the same scoping and withholding as ``get_report``.
+
+        Reports of experiments this service may not see, and final reports
+        withheld until their experiment closes, are reported exactly like
+        reports that do not exist.
+        """
+        row = None
+        if isinstance(report_id, str) and OBJECT_ID_PATTERNS["report"].fullmatch(report_id):
+            row = self.db.conn.execute("SELECT experiment_id FROM reports WHERE report_id = ?",
+                                       (report_id,)).fetchone()
+        missing = WSEError(ErrorCode.NOT_FOUND, f"report {report_id!r} does not exist",
+                           details={"report_id": str(report_id)})
+        if row is None:
+            raise missing
+        try:
+            return self.get_report(row["experiment_id"], report_id)
+        except WSEError as exc:
+            if exc.code == ErrorCode.NOT_FOUND:
+                raise missing from None
+            raise
+
     def list_reports(self, experiment_id: str) -> list[EvaluationReport]:
         experiment = self.experiments._experiment_row(experiment_id)
         rows = self.db.conn.execute(

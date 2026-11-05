@@ -213,6 +213,21 @@ class JobService:
                                details={"suite_id": str(suite_id)})
         return suite
 
+    def list_suites(self, task_id: str) -> list[EvaluationSuite]:
+        """Registered suites of ``task_id``, oldest first.
+
+        A run-bound service lists only the development suites of its run's
+        task; for any other task it lists nothing, exactly as for a task
+        without suites.
+        """
+        bound = self.experiments.bound_run_id
+        if bound is not None and task_id != self.experiments._grant_row(bound)["task_id"]:
+            return []
+        rows = self.db.conn.execute("SELECT suite_id, split FROM suites WHERE task_id = ? ORDER BY created_at, rowid",
+                                    (task_id,)).fetchall()
+        return [self._read_suite(row["suite_id"]) for row in rows
+                if bound is None or row["split"] == "development"]
+
     def _read_suite(self, suite_id: Any, conn: sqlite3.Connection | None = None) -> EvaluationSuite:
         """Any registered suite, unscoped (internal use)."""
         row = None

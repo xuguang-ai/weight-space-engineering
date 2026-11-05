@@ -8,8 +8,10 @@ adapter's ``forward``.
 Response policy:
 
 * A read returns at most ``max_read_elements`` (2,048) elements, and the
-  canonical compact JSON of a read must not exceed ``max_inline_json_bytes``
-  (32 KiB). Oversized requests fail with ``INVALID_ARGUMENT`` whose message and
+  canonical compact JSON of a read must not exceed ``max_result_json_bytes``
+  (``max_inline_json_bytes`` of 32 KiB less a 1 KiB allowance for the tool
+  response envelope, so that an MCP response carrying the result twice stays
+  within 64 KiB). Oversized requests fail with ``INVALID_ARGUMENT`` whose message and
   ``details["largest_permitted_selection"]`` state the largest selection with
   the same starts that fits, shrinking the outermost axis first.
 * An analysis may cover up to ``max_analysis_elements``. When its result would
@@ -238,7 +240,7 @@ def bounded_read(
     def json_fit(base: list[AxisSlice], data: torch.Tensor) -> list[AxisSlice]:
         def fits(candidate: list[AxisSlice]) -> bool:
             local = tuple(slice(0, extent) for extent in _extent(candidate))
-            return inline_size(build(candidate, data[local], 0.0)) <= limits.max_inline_json_bytes
+            return inline_size(build(candidate, data[local], 0.0)) <= limits.max_result_json_bytes
 
         return largest_permitted_selection(base, fits)
 
@@ -257,14 +259,16 @@ def bounded_read(
     data = read_region(_slices(entries))
     result = build(entries, data, _elapsed(start))
     size = inline_size(result)
-    if size > limits.max_inline_json_bytes:
+    if size > limits.max_result_json_bytes:
         raise _too_large(
             f"the read of tensor {info.name!r} would serialize to {size} bytes of JSON, above the "
-            f"{limits.max_inline_json_bytes}-byte response limit",
+            f"{limits.max_result_json_bytes}-byte result limit (the {limits.max_inline_json_bytes}-byte inline "
+            "limit less the tool-response envelope)",
             limit="max_inline_json_bytes",
             requested=entries,
             suggestion=json_fit(entries, data),
-            extra={"max_inline_json_bytes": limits.max_inline_json_bytes, "json_bytes": size},
+            extra={"max_inline_json_bytes": limits.max_inline_json_bytes,
+                   "max_result_json_bytes": limits.max_result_json_bytes, "json_bytes": size},
         )
     return result, data
 
@@ -369,7 +373,7 @@ def run_analysis(
         usage=contract_usage(spec, compute_seconds=elapsed),
         management=management,
     )
-    limit = policy.limits.max_inline_json_bytes
+    limit = policy.limits.max_result_json_bytes
     if store_large is not None and inline_size(result) > limit:
         data = payload_text.encode("utf-8")
         by_reference = result.model_copy(
@@ -387,7 +391,8 @@ def run_analysis(
                 ErrorCode.INVALID_ARGUMENT,
                 f"the analysis response would serialize to {size} bytes of JSON even with its result "
                 f"stored by reference, above the {limit}-byte response limit; pass smaller parameters",
-                details={"limit": "max_inline_json_bytes", "max_inline_json_bytes": limit, "json_bytes": size},
+                details={"limit": "max_inline_json_bytes", "max_inline_json_bytes": policy.limits.max_inline_json_bytes,
+                         "max_result_json_bytes": limit, "json_bytes": size},
             )
         result = by_reference.model_copy(update={"result_uri": store_large(data)})
     return result

@@ -1108,9 +1108,9 @@ class TaskDefinition(_Frozen):
     """The agent-visible definition of a task (``task.json``).
 
     It states the behavior to achieve and how it is measured, never how the
-    task model was built: it names no reference checkpoint, fault, or patch.
-    ``target_accuracy`` is met only by a successful report covering every
-    example of the development suite.
+    task model was built or how to change it. ``target_accuracy`` is met only
+    by a successful report of the task's own development suite covering all
+    of its ``development_examples``.
     """
 
     schema_version: Literal["1"] = SCHEMA_VERSION
@@ -1300,3 +1300,98 @@ class FinalEvaluationReport(_Frozen):
     attempts: int
     created_at: str
     management: Management = "managed"
+
+
+# ---------------------------------------------------------------------------
+# Experiment and model descriptions (agent-facing views)
+# ---------------------------------------------------------------------------
+
+ConstraintStatus = Literal["verified", "unverified"]
+
+
+class SuiteSummary(_Frozen):
+    """An evaluation suite as an experiment may use it: identity and preregistered configurations, no examples."""
+
+    suite_id: str
+    task_id: str
+    split: SuiteSplit
+    evaluator: ExtensionRef
+    sample_counts: list[int]
+    seeds: list[int]
+    example_count: int
+    cluster_unit: str | None = None
+    cluster_count: int | None = None
+
+    @classmethod
+    def from_suite(cls, suite: EvaluationSuite) -> SuiteSummary:
+        if suite.dataset is not None:
+            unit, clusters = suite.dataset.cluster_unit, suite.dataset.cluster_count
+        else:
+            unit, clusters = suite.data.cluster_unit, len(set(suite.data.cluster_ids()))
+        return cls(suite_id=suite.suite_id, task_id=suite.task_id, split=suite.split, evaluator=suite.evaluator,
+                   sample_counts=list(suite.sample_counts), seeds=list(suite.seeds),
+                   example_count=suite.example_count, cluster_unit=unit, cluster_count=clusters)
+
+
+class OperationsSummary(_Frozen):
+    """The operations an experiment's policy permits: public names mapped to exact operator versions."""
+
+    analyses: dict[str, ExtensionRef]
+    edits: dict[str, ExtensionRef]
+    limits: dict[str, int]
+
+
+class ExperimentDescription(_Frozen):
+    """Everything a controller needs to work on an experiment, inline.
+
+    ``task`` is the registered task definition with its ``ObjectiveSpec``
+    (``None`` when the operator registered none). ``suites`` lists the
+    development suites the experiment may evaluate; ``evaluation_available``
+    is false in ``weights_only`` mode. ``constraint_status`` is ``verified``
+    only when the operator who started the interface attests that the
+    controller has no other execution channel (Section 6.1 of the plan);
+    otherwise it is ``unverified``.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    experiment: Experiment
+    task: TaskDefinition | None
+    operations: OperationsSummary
+    evaluation_available: bool
+    suites: list[SuiteSummary]
+    checkpoints: list[ExperimentCheckpoint]
+    policy_uri: str
+    constraint_status: ConstraintStatus = "unverified"
+    management: Management = "managed"
+
+
+class TensorStatistics(_Frozen):
+    """Whole-tensor statistics of one parameter, or why they are unavailable."""
+
+    tensor: str
+    shape: list[int]
+    dtype: str
+    statistics: dict[str, float | int] | None
+    operator: ExtensionRef | None = None
+    unavailable: str | None = None
+
+
+class ModelInspection(_Frozen):
+    """The manifest of a checkpoint an experiment owns, with whole-tensor statistics by layer."""
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    experiment_id: str
+    checkpoint_id: str
+    role: Literal["base", "candidate"]
+    manifest: ModelManifest
+    tensor_statistics: list[TensorStatistics]
+    manifest_uri: str
+    management: Management = "managed"
+
+
+class PatchDocument(_Frozen):
+    """A stored patch as a resource: its preview summary and its frozen spec and exact patch."""
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    preview: PatchPreview
+    artifact: PatchArtifact

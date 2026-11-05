@@ -720,3 +720,20 @@ def test_damaged_stored_analysis_result_is_replaced(workspace):
         _expect(ErrorCode.ARTIFACT_CORRUPT, engine.read_analysis_result, uri)
         assert engine.analyze(ckpt, "dump", "layers.0.weight", _full([64, 64])).result_uri == uri
         assert len(engine.read_analysis_result(uri)["values"]) == 64 * 64
+
+
+def test_read_results_leave_room_for_the_tool_response_envelope(engine, huge_ckpt):
+    from wse.policy import RESPONSE_ENVELOPE_BYTES, ResponseLimits
+
+    assert ResponseLimits().max_result_json_bytes == MAX_INLINE_JSON_BYTES - RESPONSE_ENVELOPE_BYTES == 31 * 1024
+    ckpt = huge_ckpt.checkpoint_id
+    error = _expect(ErrorCode.INVALID_ARGUMENT, engine.read_tensor_slice, ckpt, "layers.0.weight",
+                    _sel((0, 32), (0, 64)))
+    assert error.details["max_result_json_bytes"] == 31 * 1024
+    fitted = engine.read_tensor_slice(ckpt, "layers.0.weight", error.details["largest_permitted_selection"])
+    rows = fitted.shape[0]
+    assert len(fitted.canonical_json().encode()) <= 31 * 1024
+    # One more row exceeds the result limit.
+    again = _expect(ErrorCode.INVALID_ARGUMENT, engine.read_tensor_slice, ckpt, "layers.0.weight",
+                    _sel((0, rows + 1), (0, 64)))
+    assert 31 * 1024 < again.details["json_bytes"]

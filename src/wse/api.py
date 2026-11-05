@@ -64,7 +64,10 @@ if TYPE_CHECKING:
         EvaluationReport,
         Experiment,
         ExperimentCheckpoint,
+        ExperimentDescription,
         Job,
+        ModelInspection,
+        PatchDocument,
         PatchArtifact,
         PatchPreview,
         PatchSpec,
@@ -882,6 +885,51 @@ class Engine:
 
     def audit_log(self, experiment_id: str) -> list[dict[str, Any]]:
         return self.experiments.audit_log(experiment_id)
+
+    def experiment_policy(self, experiment_id: str) -> ExperimentPolicy:
+        """The immutable policy of an experiment this engine may see."""
+        return self.experiments.experiment_policy(experiment_id)
+
+    def describe_experiment(self, experiment_id: str, *, constraint_status: str = "unverified"
+                            ) -> ExperimentDescription:
+        """State, task and objective, permitted operations, development suites, and checkpoints, inline.
+
+        ``constraint_status`` is supplied by whoever runs the interface: only
+        an operator who has removed every other execution channel of the
+        controller may pass ``verified``.
+        """
+        from wse.schemas import ExperimentDescription, OperationsSummary, SuiteSummary
+
+        experiment = self.get_experiment(experiment_id)
+        policy = self.experiment_policy(experiment_id)
+        try:
+            task = self.get_task(experiment.task_id)
+        except WSEError as exc:
+            if exc.code != ErrorCode.NOT_FOUND:
+                raise
+            task = None
+        suites = [SuiteSummary.from_suite(suite) for suite in self.jobs.list_suites(experiment.task_id)
+                  if suite.split == "development"]
+        operations = OperationsSummary(analyses=dict(policy.operations.analyses), edits=dict(policy.operations.edits),
+                                       limits=policy.operations.limits.model_dump())
+        return ExperimentDescription(
+            experiment=experiment, task=task, operations=operations,
+            evaluation_available=experiment.mode == "bounded_eval" and policy.budget.evaluation_batches > 0,
+            suites=suites, checkpoints=self.list_experiment_checkpoints(experiment_id),
+            policy_uri=f"wse://experiments/{experiment_id}/policy", constraint_status=constraint_status,
+        )
+
+    def inspect_model_details(self, experiment_id: str, checkpoint_id: str) -> ModelInspection:
+        """An owned checkpoint's manifest with whole-tensor statistics by layer (not charged)."""
+        return self.experiments.inspect_details(experiment_id, checkpoint_id)
+
+    def find_patch(self, patch_id: str) -> PatchDocument:
+        """A visible patch by ID alone: its preview and stored artifact."""
+        return self.experiments.find_patch(patch_id)
+
+    def find_report(self, report_id: str) -> EvaluationReport:
+        """A visible report by ID alone; final reports are withheld until their experiment closes."""
+        return self.evaluation.find_report(report_id)
 
     # -- metered experiment reads ---------------------------------------------------
 

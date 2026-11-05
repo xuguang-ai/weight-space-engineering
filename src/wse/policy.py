@@ -14,7 +14,11 @@ synchronous managed operation also charges its elapsed compute seconds.
 Response-size rules (Section 4.1 of the plan): a read returns at most 2,048
 elements, and the canonical compact JSON of a read or analysis result must not
 exceed 32 KiB, because an MCP response carries it twice (``structuredContent``
-and the text mirror) within a 64 KiB total. Explicit top-k values satisfy
+and the text mirror) within a 64 KiB total. Those two copies also carry the
+tool-response envelope (summary, URIs, cumulative usage) and the JSON-RPC
+framing, so a result may use at most ``max_inline_json_bytes`` less
+``RESPONSE_ENVELOPE_BYTES`` (1 KiB): 31 KiB under the default policy, which
+keeps the largest permitted response within 64 KiB. Explicit top-k values satisfy
 ``1 <= k <= min(64, element_count)``; an omitted ``k`` resolves to
 ``min(16, element_count)``.
 """
@@ -42,6 +46,7 @@ from wse.schemas import (
 MAX_READ_ELEMENTS = 2048
 MAX_INLINE_JSON_BYTES = 32 * 1024
 MAX_RESPONSE_BYTES = 64 * 1024
+RESPONSE_ENVELOPE_BYTES = 1024
 MAX_TOP_K = 64
 DEFAULT_TOP_K = 16
 MAX_ANALYSIS_ELEMENTS = 16 * 1024 * 1024
@@ -59,10 +64,15 @@ class ResponseLimits(_Frozen):
     """
 
     max_read_elements: int = Field(default=MAX_READ_ELEMENTS, ge=1)
-    max_inline_json_bytes: int = Field(default=MAX_INLINE_JSON_BYTES, ge=1024)
+    max_inline_json_bytes: int = Field(default=MAX_INLINE_JSON_BYTES, ge=2048)
     max_analysis_elements: int = Field(default=MAX_ANALYSIS_ELEMENTS, ge=1)
     max_patch_operations: int = Field(default=MAX_PATCH_OPERATIONS, ge=1)
     max_patch_elements: int = Field(default=MAX_PATCH_ELEMENTS, ge=1)
+
+    @property
+    def max_result_json_bytes(self) -> int:
+        """Largest canonical JSON of one read or analysis result: the inline limit less the envelope allowance."""
+        return self.max_inline_json_bytes - RESPONSE_ENVELOPE_BYTES
 
 
 def _default_edits() -> dict[str, ExtensionRef]:

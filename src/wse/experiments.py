@@ -66,14 +66,17 @@ from wse.schemas import (
     ExperimentCheckpoint,
     FrozenOperation,
     FrozenPatchSpec,
+    ModelInspection,
     ModelManifest,
     PatchArtifact,
+    PatchDocument,
     PatchOperationSummary,
     PatchPreview,
     PatchSpec,
     Provenance,
     RunGrant,
     StorageCost,
+    TensorStatistics,
     Usage,
     WSEError,
     canonical_json,
@@ -453,6 +456,57 @@ class ExperimentService:
     def inspect_model(self, experiment_id: str, checkpoint_id: str) -> ModelManifest:
         """The manifest of an owned checkpoint (no tensor data; not charged)."""
         return self.load_manifest(experiment_id, checkpoint_id)
+
+    def inspect_details(self, experiment_id: str, checkpoint_id: str) -> ModelInspection:
+        """The manifest of an owned checkpoint with whole-tensor statistics by layer (not charged).
+
+        Statistics come from the experiment policy's registered ``stats``
+        analysis, so no separate algorithm runs here; a tensor larger than
+        the policy's ``max_analysis_elements`` (or a policy without a
+        ``stats`` kind) reports why its statistics are unavailable.
+        """
+        manifest = self.load_manifest(experiment_id, checkpoint_id)
+        role = self._owned_checkpoint(self.db.conn, experiment_id, checkpoint_id)["role"]
+        policy = self.experiment_policy(experiment_id).operations
+        statistics = []
+        for info in manifest.tensors:
+            entry: dict[str, Any] = {"tensor": info.name, "shape": list(info.shape), "dtype": info.dtype}
+            selection = [{"start": 0, "stop": extent, "step": 1} for extent in info.shape]
+            try:
+                result = self.engine._analyze(checkpoint_id, "stats", info.name, selection, policy=policy)
+            except WSEError as exc:
+                if exc.code not in (ErrorCode.POLICY_DENIED, ErrorCode.INVALID_ARGUMENT,
+                                    ErrorCode.UNSUPPORTED_CAPABILITY):
+                    raise
+                entry.update(statistics=None, unavailable=exc.message)
+            else:
+                entry.update(statistics=result.result, operator=result.operator,
+                             unavailable=None if result.result is not None else "stored by reference")
+            statistics.append(TensorStatistics.model_validate(entry))
+        return ModelInspection(experiment_id=experiment_id, checkpoint_id=checkpoint_id, role=role,
+                               manifest=manifest, tensor_statistics=statistics,
+                               manifest_uri=f"wse://models/{checkpoint_id}/manifest")
+
+    def find_patch(self, patch_id: Any) -> PatchDocument:
+        """A patch by ID alone (for resource reads), scoped like every other lookup.
+
+        Patches of experiments this service may not see are reported exactly
+        like patches that do not exist.
+        """
+        row = None
+        if isinstance(patch_id, str) and OBJECT_ID_PATTERNS["patch"].fullmatch(patch_id):
+            row = self.db.conn.execute("SELECT experiment_id FROM patches WHERE patch_id = ?", (patch_id,)).fetchone()
+        missing = WSEError(ErrorCode.NOT_FOUND, f"patch {patch_id!r} does not exist", details={"patch_id": str(patch_id)})
+        if row is None:
+            raise missing
+        try:
+            self._experiment_row(row["experiment_id"])
+        except WSEError as exc:
+            if exc.code == ErrorCode.NOT_FOUND:
+                raise missing from None
+            raise
+        return PatchDocument(preview=self.get_patch(row["experiment_id"], patch_id),
+                             artifact=self.read_patch(row["experiment_id"], patch_id))
 
     def _metered(self, experiment_id: str, checkpoint_id: Any, counter: str, units: int,
                  compute: Callable[[ExperimentPolicy], Any]) -> Any:
