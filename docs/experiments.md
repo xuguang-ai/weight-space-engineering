@@ -99,10 +99,21 @@ controller (cancelling the SDK run) when:
 
 The controller may also stop voluntarily (a final message, or a strategy's
 `stop`). After any ending, including the turn limit, the wall-clock limit,
-cancellation, an SDK error, or a failed connection, the runner cancels every
-queued or running job, waits for the worker to settle it (recovering jobs
-whose worker was lost), and freezes the selected checkpoint, while the MCP
-server stays connected; only then does it close the connection.
+cancellation, an SDK error, a failed connection, or a failure inside the
+runner, the runner cancels every queued or running job, waits for the worker
+to settle it (recovering jobs whose worker was lost), and freezes the
+selected checkpoint, while the MCP server stays connected; only then does it
+close the connection.
+
+The operator can stop a running trial with Ctrl-C. The first SIGINT stops a
+stepwise strategy before its next action, or cancels the SDK loop; the
+runner then settles and freezes as above, records the trial as `cancelled`
+with the stop condition `operator_interrupt`, and only then raises
+`KeyboardInterrupt` to its caller. A second Ctrl-C aborts at once and can
+leave the experiment open. The `wse serve` process runs in its own process
+group, so a terminal's Ctrl-C reaches only the runner; its evaluation worker
+stops after its current job if `wse serve` dies without cleanup (a crash or
+SIGKILL), so no orphaned worker claims a later trial's jobs.
 
 ## Records
 
@@ -112,11 +123,14 @@ hash, `constraint_status`, the tracing setting, and the termination record:
 status (`completed`, `stopped`, `max_turns`, `timeout`, `cancelled`,
 `connection_failed`, `error`), reason, stop condition, final message, turns,
 tool calls, elapsed time, usage, provider metadata (SDK, MCP, and protocol
-versions, limits, allowed and observed tools), the settlement and freeze, and
-the environment (Python, platform, CPU, package versions). The normalized
-trace (`controller_events`) holds tool calls with their arguments, tool
-results with their error codes, sizes, hashes, and bounded excerpts, model
-responses with per-request usage, messages, and stop requests. Private
+versions, limits, allowed and observed tools), the settlement and freeze, the
+environment (Python, platform, CPU, package versions), and, for an agent, the
+path of the `wse serve` log (`serve_log`; the reason of a `connection_failed`
+or `error` ending names the underlying exception and points to that log).
+The normalized trace (`controller_events`) holds tool calls with their
+arguments, tool results with their error codes, sizes, hashes, and bounded
+excerpts, model responses with per-request usage, messages, and stop
+requests. Private
 reasoning is never requested or stored: reasoning items are counted, not
 kept, and hypotheses are one or two sentences of observable evidence.
 
@@ -223,6 +237,11 @@ uv run --no-sync python examples/signed_sum/run_trials.py LIVE --label live \
 
 Each trial runs to its freeze before the next starts; the final evaluations
 run only after all 5 have frozen; every trial is exported, replayed, and
-listed with its failure cause in `LIVE/reports/live.md`. The exact SDK and
+listed with its failure cause in `LIVE/reports/live.md`. A trial that raises
+is listed with its error and counts as unsuccessful, and the remaining
+trials still run. Ctrl-C stops the running trial (settled and frozen first),
+starts no further trial, and still final-evaluates and reports the frozen
+ones. The script exits with 0, with 1 if any trial or step failed, or with
+130 after an interrupt; each server's log is `LIVE/logs/serve-RUN_ID.log`. The exact SDK and
 model settings are in each export's `controller.json`. Running these trials
 sends the task instructions and tool results to the model provider.

@@ -15,7 +15,8 @@ runner has settled pending jobs and frozen the experiment:
 2. ``await adapter.run(experiment_id, agent_config, event_sink)`` runs the
    SDK loop to its end and returns an ``AgentRunResult``.
    ``adapter.cancel(experiment_id, reason)`` (thread-safe) stops a running
-   loop; the result then reports ``stopped`` with that reason.
+   loop, or a loop that has not started yet; the result then reports
+   ``stopped`` with that reason.
 3. The runner settles jobs and freezes, then ``await adapter.close(...)``.
 
 This module imports no agent SDK; ``wse.agent_adapters.openai_agents``
@@ -41,6 +42,7 @@ __all__ = [
     "EventSink",
     "RunConnection",
     "TerminationStatus",
+    "describe_exception",
 ]
 
 DEFAULT_MAX_TURNS = 100
@@ -48,6 +50,26 @@ DEFAULT_WALL_CLOCK_SECONDS = 900.0
 
 TerminationStatus = Literal["completed", "stopped", "max_turns", "timeout", "cancelled", "connection_failed",
                             "error"]
+
+
+def describe_exception(exc: BaseException, limit: int = 2000) -> str:
+    """``Type: message`` of an exception, or of the innermost exceptions of an exception group.
+
+    SDK and transport failures usually arrive wrapped in task-group
+    exception groups whose own message ("unhandled errors in a TaskGroup")
+    names no cause, so the leaves are reported instead.
+    """
+    leaves: list[str] = []
+
+    def walk(error: BaseException) -> None:
+        if isinstance(error, BaseExceptionGroup) and error.exceptions:
+            for inner in error.exceptions:
+                walk(inner)
+        else:
+            leaves.append(f"{type(error).__name__}: {error}")
+
+    walk(exc)
+    return " | ".join(dict.fromkeys(leaves))[:limit]
 
 
 class AgentConfig(_Frozen):

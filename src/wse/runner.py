@@ -33,7 +33,13 @@ drives one trial on an operator-prepared workspace:
    freezes the selected checkpoint, while an SDK adapter's MCP server stays
    connected; only then is the adapter closed. Neither the SDK nor the runner
    closes an experiment: final evaluation (``wse final-evaluate``) is a
-   separate operator step.
+   separate operator step. This holds however the controller ends, including
+   a failure inside the runner (status ``error``) and an operator interrupt:
+   the first Ctrl-C (SIGINT) while a controller runs stops it at its next
+   step or cancels the SDK loop, the trial is recorded as ``cancelled`` with
+   the stop condition ``operator_interrupt``, and ``KeyboardInterrupt`` is
+   raised to the caller only after the experiment is settled and frozen.
+   A second Ctrl-C aborts at once and can leave the experiment open.
 
 Agent instructions are generated from the registered task definition
 (``task.json``) and the experiment policy only, never from repository
@@ -49,7 +55,9 @@ import asyncio
 import logging
 import os
 import re
+import signal
 import sys
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -64,8 +72,9 @@ from wse.agent_adapters.base import (
     AgentRunResult,
     AgentUsage,
     RunConnection,
+    describe_exception,
 )
-from wse.api import Engine
+from wse.api import Engine, model_list_page
 from wse.audit import (
     append_controller_event,
     controller_record,
@@ -87,6 +96,7 @@ from wse.strategies.base import STRATEGY_TOOLS, Action, Observation
 
 __all__ = [
     "EVALUATION_TOOLS",
+    "OPERATOR_INTERRUPT",
     "TEST_DOUBLE_PREFIX",
     "ExperimentExecutor",
     "ReferenceRunner",
@@ -108,6 +118,7 @@ EVALUATION_TOOLS = ("wse_submit_evaluation", "wse_get_job", "wse_cancel_job", "w
 NO_IMPROVEMENT_PATIENCE = 3
 POLICY_DENIAL_LIMIT = 3
 TEST_DOUBLE_PREFIX = "wse-test-double:"
+OPERATOR_INTERRUPT = "operator_interrupt: the operator interrupted the run (SIGINT)"
 SERVE_ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "PYTHONPATH", "VIRTUAL_ENV",
                        "SYSTEMROOT")
 SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE)
@@ -273,9 +284,7 @@ class ExperimentExecutor:
         self.tools = tuple(tools)
         e = engine
         self._operations: dict[str, Callable[..., Any]] = {
-            "wse_list_models": lambda: {"models": [{"checkpoint_id": m.checkpoint_id, "weights_hash": m.weights_hash,
-                                                    "parameter_count": m.parameter_count}
-                                                   for m in e.list_models()]},
+            "wse_list_models": lambda cursor=None: model_list_page(e.list_models(), cursor),
             "wse_get_experiment": lambda experiment_id: e.describe_experiment(
                 experiment_id, constraint_status=self.constraint_status),
             "wse_inspect_model": lambda experiment_id, checkpoint_id: e.inspect_model_details(experiment_id,
@@ -449,6 +458,51 @@ class _Trace:
         return event
 
 
+class _OperatorInterrupt:
+    """While a controller runs, the first SIGINT requests a graceful stop; a second one raises at once.
+
+    ``requested`` is polled by the strategy loop; an agent run registers a
+    callback (``on_request``) that cancels the SDK loop from the event loop.
+    The handler is installed only in the main thread and is restored on exit.
+    """
+
+    def __init__(self) -> None:
+        self.requested = False
+        self._callback: Callable[[], None] | None = None
+        self._previous: Any = None
+        self._installed = False
+
+    def __enter__(self) -> _OperatorInterrupt:
+        if threading.current_thread() is threading.main_thread():
+            try:
+                self._previous = signal.signal(signal.SIGINT, self._handle)
+                self._installed = True
+            except ValueError:  # signals unavailable (for example in an embedded interpreter)
+                pass
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self._installed:
+            previous = self._previous if self._previous is not None else signal.default_int_handler
+            signal.signal(signal.SIGINT, previous)
+            self._installed = False
+
+    def on_request(self, callback: Callable[[], None] | None) -> None:
+        """Call ``callback`` on the first interrupt, at once if one was already requested."""
+        self._callback = callback
+        if callback is not None and self.requested:
+            callback()
+
+    def _handle(self, signum: int, frame: Any) -> None:
+        if self.requested:
+            raise KeyboardInterrupt
+        self.requested = True
+        logger.warning("interrupted: stopping the controller, then settling jobs and freezing the experiment "
+                       "(press Ctrl-C again to abort at once, which can leave the experiment open)")
+        if self._callback is not None:
+            self._callback()
+
+
 class ReferenceRunner:
     """Runs one controller per run grant and finalizes its experiment (see the module docstring).
 
@@ -478,13 +532,21 @@ class ReferenceRunner:
         self.settle_timeout_seconds = settle_timeout_seconds
         self.log_dir = Path(log_dir) if log_dir is not None else self.workspace / "logs"
         self.last_result: dict[str, Any] | None = None
+        self.last_experiment_id: str | None = None
 
     # -- entry point ---------------------------------------------------------------------
 
     def run_experiment(self, run_id: str, task_id: str, policy_id: str,
                        agent_config: StrategyConfig | AgentConfig | Mapping[str, Any]) -> str:
-        """Run one controller on the run grant's experiment and freeze it; return the experiment ID."""
+        """Run one controller on the run grant's experiment and freeze it; return the experiment ID.
+
+        ``last_experiment_id`` names the experiment as soon as it exists, so a
+        caller can report a run that raised. After an operator interrupt the
+        experiment is settled and frozen first, then ``KeyboardInterrupt`` is
+        raised.
+        """
         config = parse_controller_config(agent_config)
+        self.last_result = self.last_experiment_id = None
         with Engine(self.workspace, registry=self.registry, run_id=run_id) as bound:
             grant = bound.experiments.get_run_grant(run_id)
             if (grant.task_id, grant.policy_id) != (task_id, policy_id):
@@ -495,12 +557,16 @@ class ReferenceRunner:
             if experiment.state != "OPEN":
                 raise WSEError(ErrorCode.VERSION_CONFLICT, f"experiment {eid} is {experiment.state}; a run grant "
                                "permits one controller run")
+            self.last_experiment_id = eid
             policy = bound.experiment_policy(eid)
             task = bound.get_task(task_id)
-        if isinstance(config, StrategyConfig):
-            self._run_strategy(eid, task, policy, config)
-        else:
-            self._run_agent(run_id, eid, task, policy, config)
+        with _OperatorInterrupt() as interrupt:
+            if isinstance(config, StrategyConfig):
+                self._run_strategy(eid, task, policy, config, interrupt)
+            else:
+                self._run_agent(run_id, eid, task, policy, config, interrupt)
+        if interrupt.requested:
+            raise KeyboardInterrupt(f"experiment {eid} was interrupted by the operator; it is settled and frozen")
         return eid
 
     # -- records -----------------------------------------------------------------------------
@@ -512,13 +578,24 @@ class ReferenceRunner:
                                 constraint_status=constraint_status, tracing=tracing)
 
     def _end_record(self, engine: Engine, eid: str, result: AgentRunResult, stop_condition: str | None,
-                    finalization: dict[str, Any] | None, error: str | None = None) -> None:
+                    finalization: dict[str, Any] | None, error: str | None = None,
+                    extra: Mapping[str, Any] | None = None) -> None:
         record = {**result.model_dump(mode="json"), "stop_condition": stop_condition,
-                  "finalization": finalization, "environment": environment_record()}
+                  "finalization": finalization, "environment": environment_record(), **(extra or {})}
         if error is not None:
             record["finalization_error"] = error
         record_controller_end(engine.store.db, eid, record)
         self.last_result = controller_record(engine.store.db, eid)
+
+    def _settle_and_record(self, engine: Engine, eid: str, result: AgentRunResult, stop_condition: str | None,
+                           extra: Mapping[str, Any] | None = None) -> None:
+        """Finalize (settle jobs, freeze) and write the termination record, also when finalization fails."""
+        try:
+            finalization = self._finalize(engine, eid)
+        except WSEError as exc:
+            self._end_record(engine, eid, result, stop_condition, None, error=exc.message, extra=extra)
+            raise
+        self._end_record(engine, eid, result, stop_condition, finalization, extra=extra)
 
     # -- finalization ----------------------------------------------------------------------
 
@@ -556,7 +633,7 @@ class ReferenceRunner:
     # -- stepwise strategies -----------------------------------------------------------------
 
     def _run_strategy(self, eid: str, task: TaskDefinition, policy: ExperimentPolicy,
-                      config: StrategyConfig) -> None:
+                      config: StrategyConfig, interrupt: _OperatorInterrupt) -> None:
         from wse.worker import WorkerSupervisor
 
         ref = self.registry.resolve_reference("strategy", config.strategy)
@@ -577,20 +654,25 @@ class ReferenceRunner:
                 worker_args = [arg for spec in self.setup for arg in ("--setup", spec)] + list(self.worker_args)
                 supervisor = WorkerSupervisor(self.workspace, extra_args=worker_args).start()
             try:
-                result, stop = self._strategy_loop(strategy, eid, task, config, tools, monitor, trace, run_id)
                 try:
-                    finalization = self._finalize(operator, eid)
-                except WSEError as exc:
-                    self._end_record(operator, eid, result, stop, None, error=exc.message)
+                    result, stop = self._strategy_loop(strategy, eid, task, config, tools, monitor, trace, run_id,
+                                                       interrupt)
+                except Exception as exc:  # noqa: BLE001 - a failure inside the runner still settles and freezes
+                    logger.exception("strategy run failed")
+                    result, stop = AgentRunResult(status="error", reason=describe_exception(exc)), None
+                except BaseException as exc:  # a repeated Ctrl-C or SystemExit: settle and freeze, then re-raise
+                    self._settle_and_record(operator, eid, AgentRunResult(
+                        status="cancelled", reason=f"interrupted: {describe_exception(exc)}"),
+                        OPERATOR_INTERRUPT if interrupt.requested else None)
                     raise
-                self._end_record(operator, eid, result, stop, finalization)
+                self._settle_and_record(operator, eid, result, stop)
             finally:
                 if supervisor is not None:
                     supervisor.stop(stop_timeout=5.0)
 
     def _strategy_loop(self, strategy: Any, eid: str, task: TaskDefinition, config: StrategyConfig,
-                       tools: Sequence[str], monitor: StopMonitor, trace: _Trace, run_id: str
-                       ) -> tuple[AgentRunResult, str | None]:
+                       tools: Sequence[str], monitor: StopMonitor, trace: _Trace, run_id: str,
+                       interrupt: _OperatorInterrupt) -> tuple[AgentRunResult, str | None]:
         started = time.monotonic()
         trace.emit("run_started", details={"strategy": f"{strategy.strategy_id}@{strategy.version}",
                                            "max_steps": config.max_steps,
@@ -612,6 +694,10 @@ class ReferenceRunner:
 
             execute(Action.call("wse_get_experiment", "Read the task and budget.", experiment_id=eid))
             while steps < config.max_steps:
+                if interrupt.requested:
+                    status, reason = "cancelled", OPERATOR_INTERRUPT
+                    stop = OPERATOR_INTERRUPT
+                    break
                 if time.monotonic() - started > config.wall_clock_seconds:
                     status, reason = "timeout", f"the wall-clock limit of {config.wall_clock_seconds:g} s was reached"
                     break
@@ -624,9 +710,13 @@ class ReferenceRunner:
                     action = strategy.next_action(task.objective, list(observations), budget)
                 except Exception as exc:  # noqa: BLE001 - a strategy failure still settles and freezes
                     logger.exception("strategy failed")
-                    status, reason = "error", f"{type(exc).__name__}: {exc}"[:2000]
+                    status, reason = "error", describe_exception(exc)
                     break
                 steps += 1
+                if interrupt.requested:  # an action proposed after the interrupt is not executed
+                    status, reason = "cancelled", OPERATOR_INTERRUPT
+                    stop = OPERATOR_INTERRUPT
+                    break
                 if action.kind == "stop":
                     status, reason = "completed", f"the strategy stopped: {action.reason}"
                     trace.emit("message", output=action.reason)
@@ -669,13 +759,17 @@ class ReferenceRunner:
             return adapter_class(model=strategy_model(strategy, experiment_id=eid))
         return adapter_class()
 
+    def serve_log(self, run_id: str) -> str:
+        """The log file of the run's ``wse serve`` process and its worker (their stderr)."""
+        return str(self.log_dir / f"serve-{run_id}.log")
+
     def connection(self, run_id: str, eid: str, task: TaskDefinition, policy: ExperimentPolicy,
                    constraint_status: str) -> RunConnection:
         """The MCP connection for a run: ``wse serve`` bound to the grant, allow-listed tools and environment."""
         tools = allowed_tools(policy)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         command = [sys.executable, "-m", "wse.cli", "--workspace", str(self.workspace), "serve", "--run-id", run_id,
-                   "--constraint-status", constraint_status, "--log-file", str(self.log_dir / f"serve-{run_id}.log")]
+                   "--constraint-status", constraint_status, "--log-file", self.serve_log(run_id)]
         for spec in self.setup:
             command += ["--setup", spec]
         if self.worker_args:
@@ -688,10 +782,11 @@ class ReferenceRunner:
             initial_message=initial_message(eid), constraint_status=constraint_status)
 
     def _run_agent(self, run_id: str, eid: str, task: TaskDefinition, policy: ExperimentPolicy,
-                   config: AgentConfig) -> None:
+                   config: AgentConfig, interrupt: _OperatorInterrupt) -> None:
         adapter = self._make_adapter(config, eid)
         constraint_status = "verified" if config.benchmark else "unverified"
         connection = self.connection(run_id, eid, task, policy, constraint_status)
+        serve_log = self.serve_log(run_id)
         recorded = {**config.model_dump(mode="json"), "allowed_tools": connection.allowed_tools,
                     "serve_env_names": sorted(connection.serve_env), "cwd": connection.cwd}
         tracing = {"sdk_tracing_disabled": config.tracing_disabled, "benchmark": config.benchmark,
@@ -706,6 +801,14 @@ class ReferenceRunner:
                 monitor = StopMonitor(operator, eid, task)
                 trace = _Trace(operator, eid)
                 stops: list[str] = []
+                controller_running = [True]
+
+                def request_stop(reason: str) -> None:  # runs in the event loop
+                    if stops or not controller_running[0]:
+                        return
+                    stops.append(reason)
+                    trace.emit("cancel_requested", details={"reason": reason})
+                    adapter.cancel(eid, reason)
 
                 def sink(event: AgentEvent) -> None:
                     trace.record(event)
@@ -713,26 +816,40 @@ class ReferenceRunner:
                         return
                     reason = monitor.observe(event.error_code)
                     if reason is not None:
-                        stops.append(reason)
-                        trace.emit("cancel_requested", details={"reason": reason})
-                        adapter.cancel(eid, reason)
+                        request_stop(reason)
 
+                loop = asyncio.get_running_loop()
+                interrupt.on_request(lambda: loop.call_soon_threadsafe(request_stop, OPERATOR_INTERRUPT))
+                escaped: BaseException | None = None
                 try:
                     try:
                         await adapter.start(connection, config)
+                        if stops:  # requested before the session existed
+                            adapter.cancel(eid, stops[0])
                         result = await adapter.run(eid, config, sink)
                     except Exception as exc:  # noqa: BLE001 - an adapter failure still settles and freezes
                         logger.exception("agent adapter failed")
-                        result = AgentRunResult(status="error", reason=f"{type(exc).__name__}: {exc}"[:2000])
-                    try:
-                        finalization = await asyncio.to_thread(self._finalize, operator, eid)
-                    except WSEError as exc:
-                        self._end_record(operator, eid, result, stops[0] if stops else None, None,
-                                         error=exc.message)
-                        raise
-                    self._end_record(operator, eid, result, stops[0] if stops else None, finalization)
+                        result = AgentRunResult(status="error", reason=describe_exception(exc))
+                    except BaseException as exc:  # a repeated Ctrl-C, or this task cancelled: settle, then re-raise
+                        escaped = exc
+                        task_ = asyncio.current_task()
+                        while task_ is not None and task_.cancelling():
+                            task_.uncancel()  # let the finalization and the MCP cleanup below run
+                        result = AgentRunResult(status="cancelled", reason=f"interrupted: {describe_exception(exc)}")
+                    finally:
+                        controller_running[0] = False  # no stop request or trace write after the controller ends
+                        interrupt.on_request(None)
+                    if stops and stops[0] == OPERATOR_INTERRUPT and result.status == "stopped":
+                        result = result.model_copy(update={"status": "cancelled"})
+                    if result.status in ("connection_failed", "error"):
+                        result = result.model_copy(update={"reason": f"{result.reason[:1500]}; see the server log "
+                                                                     f"{serve_log}"})
+                    await asyncio.to_thread(self._settle_and_record, operator, eid, result,
+                                            stops[0] if stops else None, {"serve_log": serve_log})
                 finally:
                     await adapter.close(eid)
+                if escaped is not None:
+                    raise escaped
 
         asyncio.run(main())
 
@@ -808,6 +925,11 @@ def summarize_trial(engine: Engine, experiment_id: str, *, threshold: float = SU
     return row
 
 
+def _trial_name(row: Mapping[str, Any]) -> str:
+    """The experiment ID, or the run grant of a trial that failed before its experiment existed."""
+    return row["experiment_id"] or f"run {row['run_id']} (no experiment)"
+
+
 def render_trials_markdown(rows: Sequence[Mapping[str, Any]], *, threshold: float = SUCCESS_ACCURACY) -> str:
     """A concise Markdown report of trials: a table, the success count, and every failure cause."""
     closed = [row for row in rows if row["success"] is not None]
@@ -823,16 +945,18 @@ def render_trials_markdown(rows: Sequence[Mapping[str, Any]], *, threshold: floa
         token_text = ("n/a" if tokens["input_tokens"] is None
                       else f"{tokens['input_tokens']}/{tokens['output_tokens']}")
         final = row["final"]
-        final_text = "pending" if final is None else f"{final['candidate_accuracy']:.4f} ({final['control_accuracy']:.4f})"
+        final_text = (("pending" if row["success"] is None else "n/a") if final is None
+                      else f"{final['candidate_accuracy']:.4f} ({final['control_accuracy']:.4f})")
         lower = "" if final is None else f"{final['clopper_pearson_lower']:.4f}"
         elapsed = "" if row["elapsed_seconds"] is None else f"{row['elapsed_seconds']:.1f}"
-        lines.append(f"| {row['experiment_id']} | {row['controller']} | {row['model'] or ''} | {row['policy_id']} | "
-                     f"{row['status']} | {row['candidates']} | {row['evaluated_examples']} | {elapsed} | "
-                     f"{token_text} | {row['changed_fraction']:.4f} | {final_text} | {lower} |")
+        lines.append(f"| {_trial_name(row)} | {row['controller'] or ''} | {row['model'] or ''} | {row['policy_id']} | "
+                     f"{row['status'] or 'not recorded'} | {row['candidates']} | {row['evaluated_examples']} | "
+                     f"{elapsed} | {token_text} | {row['changed_fraction']:.4f} | {final_text} | {lower} |")
     lines += ["", "Termination and failure causes:", ""]
     for row in rows:
         cause = row["failure_cause"] or "success"
-        lines.append(f"- {row['experiment_id']}: {row['status']} ({row['reason']}); {cause}")
+        ending = f"{row['status']} ({row['reason']})" if row["status"] else "no termination record"
+        lines.append(f"- {_trial_name(row)}: {ending}; {cause}")
     unavailable = {reason for row in rows for reason in row["tokens_unavailable"].values()}
     if unavailable:
         lines += ["", "Token counts reported as n/a: " + "; ".join(sorted(unavailable)) + "."]

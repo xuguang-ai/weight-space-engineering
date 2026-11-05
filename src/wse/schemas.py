@@ -1342,6 +1342,30 @@ class OperationsSummary(_Frozen):
     limits: dict[str, int]
 
 
+class ModelSummary(BaseModel):
+    """A registered checkpoint this run may use, without tensor data."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    checkpoint_id: str
+    adapter: ExtensionRef
+    weights_hash: str
+    parameter_count: int
+    tensor_count: int
+    input_description: str
+    output_description: str
+    manifest_uri: str
+
+
+class ModelList(BaseModel):
+    """One page of model summaries; pass ``next_cursor`` back as ``cursor`` for the next page."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    models: list[ModelSummary]
+    next_cursor: str | None
+
+
 class ExperimentDescription(_Frozen):
     """Everything a controller needs to work on an experiment, inline.
 

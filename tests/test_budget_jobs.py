@@ -602,6 +602,42 @@ def test_the_supervisor_keeps_one_worker_running(workspace, engine, base, experi
     assert supervisor.process is None
 
 
+SUPERVISOR_PARENT = """
+import sys, time
+from wse.worker import WorkerSupervisor
+supervisor = WorkerSupervisor(sys.argv[1], extra_args=("--poll-seconds", "0.02")).start()
+print(supervisor.process.pid, flush=True)
+time.sleep(120)
+"""
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_a_supervised_worker_exits_when_its_supervisor_process_dies(workspace, engine):
+    # Like a wse serve process that crashes or is killed: no cleanup runs in the supervisor.
+    parent = subprocess.Popen([sys.executable, "-c", SUPERVISOR_PARENT, str(workspace)], stdout=subprocess.PIPE,
+                              text=True)
+    worker_pid = None
+    try:
+        worker_pid = int(parent.stdout.readline())
+        assert _alive(worker_pid)
+        parent.kill()
+        parent.wait(timeout=30)
+        _wait_for(lambda: not _alive(worker_pid), timeout=15)
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait(timeout=30)
+        if worker_pid is not None and _alive(worker_pid):
+            os.kill(worker_pid, signal.SIGKILL)
+
+
 def test_a_worker_process_never_runs_forward_in_weights_only_mode(workspace, engine, base, processes, tmp_path):
     log = tmp_path / "forward.log"
     experiment = _experiment(engine, base, WEIGHTS_ONLY_POLICY_ID)

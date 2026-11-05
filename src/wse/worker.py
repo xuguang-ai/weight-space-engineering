@@ -15,6 +15,11 @@ code: it runs registered evaluators over registered adapters only.
 * **Leases and heartbeats.** A monitor thread renews the job's lease, records
   progress, and watches for cancellation and the time limit. A worker that
   dies stops renewing; its job is then settled as lost by crash recovery.
+* **Supervision.** A worker started by ``WorkerSupervisor`` (the job
+  scheduler of ``wse serve`` or of the runner) is given its supervisor's
+  process ID and stops, after its current job, once that process is no longer
+  its parent: a supervisor that dies without cleanup (a crash, SIGKILL)
+  leaves no orphan worker behind to claim later runs' jobs.
 * **Stopping.** Cancellation and the time limit (``seconds_per_operation``,
   capped by the remaining compute budget, as reserved) stop a job at its next
   forward call or ``forward.check()``. A job that does not yield within the
@@ -189,6 +194,7 @@ class Worker:
         cancel_grace_seconds: float = DEFAULT_CANCEL_GRACE_SECONDS,
         timeout_grace_seconds: float = DEFAULT_TIMEOUT_GRACE_SECONDS,
         hard_exit: Callable[[int], Any] = os._exit,
+        parent_pid: int | None = None,
     ) -> None:
         from wse.api import Engine
 
@@ -202,6 +208,7 @@ class Worker:
         self.cancel_grace_seconds = float(cancel_grace_seconds)
         self.timeout_grace_seconds = float(timeout_grace_seconds)
         self.hard_exit = hard_exit
+        self.parent_pid = parent_pid
         self._stop = threading.Event()
 
     def close(self) -> None:
@@ -223,6 +230,10 @@ class Worker:
         """Process jobs until stopped; return the number of jobs run."""
         count, idle_since = 0, time.monotonic()
         while not self._stop.is_set():
+            if self.parent_pid is not None and os.getppid() != self.parent_pid:
+                print(f"wse worker: supervisor process {self.parent_pid} is gone; stopping", file=sys.stderr,
+                      flush=True)
+                break
             if self.run_once() is not None:
                 count += 1
                 idle_since = time.monotonic()
@@ -433,6 +444,8 @@ class WorkerSupervisor:
     A worker that exits (a hard stop or a crash) is replaced after
     ``restart_delay_seconds``. ``stop`` terminates the current worker, which
     finishes its current job first, and kills it after ``stop_timeout``.
+    Each worker is told this process's ID and stops by itself if this process
+    dies without calling ``stop``.
     """
 
     def __init__(self, workspace: str | Path, *, extra_args: Sequence[str] = (), env: Mapping[str, str] | None = None,
@@ -447,9 +460,12 @@ class WorkerSupervisor:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
+    def _spawn(self) -> subprocess.Popen:
+        return spawn_worker(self.workspace, "--parent-pid", str(os.getpid()), *self.extra_args, env=self.env)
+
     def start(self) -> WorkerSupervisor:
         self._stop.clear()
-        self.process = spawn_worker(self.workspace, *self.extra_args, env=self.env)
+        self.process = self._spawn()
         self._thread = threading.Thread(target=self._watch, daemon=True, name="wse-worker-supervisor")
         self._thread.start()
         return self
@@ -460,7 +476,7 @@ class WorkerSupervisor:
                 if self._stop.wait(self.restart_delay_seconds):
                     return
                 self.restarts += 1
-                self.process = spawn_worker(self.workspace, *self.extra_args, env=self.env)
+                self.process = self._spawn()
 
     def stop(self, stop_timeout: float = 30.0) -> None:
         self._stop.set()
@@ -502,6 +518,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--timeout-grace-seconds", type=float, default=DEFAULT_TIMEOUT_GRACE_SECONDS)
     parser.add_argument("--max-jobs", type=int, default=None)
     parser.add_argument("--idle-exit-seconds", type=float, default=None)
+    parser.add_argument("--parent-pid", type=int, default=None,
+                        help="stop (after the current job) once this process is no longer the worker's parent")
     args = parser.parse_args(argv)
 
     from wse.registry import builtin_registry
@@ -512,7 +530,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     worker = Worker(args.workspace, registry=registry, lease_seconds=args.lease_seconds,
                     heartbeat_seconds=args.heartbeat_seconds, poll_seconds=args.poll_seconds,
                     cancel_grace_seconds=args.cancel_grace_seconds,
-                    timeout_grace_seconds=args.timeout_grace_seconds)
+                    timeout_grace_seconds=args.timeout_grace_seconds, parent_pid=args.parent_pid)
     previous = {}
     if threading.current_thread() is threading.main_thread():
         for signum in (signal.SIGTERM, signal.SIGINT):

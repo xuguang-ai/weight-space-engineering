@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -40,7 +40,9 @@ from wse.schemas import (
     Management,
     MaterializedPatch,
     ModelIdentity,
+    ModelList,
     ModelManifest,
+    ModelSummary,
     TensorDiff,
     Usage,
     WSEError,
@@ -183,6 +185,37 @@ class EvaluationResult:
     truncation_count: int
     elapsed_seconds: float
     management: Management = "unmanaged"
+
+
+MODEL_PAGE_SIZE = 50
+
+
+def manifest_uri(checkpoint_id: str) -> str:
+    """The ``wse://`` resource URI of a checkpoint's manifest."""
+    return f"wse://models/{checkpoint_id}/manifest"
+
+
+def model_list_page(manifests: Sequence[ModelManifest], cursor: Any = None) -> ModelList:
+    """One page of model summaries (the result of ``wse_list_models``, also for stepwise strategies).
+
+    ``cursor`` is omitted for the first page, or the ``next_cursor`` of the
+    previous page.
+    """
+    if cursor in (None, ""):
+        offset = 0
+    elif isinstance(cursor, str) and cursor.startswith("models:") and cursor[7:].isdigit():
+        offset = int(cursor[7:])
+    else:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, f"cursor {cursor!r} was not returned by wse_list_models; omit it "
+                       "to start from the first page")
+    page = manifests[offset:offset + MODEL_PAGE_SIZE]
+    models = [ModelSummary(checkpoint_id=m.checkpoint_id, adapter=m.adapter, weights_hash=m.weights_hash,
+                           parameter_count=m.parameter_count, tensor_count=len(m.tensors),
+                           input_description=m.input_semantics.description,
+                           output_description=m.output_semantics.description,
+                           manifest_uri=manifest_uri(m.checkpoint_id)) for m in page]
+    more = offset + MODEL_PAGE_SIZE < len(manifests)
+    return ModelList(models=models, next_cursor=f"models:{offset + MODEL_PAGE_SIZE}" if more else None)
 
 
 def _resolve_adapter(registry: Registry, adapter: str | ExtensionRef) -> tuple[ExtensionRef, ModelAdapter]:
@@ -764,8 +797,10 @@ class Engine:
     def read_tensor_slice(self, checkpoint_id: str, tensor: str, selection: Any) -> TensorSlice:
         """Bounded read of an exact-name tensor region, serialized for responses.
 
-        At most 2,048 elements and 32 KiB of canonical JSON; oversized requests
-        fail with the largest permitted selection.
+        At most 2,048 elements, and canonical JSON within ``max_inline_json_bytes``
+        less the 1 KiB response envelope (31 KiB under the default policy; see
+        ``wse.policy``); oversized requests fail with the largest permitted
+        selection.
         """
         self._require_unbound("read_tensor_slice")
         return self._bounded_read(checkpoint_id, tensor, selection)[0]

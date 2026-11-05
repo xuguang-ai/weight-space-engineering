@@ -12,14 +12,17 @@ reaches the experiment only through the run-bound executor.
 from __future__ import annotations
 
 import json
+import os
 import re
+import signal
 
 import pytest
 from test_mcp_e2e import FAULT_DESCRIPTIONS, FINAL_SEED, _final_secrets
 
 from wse.api import Engine
 from wse.cli import main as cli_main
-from wse.policy import SMALL_MODEL_POLICY_ID, WEIGHTS_ONLY_POLICY_ID, builtin_experiment_policies
+from wse.policy import SMALL_MODEL_POLICY_ID, WEIGHTS_ONLY_POLICY_ID, ExperimentPolicy, builtin_experiment_policies
+from wse.registry import builtin_registry
 from wse.runner import (
     EVALUATION_TOOLS,
     ExperimentExecutor,
@@ -30,7 +33,7 @@ from wse.runner import (
     serve_environment,
     summarize_trial,
 )
-from wse.schemas import ErrorCode, TaskDefinition, WSEError
+from wse.schemas import BudgetEntry, ErrorCode, TaskDefinition, WSEError
 from wse.strategies.base import Action
 
 FAST_WORKER = ["--poll-seconds", "0.02"]
@@ -337,8 +340,6 @@ class FailingStrategy:
 
 
 def test_a_failing_controller_is_recorded_and_its_experiment_still_frozen(engine, workspace, prepared):
-    from wse.registry import builtin_registry
-
     registry = builtin_registry()
     registry.register("strategy", "failing", "1", FailingStrategy)
     run_id = _grant(engine, prepared, WEIGHTS_ONLY_POLICY_ID)
@@ -348,3 +349,200 @@ def test_a_failing_controller_is_recorded_and_its_experiment_still_frozen(engine
     result = runner.last_result["result"]
     assert result["status"] == "error" and "strategy bug" in result["reason"]
     assert engine.get_experiment(eid).state == "FROZEN"
+
+
+# -- stops before an unaffordable action, repeated denials, and operator interrupts --------------------------------
+
+
+def _experiment_of(engine, run_id):
+    row = engine.store.db.conn.execute("SELECT experiment_id FROM experiments WHERE run_id = ?", (run_id,)).fetchone()
+    return row["experiment_id"]
+
+
+def _tool_calls(engine, eid):
+    rows = engine.store.db.conn.execute("SELECT payload FROM controller_events WHERE experiment_id = ? AND "
+                                        "kind = 'tool_call' ORDER BY seq", (eid,)).fetchall()
+    return [json.loads(row["payload"])["tool"] for row in rows]
+
+
+class ScriptStrategy:
+    """Plays a fixed list of steps: ``read`` (one row of W1), ``deny`` (a tool outside the allow-list), ``describe``."""
+
+    strategy_id, version = "script", "1"
+
+    def __init__(self, steps, checkpoint_id=None):
+        self.steps, self.checkpoint_id, self.calls = list(steps), checkpoint_id, 0
+
+    def config(self):
+        return {"steps": self.steps}
+
+    def next_action(self, objective, observations, remaining_budget):
+        step = self.steps[min(self.calls, len(self.steps) - 1)]
+        self.calls += 1
+        eid = observations[0].arguments["experiment_id"]
+        if step == "read":
+            return Action.call("wse_read_tensor", "Read one row.", experiment_id=eid, checkpoint_id=self.checkpoint_id,
+                               tensor="layers.0.weight", selection=[{"start": 0, "stop": 1, "step": 1},
+                                                                    {"start": 0, "stop": 2, "step": 1}])
+        if step == "deny":
+            return Action.call("wse_create_experiment", "Not permitted for a controller.", run_id="run_x")
+        return Action.call("wse_get_experiment", "Read the experiment.", experiment_id=eid)
+
+
+def _script_runner(workspace):
+    registry = builtin_registry()
+    registry.register("strategy", "script", "1", ScriptStrategy)
+    return ReferenceRunner(workspace, registry=registry, worker_args=FAST_WORKER)
+
+
+def _budget(**remaining):
+    full = {"patch_previews": 50, "candidate_commits": 5, "tensor_read_calls": 20, "analysis_calls": 20,
+            "evaluation_batches": 10, "evaluated_examples": 1000, "compute_seconds": 60.0}
+    full.update(remaining)
+    return {name: BudgetEntry(limit=100, consumed=100 - value, remaining=value) for name, value in full.items()}
+
+
+def test_the_action_shortfall_names_the_counter_the_next_action_cannot_afford():
+    from wse.runner import _action_shortfall
+
+    preview = Action.call("wse_preview_patch", experiment_id="e", patch_spec={}, idempotency_key="k")
+    apply = Action.call("wse_apply_patch", experiment_id="e", patch_id="p", idempotency_key="k")
+    read = Action.call("wse_read_tensor", experiment_id="e")
+    analyze = Action.call("wse_analyze", experiment_id="e")
+    evaluate = Action.call("wse_submit_evaluation", experiment_id="e", eval_config={"sample_count": 64, "seed": 0})
+    wait = Action.call("wse_get_job", experiment_id="e", job_id="j")
+    for action in (preview, apply, read, analyze, evaluate, wait):
+        assert _action_shortfall(action, _budget()) is None
+    assert "needs patch_previews" in _action_shortfall(preview, _budget(patch_previews=0))
+    assert "needs candidate_commits" in _action_shortfall(apply, _budget(candidate_commits=0))
+    assert "needs tensor_read_calls" in _action_shortfall(read, _budget(tensor_read_calls=0))
+    assert "needs analysis_calls" in _action_shortfall(analyze, _budget(analysis_calls=0))
+    assert "needs evaluation_batches" in _action_shortfall(evaluate, _budget(evaluation_batches=0))
+    assert "needs evaluated_examples" in _action_shortfall(evaluate, _budget(evaluated_examples=63))
+    assert _action_shortfall(evaluate, _budget(evaluated_examples=64)) is None
+    for action in (preview, apply, read, analyze, evaluate):  # every metered operation needs computation time
+        assert "needs compute_seconds" in _action_shortfall(action, _budget(compute_seconds=0))
+    assert _action_shortfall(wait, _budget(compute_seconds=0)) is None
+    assert _action_shortfall(Action.call("wse_list_models"), _budget(tensor_read_calls=0, compute_seconds=0)) is None
+
+
+def test_a_strategy_stops_before_an_action_its_budget_cannot_cover(engine, workspace, prepared):
+    tight = ExperimentPolicy.model_validate({"policy_id": "small_model_one_read_v1", "mode": "bounded_eval",
+                                             "budget": {"tensor_read_calls": 1}})
+    engine.register_policy(tight)
+    run_id = _grant(engine, prepared, tight.policy_id)
+    runner = _script_runner(workspace)
+    eid = runner.run_experiment(run_id, prepared["task_id"], tight.policy_id, {
+        "kind": "strategy", "strategy": "script@1",
+        "parameters": {"steps": ["read", "read"], "checkpoint_id": prepared["task_checkpoint_id"]}})
+    result = runner.last_result["result"]
+    assert result["status"] == "stopped"
+    assert result["stop_condition"] == ("insufficient_budget: wse_read_tensor needs tensor_read_calls, which has 0 "
+                                        "remaining")
+    # The unaffordable read was never sent: no BUDGET_EXCEEDED attempt, one read charged.
+    assert _tool_calls(engine, eid) == ["wse_get_experiment", "wse_read_tensor"]
+    experiment = engine.get_experiment(eid)
+    assert experiment.budget["tensor_read_calls"].consumed == 1 and experiment.state == "FROZEN"
+
+
+def test_three_consecutive_policy_denials_stop_the_run_and_a_success_resets_the_count(engine, workspace, prepared):
+    run_id = _grant(engine, prepared)
+    runner = _script_runner(workspace)
+    eid = runner.run_experiment(run_id, prepared["task_id"], SMALL_MODEL_POLICY_ID, {
+        "kind": "strategy", "strategy": "script@1",
+        "parameters": {"steps": ["deny", "deny", "describe", "deny", "deny", "deny", "deny"]}})
+    result = runner.last_result["result"]
+    assert result["status"] == "stopped"
+    assert result["stop_condition"] == ("repeated_policy_denials: 3 consecutive operations were denied by the "
+                                        "policy")
+    # Two denials, a success that resets the count, then three denials: the run stops after the third.
+    assert _tool_calls(engine, eid) == ["wse_get_experiment", "wse_create_experiment", "wse_create_experiment",
+                                        "wse_get_experiment", "wse_create_experiment", "wse_create_experiment",
+                                        "wse_create_experiment"]
+    assert engine.get_experiment(eid).state == "FROZEN"
+
+
+class InterruptingStrategy:
+    """Stands in for the operator's Ctrl-C: sends SIGINT to this process during its second step."""
+
+    strategy_id, version = "interrupting", "1"
+
+    def __init__(self):
+        self.calls = 0
+
+    def config(self):
+        return {}
+
+    def next_action(self, objective, observations, remaining_budget):
+        self.calls += 1
+        if self.calls == 2:
+            os.kill(os.getpid(), signal.SIGINT)
+        eid = observations[0].arguments["experiment_id"]
+        return Action.call("wse_get_experiment", "Read the experiment again.", experiment_id=eid)
+
+
+def test_an_operator_interrupt_stops_the_strategy_and_the_trial_is_still_settled_and_frozen(engine, workspace,
+                                                                                            prepared):
+    registry = builtin_registry()
+    registry.register("strategy", "interrupting", "1", InterruptingStrategy)
+    run_id = _grant(engine, prepared)
+    handler = signal.getsignal(signal.SIGINT)
+    runner = ReferenceRunner(workspace, registry=registry, worker_args=FAST_WORKER)
+    with pytest.raises(KeyboardInterrupt):  # the interrupt reaches the caller after finalization
+        runner.run_experiment(run_id, prepared["task_id"], SMALL_MODEL_POLICY_ID,
+                              {"kind": "strategy", "strategy": "interrupting@1"})
+    assert signal.getsignal(signal.SIGINT) is handler
+    eid = _experiment_of(engine, run_id)
+    experiment = engine.get_experiment(eid)
+    assert experiment.state == "FROZEN" and not [job for job in engine.list_jobs(eid) if not job.terminal]
+    result = runner.last_result["result"]
+    assert result["status"] == "cancelled" and result["stop_condition"].startswith("operator_interrupt")
+    assert result["finalization"]["state"] == "FROZEN"
+    # The action proposed after the interrupt was not executed.
+    assert _tool_calls(engine, eid) == ["wse_get_experiment", "wse_get_experiment"]
+
+
+def test_a_runner_side_failure_during_a_strategy_run_still_settles_freezes_and_records(engine, workspace, prepared,
+                                                                                      monkeypatch):
+    original = ExperimentExecutor.execute
+    calls = []
+
+    def flaky(self, action):
+        calls.append(action.tool)
+        if len(calls) == 2:
+            raise RuntimeError("database connection lost")
+        return original(self, action)
+
+    monkeypatch.setattr(ExperimentExecutor, "execute", flaky)
+    run_id = _grant(engine, prepared)
+    runner = _script_runner(workspace)
+    eid = runner.run_experiment(run_id, prepared["task_id"], SMALL_MODEL_POLICY_ID, {
+        "kind": "strategy", "strategy": "script@1", "parameters": {"steps": ["describe"]}})
+    result = runner.last_result["result"]
+    assert result["status"] == "error" and "RuntimeError: database connection lost" in result["reason"]
+    assert engine.get_experiment(eid).state == "FROZEN" and result["finalization"]["state"] == "FROZEN"
+
+
+# -- the executor and the MCP tools return the same results --------------------------------------------------------
+
+
+def test_the_executor_returns_the_results_of_the_matching_mcp_tools(engine, workspace, prepared):
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from wse.mcp_server import WSEMCPServer
+
+    run_id = _grant(engine, prepared)
+    with Engine(workspace, run_id=run_id) as bound:
+        eid = bound.create_experiment(run_id, prepared["task_id"], SMALL_MODEL_POLICY_ID, "c").experiment_id
+        executor = ExperimentExecutor(bound, constraint_status="verified")
+        server = WSEMCPServer(bound, constraint_status="verified")
+        for tool, arguments in [("wse_list_models", {}), ("wse_list_models", {"cursor": None}),
+                                ("wse_get_experiment", {"experiment_id": eid})]:
+            observation = executor.execute(Action.call(tool, **arguments))
+            response = getattr(server, tool)(**arguments)
+            assert observation.ok, (tool, observation.error)
+            assert observation.result == response.structured_content["result"], tool
+        bad = executor.execute(Action.call("wse_list_models", cursor="page-2"))
+        with pytest.raises(ToolError) as excinfo:  # returned to the client as an isError result
+            server.wse_list_models(cursor="page-2")
+        assert bad.error == json.loads(str(excinfo.value))["error"]

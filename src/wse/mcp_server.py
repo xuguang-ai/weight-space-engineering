@@ -57,7 +57,8 @@ from mcp.server.mcpserver.exceptions import ResourceError, ResourceNotFoundError
 from mcp_types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema
 
-from wse.api import Engine
+from wse.api import MODEL_PAGE_SIZE, Engine, model_list_page
+from wse.api import manifest_uri as _manifest_uri
 from wse.jobs import MAX_WAIT_SECONDS
 from wse.jobs import _wait_seconds as wait_seconds_value
 from wse.store import ANALYSIS_URI_PREFIX
@@ -70,10 +71,11 @@ from wse.schemas import (
     EvalConfig,
     Experiment,
     ExperimentDescription,
-    ExtensionRef,
     Job,
     ModelInspection,
+    ModelList,
     ModelManifest,
+    ModelSummary,
     PatchPreview,
     PatchSpec,
     TensorSlice,
@@ -83,7 +85,6 @@ from wse.schemas import (
 )
 
 SERVER_NAME = "wse"
-MODEL_PAGE_SIZE = 50
 RESOURCE_PAGE_BYTES = 32 * 1024
 PAGE_ENVELOPE_BYTES = 256
 WAIT_POLL_SECONDS = 0.05
@@ -124,30 +125,6 @@ class ToolResponse(BaseModel, Generic[T]):
     uris: list[str]
     usage: ToolUsage | None
     result: T
-
-
-class ModelSummary(BaseModel):
-    """A registered checkpoint this run may use, without tensor data."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    checkpoint_id: str
-    adapter: ExtensionRef
-    weights_hash: str
-    parameter_count: int
-    tensor_count: int
-    input_description: str
-    output_description: str
-    manifest_uri: str
-
-
-class ModelList(BaseModel):
-    """One page of model summaries; pass ``next_cursor`` back as ``cursor`` for the next page."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    models: list[ModelSummary]
-    next_cursor: str | None
 
 
 # ---------------------------------------------------------------------------
@@ -216,25 +193,12 @@ def _respond(response: ToolResponse[Any]) -> CallToolResult:
                           structured_content=structured)
 
 
-def _manifest_uri(checkpoint_id: str) -> str:
-    return f"wse://models/{checkpoint_id}/manifest"
-
-
 def _patch_uri(patch_id: str) -> str:
     return f"wse://patches/{patch_id}"
 
 
 def _report_uri(report_id: str) -> str:
     return f"wse://reports/{report_id}"
-
-
-def _parse_cursor(cursor: Any) -> int:
-    if cursor in (None, ""):
-        return 0
-    if isinstance(cursor, str) and cursor.startswith("models:") and cursor[7:].isdigit():
-        return int(cursor[7:])
-    raise WSEError(ErrorCode.INVALID_ARGUMENT, f"cursor {cursor!r} was not returned by wse_list_models; omit it to "
-                   "start from the first page")
 
 
 def _paged(uri: str, document: BaseModel | dict[str, Any], page: Any) -> str:
@@ -370,19 +334,11 @@ class WSEMCPServer:
     ) -> Annotated[CallToolResult, ToolResponse[ModelList]]:
         """List the registered checkpoints this run may use (no filesystem paths are scanned)."""
         def run() -> ToolResponse[ModelList]:
-            offset = _parse_cursor(cursor)
             manifests = self.engine.list_models()
-            page = manifests[offset:offset + MODEL_PAGE_SIZE]
-            models = [ModelSummary(checkpoint_id=m.checkpoint_id, adapter=m.adapter, weights_hash=m.weights_hash,
-                                   parameter_count=m.parameter_count, tensor_count=len(m.tensors),
-                                   input_description=m.input_semantics.description,
-                                   output_description=m.output_semantics.description,
-                                   manifest_uri=_manifest_uri(m.checkpoint_id)) for m in page]
-            more = offset + MODEL_PAGE_SIZE < len(manifests)
+            page = model_list_page(manifests, cursor)
             return ToolResponse[ModelList](
-                summary=f"{len(models)} of {len(manifests)} models", uris=[m.manifest_uri for m in models],
-                usage=None, result=ModelList(models=models,
-                                             next_cursor=f"models:{offset + MODEL_PAGE_SIZE}" if more else None))
+                summary=f"{len(page.models)} of {len(manifests)} models", uris=[m.manifest_uri for m in page.models],
+                usage=None, result=page)
         return _respond(self._call(run))
 
     def wse_create_experiment(self, run_id: IdArg, task_id: IdArg, policy_id: IdArg, idempotency_key: KeyArg,

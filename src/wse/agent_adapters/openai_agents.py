@@ -55,6 +55,7 @@ from wse.agent_adapters.base import (
     AgentUsage,
     EventSink,
     RunConnection,
+    describe_exception,
 )
 from wse.schemas import ErrorCode, WSEError, content_hash
 
@@ -240,7 +241,7 @@ class OpenAIAgentsAdapter(AgentAdapter):
             if missing:
                 raise WSEError(ErrorCode.NOT_FOUND, f"the WSE server does not offer the allowed tools {missing}")
         except Exception as exc:  # noqa: BLE001 - every connection failure is reported by run()
-            session.connect_error = f"{type(exc).__name__}: {exc}"[:2000]
+            session.connect_error = describe_exception(exc)
             await self._cleanup(session)
 
     async def close(self, experiment_id: str) -> None:
@@ -376,7 +377,7 @@ class OpenAIAgentsAdapter(AgentAdapter):
             except MaxTurnsExceeded as exc:
                 status, reason = "max_turns", f"the SDK turn limit of {agent_config.max_turns} was reached: {exc}"
             except Exception as exc:  # noqa: BLE001 - every SDK failure becomes a termination record
-                status, reason = "error", f"{type(exc).__name__}: {exc}"[:2000]
+                status, reason = "error", describe_exception(exc)
             else:
                 status, reason = "completed", "the agent stopped voluntarily"
                 final_message = None if result.final_output is None else str(result.final_output)

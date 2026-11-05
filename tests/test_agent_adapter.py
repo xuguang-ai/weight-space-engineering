@@ -14,9 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import socket
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -73,9 +76,11 @@ class ToolModel(Model):
     """A fake SDK model that plays a script of tool calls, messages, and sleeps.
 
     Each step is ``("call", tool, arguments)`` (``arguments`` may be a
-    function of the previous tool output), ``("say", text)``, or
-    ``("sleep", seconds)``. After the script, it keeps repeating its last
-    step. It records the instructions and tools of every request.
+    function of the previous tool output), ``("say", text)``,
+    ``("sleep", seconds)``, or ``("interrupt", seconds)`` (SIGINT to this
+    process, as from the operator's Ctrl-C, then a sleep). After the script,
+    it keeps repeating its last step. It records the instructions and tools
+    of every request.
     """
 
     provider_name = "test-double"
@@ -97,7 +102,9 @@ class ToolModel(Model):
         self.outputs.append(last)
         step = self.script[min(self.calls, len(self.script) - 1)]
         self.calls += 1
-        if step[0] == "sleep":
+        if step[0] in ("sleep", "interrupt"):
+            if step[0] == "interrupt":  # stands in for the operator's Ctrl-C while the model is working
+                os.kill(os.getpid(), signal.SIGINT)
             await asyncio.sleep(step[1])
             step = ("say", "done")
         if step[0] == "say":
@@ -326,6 +333,53 @@ def test_a_connection_failure_is_reported_and_the_experiment_is_still_finalized(
         "input_tokens"]
     experiment = engine.get_experiment(eid)
     assert experiment.state == "FROZEN" and experiment.selected_checkpoint_id == experiment.base_checkpoint_id
+
+
+def test_a_connection_failure_names_its_cause_and_points_to_the_server_log(engine, workspace, prepared, monkeypatch):
+    original = ReferenceRunner.connection
+
+    def unloadable(self, *args, **kwargs):  # the server exits at startup: its setup hook cannot be imported
+        connection = original(self, *args, **kwargs)
+        return connection.model_copy(update={"serve_command": [*connection.serve_command, "--setup",
+                                                               "wse_no_such_module:setup"]})
+
+    monkeypatch.setattr(ReferenceRunner, "connection", unloadable)
+    never = lambda eid: ToolModel([("say", "unreachable")])  # noqa: E731
+    eid, record, made = _agent_run(engine, workspace, prepared, never, connect_timeout_seconds=20)
+    result = record["result"]
+    assert result["status"] == "connection_failed" and made["model"].calls == 0
+    log = Path(result["serve_log"])
+    assert log.name == f"serve-{engine.get_experiment(eid).run_id}.log"
+    assert "ModuleNotFoundError: No module named 'wse_no_such_module'" in log.read_text()
+    # The reason names the underlying failure, not only an exception group, and where the server's log is.
+    assert f"see the server log {log}" in result["reason"]
+    assert "unhandled errors in a TaskGroup" not in result["reason"].split(";")[0]
+    assert engine.get_experiment(eid).state == "FROZEN"
+
+
+def test_an_operator_interrupt_cancels_the_sdk_loop_and_the_trial_is_still_frozen(engine, workspace, prepared):
+    run_id = engine.grant_run(prepared["task_id"], SMALL_MODEL_POLICY_ID, prepared["task_checkpoint_id"]).run_id
+    made: dict[str, Any] = {}
+
+    def factory(config, eid):
+        made["model"] = ToolModel([("call", "wse_get_experiment", {"experiment_id": eid}), ("interrupt", 60)])
+        made["adapter"] = OpenAIAgentsAdapter(model=made["model"])
+        return made["adapter"]
+
+    runner = _runner(workspace, factory)
+    handler = signal.getsignal(signal.SIGINT)
+    started = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):  # the interrupt reaches the caller after finalization
+        runner.run_experiment(run_id, prepared["task_id"], SMALL_MODEL_POLICY_ID, {"model": "test-double"})
+    assert time.monotonic() - started < 45  # the model's 60 s sleep was cancelled
+    assert signal.getsignal(signal.SIGINT) is handler
+    row = engine.store.db.conn.execute("SELECT experiment_id FROM experiments WHERE run_id = ?", (run_id,)).fetchone()
+    experiment = engine.get_experiment(row["experiment_id"])
+    assert experiment.state == "FROZEN" and not [job for job in engine.list_jobs(experiment.experiment_id)
+                                                 if not job.terminal]
+    result = runner.last_result["result"]
+    assert result["status"] == "cancelled" and result["stop_condition"].startswith("operator_interrupt")
+    assert result["finalization"]["state"] == "FROZEN" and made["model"].calls == 2
 
 
 def test_sdk_completion_alone_does_not_freeze_or_close_an_experiment(engine, workspace, prepared):

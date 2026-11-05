@@ -10,6 +10,13 @@ excluded), replays each export in a clean workspace to confirm
 byte-identical weights, and writes ``OUT/reports/LABEL.json`` and
 ``OUT/reports/LABEL.md``.
 
+A trial that raises is reported with its error and counts as unsuccessful;
+the remaining trials still run. Ctrl-C stops the running trial (the runner
+settles and freezes it first), starts no further trial, and still
+final-evaluates and reports the frozen ones; press it again to abort at
+once. The exit status is 0, 1 if any trial or step failed, or 130 after an
+interrupt.
+
 Offline (no model, no network):
 
     uv run --no-sync python examples/signed_sum/run_trials.py OUT --label scripted
@@ -42,6 +49,30 @@ def _fixture():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _error_text(exc: BaseException) -> str:
+    from wse.schemas import WSEError
+
+    if isinstance(exc, WSEError):
+        return f"{exc.code.value}: {exc.message}"
+    return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+
+
+def _joined(first: str | None, second: str) -> str:
+    return second if first is None else f"{first}; {second}"
+
+
+def _unstarted_row(trial: dict, args: argparse.Namespace) -> dict:
+    """The report row of a trial that failed before its experiment existed."""
+    return {"experiment_id": None, "run_id": trial["run_id"], "policy_id": args.policy, "mode": None, "state": None,
+            "controller": None, "model": args.model, "status": "error", "reason": trial["error"],
+            "stop_condition": None, "candidates": 0, "evaluated_examples": 0, "compute_seconds": 0.0,
+            "elapsed_seconds": None, "turns": None, "tool_calls": None,
+            "tokens": {"input_tokens": None, "output_tokens": None, "total_tokens": None},
+            "tokens_unavailable": {}, "changed_elements": 0, "parameter_count": None, "changed_fraction": 0.0,
+            "constraint_status": None, "tracing": None, "final": None, "success": False,
+            "failure_cause": f"the trial failed before its experiment was created: {trial['error']}"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -79,33 +110,69 @@ def main(argv: list[str] | None = None) -> int:
     else:
         config = {"kind": "agent", "model": args.model, "max_turns": args.max_turns,
                   "wall_clock_seconds": args.wall_clock_seconds}
-    experiments = []
+    trials: list[dict] = []
+    interrupted = False
     for number, run_id in enumerate(grants, 1):
         runner = ReferenceRunner(workspace, log_dir=args.out / "logs")
-        experiment_id = runner.run_experiment(run_id, ids["task_id"], args.policy, config)
-        result = runner.last_result["result"]
-        print(f"trial {number}/{len(grants)}: {experiment_id} {result['status']} ({result['reason']})", file=sys.stderr)
-        experiments.append(experiment_id)
-    # Final evaluations only after every trial has frozen.
+        trial = {"trial": number, "run_id": run_id, "experiment_id": None, "error": None}
+        trials.append(trial)
+        try:
+            runner.run_experiment(run_id, ids["task_id"], args.policy, config)
+        except KeyboardInterrupt as exc:
+            trial["error"], interrupted = _error_text(exc), True
+        except Exception as exc:  # noqa: BLE001 - one failed trial must not lose the other trials' reports
+            trial["error"] = _error_text(exc)
+        trial["experiment_id"] = runner.last_experiment_id
+        result = (runner.last_result or {}).get("result") or {}
+        ending = f"{result['status']} ({result['reason']})" if result else "no termination record"
+        print(f"trial {number}/{len(grants)}: {trial['experiment_id'] or 'no experiment'} {ending}"
+              + (f"; {trial['error']}" if trial["error"] else ""), file=sys.stderr)
+        if interrupted:
+            print("interrupted: no further trial starts; final-evaluating and reporting the frozen trials (press "
+                  "Ctrl-C again to abort)", file=sys.stderr)
+            break
+    # Final evaluations only after every trial has frozen (or failed).
+    rows = []
+    replays = {}
     with Engine(workspace) as engine:
-        for experiment_id in experiments:
-            engine.final_evaluate(experiment_id)
-        rows = [summarize_trial(engine, experiment_id) for experiment_id in experiments]
-        replays = {}
-        for experiment_id in experiments:
-            target = exports / experiment_id
-            engine.export_experiment(experiment_id, target)
-            with Engine(args.out / "replay" / experiment_id) as clean:
-                replays[experiment_id] = clean.replay_export(target).all_identical
-    for row in rows:
-        row["replay_identical"] = replays[row["experiment_id"]]
+        for trial in trials:
+            eid = trial["experiment_id"]
+            if eid is not None and engine.get_experiment(eid).state == "FROZEN":
+                try:
+                    engine.final_evaluate(eid)
+                except Exception as exc:  # noqa: BLE001
+                    trial["error"] = _joined(trial["error"], f"final evaluation: {_error_text(exc)}")
+        for trial in trials:
+            eid = trial["experiment_id"]
+            row = summarize_trial(engine, eid) if eid is not None else _unstarted_row(trial, args)
+            row["trial"], row["replay_identical"] = trial["trial"], None
+            if row["state"] == "CLOSED":
+                try:
+                    target = exports / eid
+                    engine.export_experiment(eid, target)
+                    with Engine(args.out / "replay" / eid) as clean:
+                        row["replay_identical"] = replays[eid] = clean.replay_export(target).all_identical
+                except Exception as exc:  # noqa: BLE001
+                    trial["error"] = _joined(trial["error"], f"export or replay: {_error_text(exc)}")
+            row["error"] = trial["error"]
+            if row["error"] is not None and row["success"] is None:  # a failed trial is never evaluated later
+                row["success"] = False
+                row["failure_cause"] = row["failure_cause"] or f"the trial did not complete: {row['error']}"
+            rows.append(row)
     reports.mkdir(parents=True, exist_ok=True)
     (reports / f"{args.label}.json").write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    markdown = render_trials_markdown(rows) + "\nExports replayed to byte-identical weights: " + ", ".join(
-        f"{eid}: {'yes' if ok else 'NO'}" for eid, ok in replays.items()) + "\n"
+    markdown = render_trials_markdown(rows) + "\nExports replayed to byte-identical weights: " + (", ".join(
+        f"{eid}: {'yes' if ok else 'NO'}" for eid, ok in replays.items()) or "none") + "\n"
+    failed = [row for row in rows if row["error"] is not None]
+    if failed:
+        markdown += "\nTrial errors:\n\n" + "".join(
+            f"- trial {row['trial']} ({row['experiment_id'] or row['run_id']}): {row['error']}\n" for row in failed)
+    if interrupted:
+        markdown += (f"\nInterrupted by the operator: {len(grants) - len(trials)} of {len(grants)} trials not "
+                     "started.\n")
     (reports / f"{args.label}.md").write_text(markdown, encoding="utf-8")
     sys.stdout.write(markdown)
-    return 0
+    return 130 if interrupted else 1 if failed else 0
 
 
 if __name__ == "__main__":
