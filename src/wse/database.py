@@ -220,6 +220,15 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "CREATE INDEX jobs_experiment ON jobs (experiment_id, created_at)",
         ],
     ),
+    (
+        4,
+        [
+            # The process ID of the local worker holding a job's lease. A restarted
+            # engine settles a job whose worker process no longer exists at once,
+            # without waiting for the lease to expire.
+            "ALTER TABLE jobs ADD COLUMN lease_pid INTEGER",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

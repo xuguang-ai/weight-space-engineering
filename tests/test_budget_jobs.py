@@ -708,3 +708,105 @@ def test_the_cli_runs_the_worker(workspace, engine, base, experiment):
                                    {"sample_count": 64, "seed": 0}, "k1")
     assert main(["--workspace", str(workspace), "worker", "--max-jobs", "1", "--poll-seconds", "0.01"]) == 0
     assert engine.get_job(experiment.experiment_id, job.job_id).state == "succeeded"
+
+
+# -- Task 4 review fixes ---------------------------------------------------------------------
+
+
+def _fully_explained(usage) -> bool:
+    """Every unavailable (None) usage field carries the reason it is unavailable."""
+    fields = [name for name in type(usage).model_fields if name != "unavailable"]
+    return all(getattr(usage, name) is not None or name in usage.unavailable for name in fields)
+
+
+def test_a_reservation_of_an_unfinished_job_cannot_be_settled_directly(workspace, engine, base, experiment):
+    eid = experiment.experiment_id
+    job = engine.submit_evaluation(eid, base.checkpoint_id, DEV, {"sample_count": 64, "seed": 0}, "k1")
+    before = _budget(engine, eid)
+    error = _expect(ErrorCode.VERSION_CONFLICT, engine.settle, job.reservation.reservation_id, {}, "cancelled")
+    assert error.details["job_state"] == "queued"
+    assert _budget(engine, eid) == before
+    with _worker(workspace) as worker:
+        worker.run_once()
+    done = engine.get_job(eid, job.job_id)
+    assert done.state == "succeeded" and done.reservation.charged["model_forward_calls"] == 1
+    assert _budget(engine, eid)["model_forward_calls"] == (1, 0)  # the job's forward call is charged
+
+
+def test_a_queued_job_whose_reservation_is_no_longer_held_never_runs(workspace, engine, base, experiment,
+                                                                       monkeypatch):
+    eid = experiment.experiment_id
+    job = engine.submit_evaluation(eid, base.checkpoint_id, DEV, {"sample_count": 64, "seed": 0}, "k1")
+    with engine.store.db.transaction() as conn:  # state left by an older release or a manual repair
+        conn.execute("UPDATE reservations SET state = 'SETTLED', charged_json = '{}' WHERE reservation_id = ?",
+                     (job.reservation.reservation_id,))
+    from wse.adapters.mlp import MLPAdapter
+
+    calls = []
+    monkeypatch.setattr(MLPAdapter, "forward", lambda self, tensors, inputs: calls.append(1))
+    with _worker(workspace) as worker:
+        assert worker.run_once() is None
+    failed = engine.get_job(eid, job.job_id)
+    assert calls == [] and failed.state == "failed" and failed.error.details["reason"] == "reservation_settled"
+
+
+def test_a_bound_engines_services_cannot_reach_past_its_run(workspace, engine, base, signed_sum):
+    engine.register_suite(_suite(signed_sum, "other_task_dev", task_id="other_task"))
+    mine, other = _experiment(engine, base), _experiment(engine, base)
+    foreign = engine.submit_evaluation(other.experiment_id, base.checkpoint_id, DEV, {"sample_count": 8, "seed": 0},
+                                       "k1")
+    resv = foreign.reservation.reservation_id
+    with Engine(workspace, run_id=mine.run_id) as bound:
+        _expect(ErrorCode.POLICY_DENIED, bound.budget.reserve, mine.experiment_id, "job_" + "e" * 32,
+                {"evaluation_batches": 1})
+        _expect(ErrorCode.POLICY_DENIED, bound.budget.settle, resv, {}, "failed")
+        with pytest.raises(WSEError) as excinfo, bound.store.db.transaction() as conn:
+            bound.budget.settle(resv, {}, "failed", conn=conn)
+        assert excinfo.value.code == ErrorCode.NOT_FOUND
+        with pytest.raises(WSEError) as excinfo, bound.store.db.transaction() as conn:
+            bound.budget.reserve(other.experiment_id, "job_" + "e" * 32, {"evaluation_batches": 1}, conn=conn)
+        assert excinfo.value.code == ErrorCode.NOT_FOUND
+        _expect(ErrorCode.NOT_FOUND, bound.jobs.load_suite, "other_task_dev")
+        assert bound.jobs.load_suite(DEV).suite_id == DEV
+        # A rejected creation naming another run is never written into that run's trace.
+        _expect(ErrorCode.POLICY_DENIED, bound.create_experiment, other.run_id, TASK, SMALL_MODEL_POLICY_ID, "x")
+    assert not [e for e in engine.audit_log(other.experiment_id) if e["event_type"] == "experiment.create.failed"]
+    after = engine.get_job(other.experiment_id, foreign.job_id)
+    assert after.state == "queued" and after.reservation.state == "HELD"
+
+
+def test_a_crashed_workers_job_is_settled_on_restart_before_its_lease_expires(workspace, engine, base, signed_sum,
+                                                                              processes, tmp_path):
+    marker = tmp_path / "first-batch"
+    engine.register_suite(_suite(signed_sum, "blocking_dev", evaluator="slow_batches@1",
+                                 parameters={"sleep_seconds": 60.0, "marker": str(marker)}))
+    experiment = _experiment(engine, base, policy=_tiny_policy())
+    eid = experiment.experiment_id
+    lost = engine.submit_evaluation(eid, base.checkpoint_id, "blocking_dev", {"sample_count": 8, "seed": 0}, "k1")
+    worker = _spawn(processes, workspace, "--lease-seconds", "60")
+    _wait_for(marker.exists)
+    worker.send_signal(signal.SIGKILL)
+    worker.wait(timeout=30)
+    engine.close()
+    with Engine(workspace) as restarted:  # the lease has ~60 s left, but its process is gone
+        failed = restarted.get_job(eid, lost.job_id)
+        assert failed.state == "failed" and failed.error.details["reason"] == "lost"
+        assert failed.reservation.charged == failed.reservation.requested
+        assert _fully_explained(failed.usage) and failed.usage.analysis_calls == 0
+        # New work is accepted and can run at once.
+        nxt = restarted.submit_evaluation(eid, base.checkpoint_id, DEV, {"sample_count": 4, "seed": 0}, "k2")
+        with _worker(workspace) as again:
+            assert again.run_once() == nxt.job_id
+        assert restarted.get_job(eid, nxt.job_id).state == "succeeded"
+
+
+def test_settled_job_usage_explains_every_unavailable_field(workspace, engine, base, experiment):
+    eid = experiment.experiment_id
+    cancelled = engine.cancel_job(eid, engine.submit_evaluation(eid, base.checkpoint_id, DEV,
+                                                                {"sample_count": 8, "seed": 0}, "k1").job_id, "c1")
+    assert cancelled.state == "cancelled" and _fully_explained(cancelled.usage)
+    assert cancelled.usage.artifact_bytes == 0 and "peak_memory_bytes" in cancelled.usage.unavailable
+    done = engine.submit_evaluation(eid, base.checkpoint_id, DEV, {"sample_count": 8, "seed": 0}, "k2")
+    with _worker(workspace) as worker:
+        worker.run_once()
+    assert _fully_explained(engine.get_job(eid, done.job_id).usage)

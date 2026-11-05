@@ -47,6 +47,7 @@ import torch
 
 from wse.audit import record_event
 from wse.database import Database, utc_now
+from wse.jobs import queued_cancel_usage
 from wse.schemas import ErrorCode, EvalConfig, JobProgress, Usage, WSEError, canonical_json
 
 EXIT_HARD_STOP = 70
@@ -236,15 +237,24 @@ class Worker:
             if conn.execute("SELECT 1 FROM jobs WHERE state = 'running' LIMIT 1").fetchone():
                 return None
             row = conn.execute(
-                "SELECT job_id, experiment_id FROM jobs WHERE state = 'queued' ORDER BY created_at, rowid LIMIT 1"
+                "SELECT j.job_id, j.experiment_id, r.state AS reservation_state FROM jobs j "
+                "JOIN reservations r ON r.reservation_id = j.reservation_id "
+                "WHERE j.state = 'queued' ORDER BY j.created_at, j.rowid LIMIT 1"
             ).fetchone()
             if row is None:
+                return None
+            if row["reservation_state"] != "HELD":
+                # Allowance for this job is no longer held, so it must never run.
+                self.jobs.finish(conn, row["job_id"], "failed", queued_cancel_usage(), from_state="queued",
+                                 error=WSEError(ErrorCode.WORKER_FAILED,
+                                                "the job's reservation was settled before it started, so it was "
+                                                "not run", details={"reason": "reservation_settled"}))
                 return None
             now = utc_now()
             conn.execute(
                 "UPDATE jobs SET state = 'running', lease_owner = ?, lease_expires_at = ?, heartbeat_at = ?, "
-                "started_at = ?, attempts = attempts + 1 WHERE job_id = ? AND state = 'queued'",
-                (self.worker_id, time.time() + self.lease_seconds, now, now, row["job_id"]),
+                "started_at = ?, attempts = attempts + 1, lease_pid = ? WHERE job_id = ? AND state = 'queued'",
+                (self.worker_id, time.time() + self.lease_seconds, now, now, os.getpid(), row["job_id"]),
             )
             record_event(conn, "job.started", row["job_id"], {"worker_id": self.worker_id},
                          experiment_id=row["experiment_id"])
@@ -255,7 +265,9 @@ class Worker:
     def _execute(self, row: Any) -> None:
         experiment = self.db.conn.execute("SELECT * FROM experiments WHERE experiment_id = ?",
                                           (row["experiment_id"],)).fetchone()
-        requested = self.jobs.ledger.get(row["reservation_id"]).requested
+        reservation = self.jobs.ledger.get(row["reservation_id"])
+        # Only allowance that is still held may be spent.
+        requested = reservation.requested if reservation.state == "HELD" else {}
         progress = JobProgress.model_validate_json(row["progress_json"])
         limit = float(requested.get("compute_seconds", 0))
         permitted = experiment["mode"] == "bounded_eval" and requested.get("model_forward_calls", 0) > 0

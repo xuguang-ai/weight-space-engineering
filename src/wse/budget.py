@@ -18,7 +18,15 @@ and taken in another:
   ``require`` rejects an operation up front when no compute time remains.
 
 Consumed allowance is never refunded: cancelling or rolling back changes
-nothing that was charged.
+nothing that was charged. A reservation that belongs to a job is settled only
+once that job is terminal (``jobs.finish`` moves the job and settles its
+reservation in one transaction); settling it earlier would release allowance
+that the job still uses.
+
+A ledger bound to a run (the ledger of a run-bound ``Engine``) refuses direct
+reservations and settlements with ``POLICY_DENIED``; the job service of that
+engine still reserves and settles inside its own transactions, and only for
+the run's own experiment.
 """
 
 from __future__ import annotations
@@ -100,10 +108,30 @@ def budget_error(conn: sqlite3.Connection, experiment_id: str, counter: str, amo
 
 
 class BudgetLedger:
-    """Reservations and charges on one workspace database."""
+    """Reservations and charges on one workspace database.
 
-    def __init__(self, db: Database) -> None:
+    ``bound_run_id`` binds the ledger to one run grant: direct calls of
+    ``reserve`` and ``settle`` (without the caller's transaction) are denied,
+    and service calls may touch only that run's experiment.
+    """
+
+    def __init__(self, db: Database, *, bound_run_id: str | None = None) -> None:
         self.db = db
+        self.bound_run_id = bound_run_id
+
+    def _require_unbound(self, action: str) -> None:
+        if self.bound_run_id is not None:
+            raise WSEError(ErrorCode.POLICY_DENIED,
+                           f"{action} is an operator and service action and is not available to a run")
+
+    def _check_scope(self, conn: sqlite3.Connection, experiment_id: Any) -> None:
+        """A bound ledger sees only its run's experiment; others are reported as missing."""
+        if self.bound_run_id is None:
+            return
+        row = conn.execute("SELECT run_id FROM experiments WHERE experiment_id = ?", (experiment_id,)).fetchone()
+        if row is None or row["run_id"] != self.bound_run_id:
+            raise WSEError(ErrorCode.NOT_FOUND, f"experiment {experiment_id!r} does not exist",
+                           details={"experiment_id": str(experiment_id)})
 
     # -- reading --------------------------------------------------------------
 
@@ -211,6 +239,7 @@ class BudgetLedger:
         if not isinstance(job_id, str) or not OBJECT_ID_PATTERNS["job"].fullmatch(job_id):
             raise WSEError(ErrorCode.INVALID_ARGUMENT, "job_id must match job_<32 hex digits>")
         if conn is None:
+            self._require_unbound("reserving budget directly")
             with self.db.transaction() as own:
                 return self._reserve(own, experiment_id, job_id, amounts)
         return self._reserve(conn, experiment_id, job_id, amounts)
@@ -224,6 +253,7 @@ class BudgetLedger:
         if experiment is None:
             raise WSEError(ErrorCode.NOT_FOUND, f"experiment {experiment_id!r} does not exist",
                            details={"experiment_id": str(experiment_id)})
+        self._check_scope(conn, experiment_id)
         existing = conn.execute("SELECT * FROM reservations WHERE job_id = ?", (job_id,)).fetchone()
         if existing is not None:
             if existing["experiment_id"] == experiment_id and json.loads(existing["requested_json"]) == amounts:
@@ -277,13 +307,16 @@ class BudgetLedger:
 
         Each counter is charged ``min(actual, reserved)``. A reservation that
         is already settled is returned unchanged, so settlement never charges
-        twice.
+        twice. A reservation whose job is still queued or running cannot be
+        settled (``VERSION_CONFLICT``): cancel the job instead, and its
+        reservation is settled when the job reaches a terminal state.
         """
         if terminal_state not in TERMINAL_JOB_STATES:
             raise WSEError(ErrorCode.INVALID_ARGUMENT,
                            f"terminal_state must be one of {list(TERMINAL_JOB_STATES)}")
         actual = usage_amounts(actual_usage)
         if conn is None:
+            self._require_unbound("settling a reservation directly")
             with self.db.transaction() as own:
                 return self._settle(own, reservation_id, actual, terminal_state)
         return self._settle(conn, reservation_id, actual, terminal_state)
@@ -291,8 +324,17 @@ class BudgetLedger:
     def _settle(self, conn: sqlite3.Connection, reservation_id: str, actual: dict[str, int | float],
                 terminal_state: str) -> Reservation:
         reservation = self.get(reservation_id, conn)
+        self._check_scope(conn, reservation.experiment_id)
         if reservation.state == "SETTLED":
             return reservation
+        job = conn.execute("SELECT job_id, state FROM jobs WHERE reservation_id = ?", (reservation_id,)).fetchone()
+        if job is not None and job["state"] not in TERMINAL_JOB_STATES:
+            raise WSEError(
+                ErrorCode.VERSION_CONFLICT,
+                f"reservation {reservation_id} belongs to job {job['job_id']}, which is {job['state']}; cancel the "
+                "job or wait for it to finish, and its reservation is settled with the work it executed",
+                details={"reservation_id": reservation_id, "job_id": job["job_id"], "job_state": job["state"]},
+            )
         charged = {counter: _number(min(actual.get(counter, 0), amount))
                    for counter, amount in reservation.requested.items()}
         for counter, amount in reservation.requested.items():

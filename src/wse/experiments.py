@@ -132,7 +132,7 @@ class ExperimentService:
         self.store = engine.store
         self.db = engine.store.db
         self.bound_run_id = bound_run_id
-        self.ledger = BudgetLedger(self.db)
+        self.ledger = BudgetLedger(self.db, bound_run_id=bound_run_id)
         for policy in builtin_experiment_policies().values():
             self._ensure_policy(policy)
         if bound_run_id is not None:
@@ -324,7 +324,8 @@ class ExperimentService:
         """Create the run's single experiment, or return it if it already exists.
 
         A rejected request is recorded against the run's experiment when it
-        exists, and against the run grant otherwise.
+        exists, and against the run grant otherwise. A service bound to
+        another run never writes into that run's experiment trace.
         """
         request_hash = json_hash({"operation": "create_experiment", "run_id": _hashable(run_id),
                                   "task_id": _hashable(task_id), "policy_id": _hashable(policy_id)})
@@ -332,7 +333,8 @@ class ExperimentService:
             return self._create(run_id, task_id, policy_id, key, request_hash)
         except WSEError as exc:
             existing = None
-            if isinstance(run_id, str) and OBJECT_ID_PATTERNS["run"].fullmatch(run_id):
+            if isinstance(run_id, str) and OBJECT_ID_PATTERNS["run"].fullmatch(run_id) \
+                    and self.bound_run_id in (None, run_id):
                 existing = self.db.conn.execute(
                     "SELECT experiment_id FROM experiments WHERE run_id = ?", (run_id,)).fetchone()
             record_failure(self.db, "experiment.create", exc,

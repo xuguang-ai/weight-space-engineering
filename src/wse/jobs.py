@@ -17,16 +17,21 @@ Rules implemented here (Sections 3, 4.1, 4.3, 6.2, and 7.2 of the plan):
   itself, so the worker stops the job and settles the work already executed.
   Cancelling a finished job changes nothing and refunds nothing.
 * A running job holds a lease that its worker renews with heartbeats. A job
-  whose lease expired was lost in a crash: its usage cannot be verified, so it
-  fails with its whole reservation charged and is never rerun automatically.
-  Lost jobs are settled when an engine opens, before a worker claims work, and
-  before new jobs are accepted.
+  whose lease expired, or whose local worker process no longer exists, was
+  lost in a crash: its usage cannot be verified, so it fails with its whole
+  reservation charged and is never rerun automatically. Lost jobs are settled
+  when an engine opens, before a worker claims work, and before new jobs are
+  accepted.
+* Settled usage leaves no field silently empty: counters an evaluation job
+  never uses are 0, and a field that cannot be measured is ``None`` with the
+  reason in ``Usage.unavailable``.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
 import secrets
 import sqlite3
 import time
@@ -71,6 +76,38 @@ def _wait_seconds(value: Any) -> float:
         raise WSEError(ErrorCode.INVALID_ARGUMENT,
                        f"wait_seconds must be a number between 0 and {MAX_WAIT_SECONDS:g}")
     return float(value)
+
+
+def queued_cancel_usage() -> Usage:
+    """Usage of a job cancelled before any worker started it."""
+    return Usage(evaluation_batches=0, evaluated_examples=0, model_forward_calls=0, compute_seconds=0.0,
+                 analysis_calls=0, tensor_read_calls=0, candidate_commits=0, artifact_bytes=0,
+                 peak_memory_bytes=None,
+                 unavailable={"peak_memory_bytes": "no worker executed this job, so no memory was measured"})
+
+
+def lost_job_usage(requested: Mapping[str, Any]) -> Usage:
+    """Usage charged for a lost job: its whole reservation, with unmeasured fields explained."""
+    return Usage.model_validate({
+        "evaluation_batches": 0, "evaluated_examples": 0, "model_forward_calls": 0, "compute_seconds": 0.0,
+        **requested,
+        "analysis_calls": 0, "tensor_read_calls": 0, "candidate_commits": 0, "artifact_bytes": 0,
+        "peak_memory_bytes": None,
+        "unavailable": {"peak_memory_bytes": "the worker was lost before reporting usage"},
+    })
+
+
+def process_exists(pid: Any) -> bool:
+    """Whether a local process with this ID exists (unknown IDs count as existing)."""
+    if not isinstance(pid, int) or pid <= 0:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True  # it exists but belongs to someone else
+    return True
 
 
 def lost_job_error() -> WSEError:
@@ -124,7 +161,16 @@ class JobService:
 
     def get_suite(self, suite_id: Any) -> EvaluationSuite:
         """A registered suite. A run-bound service sees only development suites of its run's task."""
-        suite = self.load_suite(suite_id)
+        return self.load_suite(suite_id)
+
+    def load_suite(self, suite_id: Any, conn: sqlite3.Connection | None = None) -> EvaluationSuite:
+        """A registered suite; a run-bound service sees only development suites of its run's task.
+
+        Final suites and other tasks' suites are reported exactly like missing
+        ones to a run-bound service. The worker and operator use an unbound
+        service, which sees every suite.
+        """
+        suite = self._read_suite(suite_id, conn)
         bound = self.experiments.bound_run_id
         if bound is not None:
             grant = self.experiments._grant_row(bound)
@@ -133,8 +179,8 @@ class JobService:
                                details={"suite_id": str(suite_id)})
         return suite
 
-    def load_suite(self, suite_id: Any, conn: sqlite3.Connection | None = None) -> EvaluationSuite:
-        """Any registered suite, unscoped (service and worker use)."""
+    def _read_suite(self, suite_id: Any, conn: sqlite3.Connection | None = None) -> EvaluationSuite:
+        """Any registered suite, unscoped (internal use)."""
         row = None
         if isinstance(suite_id, str) and len(suite_id) <= 128:
             row = (conn or self.db.conn).execute("SELECT * FROM suites WHERE suite_id = ?", (suite_id,)).fetchone()
@@ -148,7 +194,7 @@ class JobService:
 
     def _development_suite(self, suite_id: Any, task_id: str) -> EvaluationSuite:
         try:
-            suite = self.load_suite(suite_id)
+            suite = self._read_suite(suite_id)
         except WSEError as exc:
             if exc.code != ErrorCode.NOT_FOUND:
                 raise
@@ -331,9 +377,7 @@ class JobService:
             if self.experiments._lookup(conn, experiment_id, key, "cancel_job", request_hash) is None:
                 row = self._job_row(conn, experiment_id, job_id)
                 if row["state"] == "queued":
-                    zero = Usage(evaluation_batches=0, evaluated_examples=0, model_forward_calls=0,
-                                 compute_seconds=0.0, analysis_calls=0, tensor_read_calls=0, candidate_commits=0)
-                    self.finish(conn, job_id, "cancelled", zero, from_state="queued",
+                    self.finish(conn, job_id, "cancelled", queued_cancel_usage(), from_state="queued",
                                 error=WSEError(ErrorCode.WORKER_FAILED, "the job was cancelled before it started; "
                                                "its whole reservation was released",
                                                details={"reason": "cancelled"}))
@@ -372,7 +416,7 @@ class JobService:
         if state not in TERMINAL_JOB_STATES:
             raise WSEError(ErrorCode.INVALID_ARGUMENT, f"{state!r} is not a terminal job state")
         assignments = ["state = ?", "usage_json = ?", "result_json = ?", "error_json = ?", "finished_at = ?",
-                       "lease_owner = NULL", "lease_expires_at = NULL"]
+                       "lease_owner = NULL", "lease_expires_at = NULL", "lease_pid = NULL"]
         values: list[Any] = [state, usage.canonical_json(), canonical_json(result) if result is not None else None,
                              canonical_json(error.to_domain_error().model_dump(mode="json")) if error is not None else None, utc_now()]
         if progress is not None:
@@ -399,26 +443,35 @@ class JobService:
         return True
 
     def recover_lost_jobs(self) -> list[str]:
-        """Settle running jobs whose lease expired: fail them and charge the whole reservation."""
+        """Settle lost running jobs: fail them and charge the whole reservation.
+
+        A running job is lost when its lease expired or when the local worker
+        process holding the lease no longer exists, so a restarted engine
+        settles the job of a crashed worker before it accepts new jobs,
+        without waiting for the lease to expire.
+        """
         now = time.time()
-        candidates = self.db.conn.execute(
-            "SELECT job_id FROM jobs WHERE state = 'running' AND (lease_expires_at IS NULL OR lease_expires_at < ?)",
-            (now,),
+        running = self.db.conn.execute(
+            "SELECT job_id, lease_owner, lease_expires_at, lease_pid FROM jobs WHERE state = 'running'"
         ).fetchall()
+        candidates = []
+        for row in running:
+            if row["lease_expires_at"] is None or row["lease_expires_at"] < now:
+                candidates.append((row["job_id"], {"lease_expired_before": now}))
+            elif row["lease_owner"] is not None and not process_exists(row["lease_pid"]):
+                candidates.append((row["job_id"], {"lease_owner": row["lease_owner"]}))
         if not candidates:
             return []
         lost = []
         with self.db.transaction() as conn:
-            for candidate in candidates:
-                row = conn.execute("SELECT reservation_id FROM jobs WHERE job_id = ?",
-                                   (candidate["job_id"],)).fetchone()
+            for job_id, condition in candidates:
+                row = conn.execute("SELECT reservation_id FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
                 requested = self.ledger.get(row["reservation_id"], conn).requested
-                usage = Usage.model_validate({**requested, "unavailable": {
-                    "peak_memory_bytes": "the worker was lost before reporting usage"}})
-                if self.finish(conn, candidate["job_id"], "failed", usage, error=lost_job_error(),
-                               lease_expired_before=now):
-                    lost.append(candidate["job_id"])
+                if self.finish(conn, job_id, "failed", lost_job_usage(requested), error=lost_job_error(),
+                               **condition):
+                    lost.append(job_id)
         return lost
 
 
-__all__ = ["JobService", "MAX_WAIT_SECONDS", "lost_job_error"]
+__all__ = ["JobService", "MAX_WAIT_SECONDS", "lost_job_error", "lost_job_usage", "process_exists",
+           "queued_cancel_usage"]
