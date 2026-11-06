@@ -132,8 +132,9 @@ path of the `wse serve` log (`serve_log`; the reason of a `connection_failed`
 or `error` ending names the underlying exception and points to that log).
 The normalized trace (`controller_events`) holds tool calls with their
 arguments, tool results with their error codes, sizes, hashes, and bounded
-excerpts, model responses with per-request usage, messages, and stop
-requests. Private
+excerpts, model responses with per-request usage, latency (the SDK's whole
+model call, the client's retries included), and the provider's response and
+request IDs, messages, and stop requests. Private
 reasoning is never requested or stored: reasoning items are counted, not
 kept, and hypotheses are one or two sentences of observable evidence.
 

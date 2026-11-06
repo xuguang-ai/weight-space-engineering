@@ -214,6 +214,8 @@ def test_the_sdk_loop_repairs_through_wse_serve_and_the_runner_settles_and_freez
     assert kinds[0] == "run_started" and kinds[-1] == "run_finished" and "cancel_requested" in kinds
     responses = [event for event in events if event["kind"] == "model_response"]
     assert sum(event["usage"]["input_tokens"] for event in responses) == usage["input_tokens"]
+    # A test double reports no provider IDs; the latency of each model call is still measured.
+    assert all(e["details"]["request_id"] is None and e["details"]["latency_seconds"] >= 0 for e in responses)
     results = [event for event in events if event["kind"] == "tool_result"]
     assert results and all(event["ok"] and event["output_hash"].startswith("sha256:") for event in results)
     assert [e["tool"] for e in events if e["kind"] == "tool_call"] == [e["tool"] for e in results]
@@ -394,7 +396,9 @@ class _ResponsesStub(BaseHTTPRequestHandler):
     """A loopback stand-in for the Responses API: every request gets a final assistant message.
 
     HTTP/1.1 keeps each connection open after its response, as real endpoints
-    do, so the client's connection pool can reuse it.
+    do, so the client's connection pool can reuse it. Each answer comes after
+    ``server.delay_seconds`` and carries an ``x-request-id`` header, as OpenAI
+    and Azure OpenAI responses do.
     """
 
     protocol_version = "HTTP/1.1"
@@ -402,8 +406,9 @@ class _ResponsesStub(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - the http.server hook name
         request = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
         self.server.requests.append((self.path, request.get("model"), self.headers.get("Authorization")))
+        number = len(self.server.requests)
         body = json.dumps({
-            "id": f"resp_{len(self.server.requests)}", "object": "response", "created_at": 0, "status": "completed",
+            "id": f"resp_{number}", "object": "response", "created_at": 0, "status": "completed",
             "model": "stub", "error": None, "incomplete_details": None, "parallel_tool_calls": True,
             "tool_choice": "auto", "tools": [],
             "output": [{"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
@@ -411,9 +416,11 @@ class _ResponsesStub(BaseHTTPRequestHandler):
             "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12,
                       "input_tokens_details": {"cached_tokens": 0}, "output_tokens_details": {"reasoning_tokens": 0}},
         }).encode()
+        time.sleep(self.server.delay_seconds)
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("x-request-id", f"req_{number}")
         self.end_headers()
         self.wfile.write(body)
 
@@ -427,6 +434,7 @@ def responses_endpoint(offline, monkeypatch):
     server = ThreadingHTTPServer(("127.0.0.1", 0), _ResponsesStub)
     server.block_on_close = False  # a connection the client keeps open must not hold up shutdown
     server.requests = []
+    server.delay_seconds = 0.0
     address = server.server_address[:2]
     guarded = socket.socket.connect
 
@@ -454,6 +462,18 @@ def test_consecutive_model_name_trials_in_one_process_each_reach_the_endpoint(en
     # Each trial's own client calls the endpoint as the SDK's default client does: OPENAI_BASE_URL, the
     # configured model name, and OPENAI_API_KEY as a bearer token.
     assert responses_endpoint.requests == [("/v1/responses", "test-double", "Bearer test-only-key")] * 3
+
+
+def test_each_model_response_records_its_latency_and_the_provider_ids(engine, workspace, prepared,
+                                                                      responses_endpoint):
+    # A request's latency and the provider's response and request IDs locate a slow or failed request in the
+    # provider's own logs; the latency spans the SDK's whole model call, including the client's retries.
+    responses_endpoint.delay_seconds = 0.2
+    eid, last, _ = _agent_run(engine, workspace, prepared, lambda eid: None)
+    assert last["result"]["status"] == "completed", last["result"]["reason"]
+    responses = [event for event in _events(engine, eid) if event["kind"] == "model_response"]
+    assert [(e["details"]["response_id"], e["details"]["request_id"]) for e in responses] == [("resp_1", "req_1")]
+    assert all(0.2 <= e["details"]["latency_seconds"] < 30 for e in responses)
 
 
 def test_an_operator_interrupt_cancels_the_sdk_loop_and_the_trial_is_still_frozen(engine, workspace, prepared):

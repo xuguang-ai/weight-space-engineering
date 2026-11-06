@@ -15,8 +15,10 @@ selection, and evaluation stays in WSE.
   to ``api.openai.com``; benchmark configurations disable it
   (``RunConfig(tracing_disabled=True)``, no sensitive trace data), and the
   setting is reported in ``provider_metadata`` for exports.
-* **Events and usage.** Run hooks normalize model responses (token usage per
-  request; reasoning items are counted, their content is never stored), tool
+* **Events and usage.** Run hooks normalize model responses (per request:
+  token usage, the latency of the SDK's model call including the client's
+  retries, and the provider's response and request IDs; reasoning items are
+  counted, their content is never stored), tool
   calls, and tool results (ok or the domain error code, a bounded excerpt,
   size and hash) into ``AgentEvent`` records for the runner's event sink.
   Cost and the served model snapshot are not reported by the SDK, so those
@@ -170,6 +172,7 @@ class _Recorder:
         self.tool_calls = 0
         self.tokens = {"requests": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
         self.last_message: str | None = None
+        self.request_started: float | None = None
 
     def emit(self, kind: str, **fields: Any) -> None:
         self.seq += 1
@@ -180,7 +183,13 @@ class _Recorder:
         except Exception:  # noqa: BLE001 - a failing sink must not break the SDK loop
             logger.exception("event sink failed on %s", kind)
 
+    def model_request(self) -> None:
+        self.request_started = time.monotonic()
+
     def model_response(self, response: Any) -> None:
+        # The SDK's whole model call: the client's retries are inside it.
+        latency = None if self.request_started is None else round(time.monotonic() - self.request_started, 6)
+        self.request_started = None
         self.turns += 1
         usage = getattr(response, "usage", None)
         counted = {name: int(getattr(usage, name, 0) or 0) for name in self.tokens}
@@ -195,7 +204,9 @@ class _Recorder:
                 for part in getattr(item, "content", []) or []:
                     if getattr(part, "type", None) == "output_text":
                         texts.append(part.text)
-        details: dict[str, Any] = {"output_items": kinds}
+        details: dict[str, Any] = {"output_items": kinds, "latency_seconds": latency,
+                                   "response_id": getattr(response, "response_id", None),
+                                   "request_id": getattr(response, "request_id", None)}
         if kinds.get("reasoning"):
             details["reasoning_content"] = "omitted: private reasoning is never stored"
         self.emit("model_response", usage=counted, details=details)
@@ -365,6 +376,9 @@ class OpenAIAgentsAdapter(AgentAdapter):
         recorder = _Recorder(event_sink)
 
         class Hooks(RunHooks):
+            async def on_llm_start(self, context, agent, system_prompt, input_items):  # noqa: ANN001
+                recorder.model_request()
+
             async def on_llm_end(self, context, agent, response):  # noqa: ANN001
                 recorder.model_response(response)
 

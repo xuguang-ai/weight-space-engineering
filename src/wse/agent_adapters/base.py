@@ -142,8 +142,9 @@ class AgentUsage(_Frozen):
 class AgentEvent(_Frozen):
     """One normalized controller event.
 
-    ``kind``: ``run_started``, ``model_response`` (usage and output item
-    counts; private reasoning content is never stored), ``tool_call``,
+    ``kind``: ``run_started``, ``model_response`` (usage, output item counts,
+    latency, and the provider's response and request IDs; private reasoning
+    content is never stored), ``tool_call``,
     ``tool_result`` (``ok``, ``error_code``, a bounded ``output`` excerpt with
     its full size and hash), ``message``, ``cancel_requested``, and
     ``run_finished``.
