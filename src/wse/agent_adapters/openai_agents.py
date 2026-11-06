@@ -20,7 +20,10 @@ selection, and evaluation stays in WSE.
   calls, and tool results (ok or the domain error code, a bounded excerpt,
   size and hash) into ``AgentEvent`` records for the runner's event sink.
   Cost and the served model snapshot are not reported by the SDK, so those
-  usage fields are ``None`` with a reason.
+  usage fields are ``None`` with a reason. The usage provider is the class
+  of the endpoint the SDK calls (``provider_for_base_url`` of
+  ``OPENAI_BASE_URL``: ``openai``, ``azure_openai``, or
+  ``openai_compatible``); the endpoint URL itself is never recorded.
 * **Cancellation.** ``cancel`` cancels the SDK run task (from any thread); the
   runner then settles WSE jobs and freezes while the server stays connected,
   and finally calls ``close``.
@@ -41,11 +44,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
+from urllib.parse import urlsplit
 
 from wse.agent_adapters.base import (
     AgentAdapter,
@@ -59,7 +64,7 @@ from wse.agent_adapters.base import (
 )
 from wse.schemas import ErrorCode, WSEError, content_hash
 
-__all__ = ["ERROR_PREFIX", "OpenAIAgentsAdapter", "parse_tool_output", "strategy_model"]
+__all__ = ["ERROR_PREFIX", "OpenAIAgentsAdapter", "parse_tool_output", "provider_for_base_url", "strategy_model"]
 
 logger = logging.getLogger("wse.agents.openai")
 
@@ -67,6 +72,26 @@ ERROR_PREFIX = "Error executing tool "
 OUTPUT_EXCERPT_CHARS = 2000
 MESSAGE_EXCERPT_CHARS = 2000
 TEST_DOUBLE_PROVIDER = "wse-test-double"
+AZURE_OPENAI_HOST_SUFFIXES = (".openai.azure.com", ".services.ai.azure.com", ".cognitiveservices.azure.com")
+
+
+def provider_for_base_url(base_url: str | None) -> str:
+    """The class of the endpoint that the SDK's OpenAI client calls, given ``OPENAI_BASE_URL``.
+
+    ``openai`` for the OpenAI API (the client's default when the variable is
+    unset, or a regional ``*.api.openai.com`` host), ``azure_openai`` for an
+    Azure OpenAI or Azure AI Foundry resource, and ``openai_compatible`` for
+    any other value. Only this class is recorded: the URL can name a private
+    resource, so it never enters controller records or exports.
+    """
+    if base_url is None:
+        return "openai"
+    host = (urlsplit(base_url.strip()).hostname or "").lower()
+    if host == "api.openai.com" or host.endswith(".api.openai.com"):
+        return "openai"
+    if host.endswith(AZURE_OPENAI_HOST_SUFFIXES):
+        return "azure_openai"
+    return "openai_compatible"
 
 
 def _require_sdk() -> Any:
@@ -302,7 +327,8 @@ class OpenAIAgentsAdapter(AgentAdapter):
 
     def _usage(self, recorder: _Recorder | None, config: AgentConfig) -> AgentUsage:
         test_double = self.model is not None and not isinstance(self.model, str)
-        provider = getattr(self.model, "provider_name", type(self.model).__name__) if test_double else "openai"
+        provider = (getattr(self.model, "provider_name", type(self.model).__name__) if test_double
+                    else provider_for_base_url(os.environ.get("OPENAI_BASE_URL")))
         unavailable = {
             "cost_usd": "OpenAI Agents SDK reports token counts, not cost; price the tokens from the provider's "
                         "price list for the recorded model",

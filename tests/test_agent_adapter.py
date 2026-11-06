@@ -357,6 +357,37 @@ def test_a_connection_failure_names_its_cause_and_points_to_the_server_log(engin
     assert engine.get_experiment(eid).state == "FROZEN"
 
 
+def test_the_provider_is_the_class_of_the_endpoint_the_sdk_calls():
+    from wse.agent_adapters.openai_agents import provider_for_base_url
+
+    # Unset (None) is the SDK client's default, https://api.openai.com/v1; an empty value is used as given.
+    for url in (None, "https://api.openai.com/v1", "https://eu.api.openai.com/v1/"):
+        assert provider_for_base_url(url) == "openai", url
+    for url in ("https://r.openai.azure.com/openai/v1", "https://r.services.ai.azure.com/openai/v1/",
+                "https://r.cognitiveservices.azure.com/openai/v1", "HTTPS://R.Services.AI.Azure.com/openai/v1"):
+        assert provider_for_base_url(url) == "azure_openai", url
+    for url in ("http://127.0.0.1:8000/v1", "https://openrouter.ai/api/v1", "https://r.openai.azure.com.example.org/v1",
+                "https://openai.azure.com/openai/v1", "https://api.openai.com.example.org/v1", "not a url", ""):
+        assert provider_for_base_url(url) == "openai_compatible", url
+
+
+def test_a_model_name_run_records_its_endpoint_class_but_not_the_endpoint(engine, workspace, prepared, monkeypatch):
+    original = ReferenceRunner.connection
+
+    def broken(self, *args, **kwargs):  # no SDK request is ever made
+        connection = original(self, *args, **kwargs)
+        return connection.model_copy(update={"serve_command": [sys.executable, "-c", "import sys; sys.exit(3)"]})
+
+    monkeypatch.setattr(ReferenceRunner, "connection", broken)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://example-resource.services.ai.azure.com/openai/v1")
+    # model=None: the adapter passes the configured model name to the SDK, as in a live trial
+    eid, record, _ = _agent_run(engine, workspace, prepared, lambda eid: None, connect_timeout_seconds=20)
+    usage = record["result"]["usage"]
+    assert record["result"]["status"] == "connection_failed"
+    assert usage["provider"] == "azure_openai" and usage["model"] == "test-double"
+    assert "example-resource" not in json.dumps(record) + json.dumps(_events(engine, eid))
+
+
 def test_an_operator_interrupt_cancels_the_sdk_loop_and_the_trial_is_still_frozen(engine, workspace, prepared):
     run_id = engine.grant_run(prepared["task_id"], SMALL_MODEL_POLICY_ID, prepared["task_checkpoint_id"]).run_id
     made: dict[str, Any] = {}

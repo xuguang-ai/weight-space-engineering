@@ -122,7 +122,10 @@ and version (`scripted_search@1`, `openai_agents@1`), configuration and its
 hash, `constraint_status`, the tracing setting, and the termination record:
 status (`completed`, `stopped`, `max_turns`, `timeout`, `cancelled`,
 `connection_failed`, `error`), reason, stop condition, final message, turns,
-tool calls, elapsed time, usage, provider metadata (SDK, MCP, and protocol
+tool calls, elapsed time, usage (for an agent: token counts, the model name,
+and the class of the endpoint the SDK called, `openai` when `OPENAI_BASE_URL`
+is unset, `azure_openai` for an Azure resource, otherwise
+`openai_compatible`; the URL itself is never recorded), provider metadata (SDK, MCP, and protocol
 versions, limits, allowed and observed tools), the settlement and freeze, the
 environment (Python, platform, CPU, package versions), and, for an agent, the
 path of the `wse serve` log (`serve_log`; the reason of a `connection_failed`
