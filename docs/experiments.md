@@ -255,4 +255,5 @@ starts no further trial, and still final-evaluates and reports the frozen
 ones. The script exits with 0, with 1 if any trial or step failed, or with
 130 after an interrupt; each server's log is `LIVE/logs/serve-RUN_ID.log`. The exact SDK and
 model settings are in each export's `controller.json`. Running these trials
-sends the task instructions and tool results to the model provider.
+sends the task instructions and tool results to the model provider. The M1
+acceptance trials and their results are in [m1-agent-trials.md](m1-agent-trials.md).
