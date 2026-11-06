@@ -24,6 +24,12 @@ selection, and evaluation stays in WSE.
   of the endpoint the SDK calls (``provider_for_base_url`` of
   ``OPENAI_BASE_URL``: ``openai``, ``azure_openai``, or
   ``openai_compatible``); the endpoint URL itself is never recorded.
+* **Model client.** A run that names its model gets its own ``AsyncOpenAI``
+  client, configured from ``OPENAI_API_KEY`` and ``OPENAI_BASE_URL`` like the
+  SDK's default client, and closes it when the run ends. The SDK's default
+  client shares one process-wide HTTP connection pool, whose connections
+  belong to the event loop that opened them, and each trial runs in its own
+  event loop.
 * **Cancellation.** ``cancel`` cancels the SDK run task (from any thread); the
   runner then settles WSE jobs and freezes while the server stays connected,
   and finally calls ``close``.
@@ -352,8 +358,9 @@ class OpenAIAgentsAdapter(AgentAdapter):
                                   usage=self._usage(None, agent_config),
                                   provider_metadata=self._metadata(session, agent_config))
         _require_sdk()
-        from agents import Agent, ModelSettings, RunConfig, Runner, RunHooks
+        from agents import Agent, ModelSettings, MultiProvider, RunConfig, Runner, RunHooks
         from agents.exceptions import MaxTurnsExceeded
+        from openai import AsyncOpenAI
 
         recorder = _Recorder(event_sink)
 
@@ -371,19 +378,33 @@ class OpenAIAgentsAdapter(AgentAdapter):
                       model=self.model if self.model is not None else agent_config.model,
                       model_settings=ModelSettings(**agent_config.model_settings), tools=[],
                       mcp_servers=[session.server])
-        run_config = RunConfig(tracing_disabled=agent_config.tracing_disabled,
-                               trace_include_sensitive_data=not agent_config.tracing_disabled
-                               and not agent_config.benchmark,
-                               workflow_name="wse_experiment")
         metadata = self._metadata(session, agent_config)
+
+        async def sdk_run() -> Any:
+            # A model name gets a client of its own, closed in this loop: the SDK's default client pools
+            # connections process-wide, and a pooled connection dies with an earlier trial's event loop.
+            client = AsyncOpenAI() if isinstance(agent.model, str) else None
+            try:
+                provider = {} if client is None else {"model_provider": MultiProvider(openai_client=client)}
+                run_config = RunConfig(tracing_disabled=agent_config.tracing_disabled,
+                                       trace_include_sensitive_data=not agent_config.tracing_disabled
+                                       and not agent_config.benchmark,
+                                       workflow_name="wse_experiment", **provider)
+                return await Runner.run(agent, session.connection.initial_message, max_turns=agent_config.max_turns,
+                                        run_config=run_config, hooks=Hooks())
+            finally:
+                if client is not None:
+                    try:
+                        await client.close()
+                    except Exception:  # noqa: BLE001 - closing must not mask the run's outcome
+                        logger.exception("closing the model client failed")
+
         recorder.emit("run_started", details={"model": agent_config.model, "max_turns": agent_config.max_turns,
                                               "wall_clock_seconds": agent_config.wall_clock_seconds,
                                               "tracing_disabled": agent_config.tracing_disabled,
                                               "allowed_tools": list(session.connection.allowed_tools)})
         session.loop = asyncio.get_running_loop()
-        session.task = asyncio.ensure_future(Runner.run(
-            agent, session.connection.initial_message, max_turns=agent_config.max_turns, run_config=run_config,
-            hooks=Hooks()))
+        session.task = asyncio.ensure_future(sdk_run())
         if session.cancel is not None:  # cancelled before the loop started
             session.task.cancel()
         final_message, conversation_ref = None, None

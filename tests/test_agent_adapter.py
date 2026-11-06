@@ -12,6 +12,7 @@ including on failure.
 
 from __future__ import annotations
 
+import _socket
 import asyncio
 import json
 import os
@@ -20,6 +21,7 @@ import socket
 import sys
 import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -386,6 +388,72 @@ def test_a_model_name_run_records_its_endpoint_class_but_not_the_endpoint(engine
     assert record["result"]["status"] == "connection_failed"
     assert usage["provider"] == "azure_openai" and usage["model"] == "test-double"
     assert "example-resource" not in json.dumps(record) + json.dumps(_events(engine, eid))
+
+
+class _ResponsesStub(BaseHTTPRequestHandler):
+    """A loopback stand-in for the Responses API: every request gets a final assistant message.
+
+    HTTP/1.1 keeps each connection open after its response, as real endpoints
+    do, so the client's connection pool can reuse it.
+    """
+
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self) -> None:  # noqa: N802 - the http.server hook name
+        request = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        self.server.requests.append((self.path, request.get("model"), self.headers.get("Authorization")))
+        body = json.dumps({
+            "id": f"resp_{len(self.server.requests)}", "object": "response", "created_at": 0, "status": "completed",
+            "model": "stub", "error": None, "incomplete_details": None, "parallel_tool_calls": True,
+            "tool_choice": "auto", "tools": [],
+            "output": [{"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+                        "content": [{"type": "output_text", "text": "Finished.", "annotations": []}]}],
+            "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12,
+                      "input_tokens_details": {"cached_tokens": 0}, "output_tokens_details": {"reasoning_tokens": 0}},
+        }).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args) -> None:  # noqa: A002 - keep the test output quiet
+        pass
+
+
+@pytest.fixture
+def responses_endpoint(offline, monkeypatch):
+    """Serve ``_ResponsesStub`` on loopback, the one address the offline guard lets the test reach."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ResponsesStub)
+    server.block_on_close = False  # a connection the client keeps open must not hold up shutdown
+    server.requests = []
+    address = server.server_address[:2]
+    guarded = socket.socket.connect
+
+    def connect(self, target, *args, **kwargs):
+        if self.family == socket.AF_INET and tuple(target[:2]) == address:
+            return _socket.socket.connect(self, target, *args, **kwargs)
+        return guarded(self, target, *args, **kwargs)
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setenv("OPENAI_BASE_URL", f"http://{address[0]}:{address[1]}/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only-key")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield server
+    server.shutdown()
+    server.server_close()
+
+
+def test_consecutive_model_name_trials_in_one_process_each_reach_the_endpoint(engine, workspace, prepared,
+                                                                               responses_endpoint):
+    # run_trials.py runs every trial in its own event loop, all in one process. A model client shared between
+    # trials would reuse a pooled connection of an earlier, closed loop ("RuntimeError: Event loop is closed").
+    results = [_agent_run(engine, workspace, prepared, lambda eid: None)[1]["result"] for _ in range(3)]
+    assert [result["status"] for result in results] == ["completed"] * 3, [result["reason"] for result in results]
+    assert [result["usage"]["input_tokens"] for result in results] == [10, 10, 10]
+    # Each trial's own client calls the endpoint as the SDK's default client does: OPENAI_BASE_URL, the
+    # configured model name, and OPENAI_API_KEY as a bearer token.
+    assert responses_endpoint.requests == [("/v1/responses", "test-double", "Bearer test-only-key")] * 3
 
 
 def test_an_operator_interrupt_cancels_the_sdk_loop_and_the_trial_is_still_frozen(engine, workspace, prepared):
