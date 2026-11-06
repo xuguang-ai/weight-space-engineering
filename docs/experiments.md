@@ -238,6 +238,13 @@ uv run --no-sync python examples/signed_sum/run_trials.py LIVE --label live \
     --controller openai-agents --model MODEL_NAME --trials 5
 ```
 
+The key can instead live in a `.env` file at the repository root, which git
+ignores, together with `OPENAI_BASE_URL` for an endpoint other than OpenAI's
+(for an Azure resource, `https://RESOURCE.services.ai.azure.com/openai/v1`).
+`uv run --no-sync --env-file .env python examples/signed_sum/run_trials.py ...`
+loads both for that one command. uv reads no `.env` without the flag, and
+neither variable reaches the WSE server, whose environment is an allow-list.
+
 Each trial runs to its freeze before the next starts; the final evaluations
 run only after all 5 have frozen; every trial is exported, replayed, and
 listed with its failure cause in `LIVE/reports/live.md`. A trial that raises
