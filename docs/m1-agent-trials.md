@@ -97,16 +97,17 @@ stamped 21:07:10 and the last controller ended at 21:07:09.
 
 ## Earlier set (`main`) and the harness defect
 
-| Trial | Experiment | Status | Turns | Tool calls | Tokens in / out | Elapsed (s) | Final accuracy (control) |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | `exp_086cbcdc…` | stopped: `target_met` | 9 | 12 | 70,188 / 1,565 | 20.1 | 1.0 (0.5) |
-| 2 | `exp_0740705c…` | error | 0 | 0 | 0 / 0 | 0.01 | 0.5 (0.5) |
-| 3 | `exp_6c0f30b0…` | stopped: `target_met` | 11 | 14 | 96,566 / 1,875 | 24.0 | 1.0 (0.5) |
-| 4 | `exp_42fc3875…` | error | 0 | 0 | 0 / 0 | 0.01 | 0.5 (0.5) |
-| 5 | `exp_f16bba0d…` | stopped: `target_met` | 11 | 14 | 95,325 / 1,709 | 25.6 | 1.0 (0.5) |
+| Trial | Experiment | Status | Turns | Tool calls | Tokens in / out | Elapsed (s) | Dev examples | Changed parameters | Final accuracy (control) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | `exp_086cbcdc…` | stopped: `target_met` | 9 | 12 | 70,188 / 1,565 | 20.1 | 64 | 4 / 22 | 1.0 (0.5) |
+| 2 | `exp_0740705c…` | error | 0 | 0 | 0 / 0 | 0.01 | 0 | 0 / 22 | 0.5 (0.5) |
+| 3 | `exp_6c0f30b0…` | stopped: `target_met` | 11 | 14 | 96,566 / 1,875 | 24.0 | 128 | 4 / 22 | 1.0 (0.5) |
+| 4 | `exp_42fc3875…` | error | 0 | 0 | 0 / 0 | 0.01 | 0 | 0 / 22 | 0.5 (0.5) |
+| 5 | `exp_f16bba0d…` | stopped: `target_met` | 11 | 14 | 95,325 / 1,709 | 25.6 | 128 | 4 / 22 | 1.0 (0.5) |
 
-The three successful trials made the same patch as in `main2`. Trials 2 and
-4 ended with `RuntimeError: Event loop is closed` before any model response.
+The three successful trials each committed one candidate, with the same
+patch as in `main2`. Trials 2 and 4 committed none: they ended with
+`RuntimeError: Event loop is closed` before any model response.
 Each complete trace has two events: `run_started`, then `run_finished` with
 status `error`. Both trials were still settled, frozen, final-evaluated on
 the unedited base checkpoint, exported, and replayed.
