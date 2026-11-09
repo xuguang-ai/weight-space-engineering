@@ -13,6 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 agents-openai = ["openai-agents>=0.24"]
+models-hf = ["transformers>=5.22.2", "math-verify>=0.9"]
 
 [project.scripts]
 wse = "wse.cli:main"
