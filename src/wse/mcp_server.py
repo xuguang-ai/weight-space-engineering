@@ -567,6 +567,11 @@ def serve(workspace: str, run_id: str, *, registry: Any = None, constraint_statu
     supervisor = None
     try:
         mcp_server = build_server(engine, constraint_status=constraint_status)
+        # The MCP SDK logs through rich when it is importable (the models-hf extra
+        # installs it), which wraps lines at the console width. Server logs stay
+        # one plain line per record on stderr, as without rich.
+        logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=[logging.StreamHandler()],
+                            force=True)
         if worker:
             supervisor = WorkerSupervisor(workspace, extra_args=worker_args, env=worker_env).start()
         logger.info("wse serve: run %s bound; worker %s; constraint_status %s", run_id,
