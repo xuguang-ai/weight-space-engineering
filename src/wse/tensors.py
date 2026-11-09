@@ -134,10 +134,20 @@ def _reject_shared_memory(tensors: Sequence[tuple[str, torch.Tensor]]) -> None:
             )
 
 
+_FINITE_CHUNK = 1 << 22  # elements per chunk of the finiteness check
+
+
 def nonfinite_count(tensor: torch.Tensor) -> int:
+    """The number of NaN and infinite elements, counted in chunks.
+
+    Chunks bound the temporary mask to ``_FINITE_CHUNK`` bytes, where one
+    mask over a whole embedding of a language model would take hundreds of MB.
+    """
     if not (tensor.is_floating_point() or tensor.is_complex()):
         return 0
-    return int((~torch.isfinite(tensor)).sum().item())
+    flat = tensor.reshape(-1)
+    return sum(int((~torch.isfinite(flat[start:start + _FINITE_CHUNK])).sum().item())
+               for start in range(0, flat.numel(), _FINITE_CHUNK))
 
 
 def require_finite(tensors: Mapping[str, torch.Tensor]) -> None:

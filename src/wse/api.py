@@ -148,6 +148,13 @@ class ModelHandle:
         Only adapters that run through an engine (``hf_causal_lm@1``) provide
         one. It is built once per device and shares the handle's tensors on
         CPU; it is for direct library use and the worker only.
+
+        The module is read-only by contract. On CPU its parameters are the
+        handle's own stored tensors, without a copy, so an in-place change
+        through it (a hook that writes to a weight, an optimizer step) would
+        change this handle and every handle sharing those tensors while
+        ``weights_hash`` stays the same. Edit weights through operators and
+        patches instead.
         """
         build = getattr(self.adapter, "runtime", None)
         if not callable(build):

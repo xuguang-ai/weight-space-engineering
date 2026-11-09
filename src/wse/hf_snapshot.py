@@ -31,8 +31,8 @@ INDEX_FILE = "model.safetensors.index.json"
 SINGLE_WEIGHTS_FILE = "model.safetensors"
 # The tokenizer identity covers these files when present (M2 plan Section 2.1);
 # a SentencePiece model (tokenizer.model, a protobuf, not a pickle) counts too.
-TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "vocab.json",
-                   "merges.txt", "tokenizer.model")
+TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_map.json", "added_tokens.json",
+                   "vocab.json", "merges.txt", "tokenizer.model")
 CHAT_TEMPLATE_FILES = ("chat_template.jinja", "chat_template.json")
 ALLOWED_FILES = frozenset({CONFIG_FILE, GENERATION_CONFIG_FILE, INDEX_FILE, *TOKENIZER_FILES,
                            *CHAT_TEMPLATE_FILES})

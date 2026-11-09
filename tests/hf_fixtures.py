@@ -30,6 +30,8 @@ QWEN3 = dict(vocab_size=VOCAB_SIZE, hidden_size=16, intermediate_size=32, num_hi
 GEMMA3 = dict(vocab_size=VOCAB_SIZE, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
               num_attention_heads=4, num_key_value_heads=2, head_dim=4, sliding_window=8,
               max_position_embeddings=128)
+# GPT-2 has absolute (learned) position embeddings, so a position shifted by padding changes its logits.
+GPT2 = dict(vocab_size=VOCAB_SIZE, n_embd=16, n_layer=2, n_head=4, n_positions=128, bos_token_id=1, eos_token_id=2)
 QWEN3_5_TEXT = dict(vocab_size=VOCAB_SIZE, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
                     num_attention_heads=4, num_key_value_heads=2, head_dim=4, max_position_embeddings=128,
                     layer_types=["linear_attention", "full_attention"], linear_num_key_heads=2,
@@ -70,10 +72,15 @@ def add_decoys(snapshot: Path) -> None:
 
 
 def _finish(model: Any, snapshot: Path, *, dtype: Any, generation: dict[str, Any] | None = None,
-            max_shard_size: str | int | None = None) -> Path:
+            max_shard_size: str | int | None = None, f32_suffixes: tuple[str, ...] = ()) -> Path:
+    """Cast to ``dtype`` and save; parameters whose names end with one of ``f32_suffixes`` stay F32."""
+    import torch
     from transformers import GenerationConfig
 
     model = model.to(dtype)
+    for name, parameter in model.named_parameters():
+        if name.endswith(f32_suffixes):
+            parameter.data = parameter.data.to(torch.float32)
     model.generation_config = GenerationConfig(bos_token_id=1, eos_token_id=2, pad_token_id=0,
                                                **(generation or {"do_sample": True, "temperature": 0.7}))
     kwargs = {} if max_shard_size is None else {"max_shard_size": max_shard_size}
@@ -113,12 +120,23 @@ def gemma3(snapshot: Path, *, seed: int = 2) -> Path:
     return _finish(model, snapshot, dtype=torch.float32)
 
 
+def gpt2(snapshot: Path, *, seed: int = 4) -> Path:
+    """A GPT-2 model in F32: learned absolute position embeddings and tied input and output embeddings."""
+    import torch
+    from transformers import GPT2Config, GPT2LMHeadModel
+
+    _seed(seed)
+    model = GPT2LMHeadModel(GPT2Config(**GPT2, tie_word_embeddings=True))
+    return _finish(model, snapshot, dtype=torch.float32)
+
+
 def qwen3_5(snapshot: Path, *, seed: int = 3) -> Path:
     """A Qwen3.5 multimodal wrapper: a 2-layer text model (linear then full attention) and a 1-block vision model.
 
     The checkpoint is sharded with an index, as the published snapshot is, and
     an extra shard carries ``mtp.*`` tensors, which the transformers class
-    does not define.
+    does not define. As in the published checkpoint, the linear-attention
+    layer's ``A_log`` and gated norm weight are stored in F32 and the rest in BF16.
     """
     import torch
     from safetensors.torch import save_file
@@ -127,7 +145,8 @@ def qwen3_5(snapshot: Path, *, seed: int = 3) -> Path:
     _seed(seed)
     config = Qwen3_5Config(text_config=QWEN3_5_TEXT, vision_config=QWEN3_5_VISION, tie_word_embeddings=True)
     model = Qwen3_5ForConditionalGeneration(config)
-    _finish(model, snapshot, dtype=torch.bfloat16, max_shard_size="20KB")
+    _finish(model, snapshot, dtype=torch.bfloat16, max_shard_size="20KB",
+            f32_suffixes=(".linear_attn.A_log", ".linear_attn.norm.weight"))
     index_path = snapshot / "model.safetensors.index.json"
     index = json.loads(index_path.read_text())
     mtp_file = "model-mtp.safetensors"
@@ -156,6 +175,7 @@ BUILDERS = {
     "qwen3": qwen3,
     "gemma3": gemma3,
     "qwen3_5": qwen3_5,
+    "gpt2": gpt2,
     "pickled_only": pickled_only,
 }
 

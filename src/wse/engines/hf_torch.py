@@ -15,6 +15,12 @@
   one device and library version, not across them (M1 plan Section 7.3).
 * **Forward.** ``logits`` returns float32 next-token logits for every
   position of a batch of token IDs.
+* **Positions.** Position IDs come from the attention mask, as
+  ``transformers``' ``generate`` derives them: the cumulative sum of the mask
+  minus one, with masked positions set to 0, at prefill (and in ``logits``),
+  then the last position plus one at each decode step. A left-padded row
+  therefore computes the logits of the same prompt run alone (M2 plan
+  Section 4.1); counting from the first pad would shift it by its padding.
 * **Generation.** ``generate`` decodes a batch with a KV cache: the prompt is
   prefilled once, then each step feeds one token per row. Greedy decoding
   takes the first maximal logit, as ``transformers``' ``generate`` does.
@@ -193,7 +199,9 @@ class HFTorchModel:
         import inspect
 
         self._vocab_size = int(self.module.get_input_embeddings().weight.shape[0])
-        self._logits_to_keep = "logits_to_keep" in inspect.signature(self.module.forward).parameters
+        parameters = inspect.signature(self.module.forward).parameters
+        self._logits_to_keep = "logits_to_keep" in parameters
+        self._position_ids = "position_ids" in parameters
 
     def info(self) -> dict[str, Any]:
         """Device, stored dtypes, model class, attention implementation, and library versions."""
@@ -221,10 +229,12 @@ class HFTorchModel:
         return input_ids.cpu(), None if attention_mask is None else attention_mask.cpu()
 
     def _forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None, *, last_only: bool,
-                 cache: Any = None, use_cache: bool = False) -> Any:
+                 position_ids: torch.Tensor | None = None, cache: Any = None, use_cache: bool = False) -> Any:
         kwargs: dict[str, Any] = {"input_ids": input_ids.to(self.device), "use_cache": use_cache}
         if attention_mask is not None:
             kwargs["attention_mask"] = attention_mask.to(self.device)
+        if position_ids is not None and self._position_ids:
+            kwargs["position_ids"] = position_ids.to(self.device)
         if cache is not None:
             kwargs["past_key_values"] = cache
         if last_only and self._logits_to_keep:
@@ -236,8 +246,9 @@ class HFTorchModel:
     def logits(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Float32 logits ``[batch, sequence, vocab]`` on the CPU."""
         input_ids, attention_mask = self._check(input_ids, attention_mask)
+        positions = None if attention_mask is None else positions_from_mask(attention_mask)
         with torch.inference_mode():
-            output = self._forward(input_ids, attention_mask, last_only=False)
+            output = self._forward(input_ids, attention_mask, last_only=False, position_ids=positions)
             return output.logits.to(device="cpu", dtype=torch.float32, copy=True)
 
     # -- generation -----------------------------------------------------------
@@ -282,9 +293,11 @@ class HFTorchModel:
         tokens: list[list[int]] = [[] for _ in range(batch)]
         finished = [False] * batch
         step_ids, cache = input_ids, None
+        positions = positions_from_mask(mask)  # the prompt's positions at prefill; then one per step
         with torch.inference_mode():
             for _ in range(max_new_tokens):
-                output = self._forward(step_ids, mask, last_only=True, cache=cache, use_cache=True)
+                output = self._forward(step_ids, mask, last_only=True, position_ids=positions, cache=cache,
+                                       use_cache=True)
                 cache = output.past_key_values
                 scores = output.logits[:, -1].to(device="cpu", dtype=torch.float32, copy=True)
                 for processor in logits_processors:
@@ -305,7 +318,18 @@ class HFTorchModel:
                 if not bool(unfinished.any()):
                     break
                 step_ids = chosen[:, None]
+                positions = positions[:, -1:] + 1
         return GenerationResult(tokens=tokens, finished=finished)
+
+
+def positions_from_mask(mask: torch.Tensor) -> torch.Tensor:
+    """Position IDs ``[batch, sequence]`` from a 0/1 attention mask, as ``transformers``' ``generate`` derives them.
+
+    Each attended token's position counts the attended tokens before it
+    (the cumulative sum minus one); masked positions get 0.
+    """
+    mask = mask.to(torch.int64)
+    return (mask.cumsum(-1) - 1).masked_fill(mask == 0, 0)
 
 
 def _sample(scores: torch.Tensor, sampling: Sampling, generators: Sequence[torch.Generator]) -> torch.Tensor:

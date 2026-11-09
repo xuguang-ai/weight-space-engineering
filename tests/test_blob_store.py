@@ -470,3 +470,15 @@ def test_an_index_is_never_registered_under_another_weights_hash(workspace):
             store.commit_checkpoint(wrong, tensors, dedup_key=None, event_type="checkpoint.imported")
         assert excinfo.value.code == ErrorCode.ARTIFACT_CORRUPT
         assert store.list_ready() == [] and store.blob_reference_counts() == {}
+
+
+def test_nonfinite_values_are_counted_across_chunks(monkeypatch):
+    import wse.tensors as tensors
+
+    monkeypatch.setattr(tensors, "_FINITE_CHUNK", 4)
+    values = torch.zeros(3, 5, dtype=torch.bfloat16)
+    values[0, 1], values[1, 3], values[2, 4] = float("nan"), float("inf"), float("-inf")
+    assert tensors.nonfinite_count(values) == 3
+    assert tensors.nonfinite_count(values.t()) == 3  # a non-contiguous view
+    assert tensors.nonfinite_count(torch.zeros(0)) == 0
+    assert tensors.nonfinite_count(torch.tensor(float("nan"))) == 1

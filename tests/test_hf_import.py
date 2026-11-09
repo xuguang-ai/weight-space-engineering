@@ -203,6 +203,9 @@ def test_axes_follow_module_types(snapshots, engine):
     # Parameters of other module types are readable with unknown axes.
     assert qwen[prefix + "A_log"].axes == ["unknown"]
     assert qwen[prefix + "dt_bias"].axes == ["unknown"]
+    # Stored dtypes are kept: A_log and the gated norm weight are F32, the rest BF16.
+    assert (qwen[prefix + "A_log"].dtype, qwen[prefix + "norm.weight"].dtype) == ("float32", "float32")
+    assert qwen[prefix + "dt_bias"].dtype == "bfloat16"
     gemma = {t.name: t for t in _import(engine, snapshots["gemma3"]).tensors}
     # A subclass of nn.Embedding is an embedding.
     assert gemma["model.embed_tokens.weight"].axes == ["num_embeddings", "embedding_dim"]
@@ -276,6 +279,14 @@ def test_identity_changes_with_tokenizer_chat_template_and_generation_config(cop
         "chat_template_hash": variant("template", lambda s: (s / "chat_template.jinja").write_text("{{ messages }}")),
         "generation_config_hash": variant("generation", edit_json("generation_config.json", {"temperature": 0.1})),
     }
+    # added_tokens.json is a tokenizer file too: adding or changing it changes only the tokenizer hash.
+    added = variant("added_tokens", lambda s: (s / "added_tokens.json").write_text(json.dumps({"<extra>": 64})))
+    changed_added = variant("added_tokens_changed",
+                            lambda s: (s / "added_tokens.json").write_text(json.dumps({"<other>": 64})))
+    assert added.tokenizer_hash != changed_added.tokenizer_hash
+    for other in (added, changed_added):
+        assert {name for name in type(identity).model_fields
+                if getattr(identity, name) != getattr(other, name)} == {"tokenizer_hash"}
     for field, other in changed.items():
         differing = {name for name in type(identity).model_fields
                      if getattr(identity, name) != getattr(other, name)}
