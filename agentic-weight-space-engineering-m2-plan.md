@@ -358,7 +358,8 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
 
   ```bash
   M=~/Desktop/wse-models
-  INC=(--include "*.json" "*.safetensors" "*.jinja" "tokenizer*" "vocab*" "merges*")
+  # huggingface_hub 2.x takes one pattern per --include; extra patterns after one flag become file names.
+  INC=(--include "*.json" --include "*.safetensors" --include "*.jinja" --include "tokenizer*" --include "vocab*" --include "merges*")
   uv run --no-sync hf download Qwen/Qwen3.5-0.8B --revision 2fc06364715b967f1860aea9cf38778875588b17 "${INC[@]}" --local-dir "$M/Qwen3.5-0.8B"
   ( printf 'HF token: '; read -rs T; echo; HF_TOKEN="$T" uv run --no-sync hf download meta-llama/Llama-3.2-1B-Instruct "${INC[@]}" --local-dir "$M/Llama-3.2-1B-Instruct" )
   ```
