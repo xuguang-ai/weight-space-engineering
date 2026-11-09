@@ -51,7 +51,7 @@ from wse.schemas import (
     json_hash,
     model_identity,
 )
-from wse.tensors import hash_weights, normalize_tensors, weights_hash_scheme
+from wse.tensors import WEIGHTS_HASH_RAW, hash_weights, normalize_tensors, weights_hash_scheme
 
 if TYPE_CHECKING:
     from wse.adapters.base import AdapterCapabilities
@@ -703,6 +703,11 @@ class Engine:
         self._require_operator("importing a model")
         request = _import_manifest(_with_resolved_adapter(manifest, self.registry))
         adapter_ref, adapter = _resolve_adapter(self.registry, request.adapter)
+        if weights_hash_scheme(adapter) != WEIGHTS_HASH_RAW:
+            # Such adapters (hf_causal_lm@1) identify a model by its snapshot source too, which a bundle lacks.
+            raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                           f"adapter {adapter_ref} imports models from snapshots only; use import_hf_snapshot "
+                           "('wse import-hf SNAPSHOT --repo ID --revision SHA')", details={"adapter": str(adapter_ref)})
         normalized = normalize_tensors(tensors)
         size = sum(t.numel() * t.element_size() for t in normalized.values())
         if size > self.max_bytes:

@@ -165,6 +165,7 @@ class SnapshotReader:
             raise _invalid(f"{name} has an invalid safetensors header", file=name)
         data_size = size - 8 - length
         tensors: dict[str, TensorHeader] = {}
+        spans: list[tuple[int, int, str]] = []
         for tensor, entry in header.items():
             if tensor == "__metadata__":
                 continue
@@ -181,6 +182,18 @@ class SnapshotReader:
                 raise _invalid(f"{name}: tensor {tensor!r} has {end - begin} bytes; its dtype and shape need "
                                f"{info.size_bytes}", file=name, tensor=tensor)
             tensors[tensor] = info
+            spans.append((begin, end, tensor))
+        # As safetensors requires: the tensors cover the data section contiguously, without overlaps or gaps.
+        position = 0
+        for begin, end, tensor in sorted(spans):
+            if begin != position:
+                raise _invalid(f"{name}: tensor {tensor!r} starts at byte {begin} of the data section; the previous "
+                               f"tensor ends at {position} (tensors must not overlap or leave gaps)",
+                               file=name, tensor=tensor)
+            position = end
+        if position != data_size:
+            raise _invalid(f"{name}: the tensors cover {position} of the {data_size} bytes of the data section",
+                           file=name)
         return tensors
 
     def tensor_table(self) -> dict[str, TensorHeader]:
@@ -211,7 +224,11 @@ class SnapshotReader:
 
         if file not in self.files:
             raise _invalid(f"weights file {file} was not read through the snapshot's tensor table", file=file)
-        with safe_open(str(self._path(file)), framework="pt") as handle:
+        try:
+            handle = safe_open(str(self._path(file)), framework="pt")
+        except Exception as exc:  # safetensors raises its own SafetensorError for malformed files
+            raise _invalid(f"weights file {file} cannot be opened as safetensors: {exc}", file=file) from exc
+        with handle:
             yield handle
 
     # -- identity -------------------------------------------------------------

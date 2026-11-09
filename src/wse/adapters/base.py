@@ -30,7 +30,13 @@ CAP_FORWARD_LOGITS = "forward.logits"
 
 
 class AdapterCapabilities(BaseModel):
-    """Capabilities an adapter supports, plus its parameter-sharing semantics."""
+    """Capabilities an adapter supports, plus its parameter-sharing semantics.
+
+    ``shared_parameters`` declares that models of the adapter may share
+    parameters. Such an adapter lists every alias group in the architecture it
+    describes; edits refuse members of an alias group and allow every other
+    tensor.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 

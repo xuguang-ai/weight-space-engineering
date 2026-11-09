@@ -365,6 +365,12 @@ class ArtifactStore:
                 return self.load_manifest(existing)
 
         entries = _tensor_entries(tensors)
+        stored = {entry.name: entry.blob_id for entry in entries}
+        stale = sorted(info.name for info in manifest.tensors
+                       if info.blob_id is not None and stored.get(info.name) != info.blob_id)
+        if stale:
+            raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"the manifest records blob IDs that do not match the tensors "
+                           f"of {stale[:20]}", details={"tensors": stale[:20]})
         self._publish_missing_blobs(entries, tensors)
         row = self.db.conn.execute(
             "SELECT * FROM artifacts WHERE kind = 'weights' AND content_hash = ?",

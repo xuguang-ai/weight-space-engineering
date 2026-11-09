@@ -12,6 +12,7 @@ import io
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import textwrap
@@ -464,3 +465,99 @@ def test_hf_modules_import_without_transformers():
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "[]"
+
+
+# -- edits, blob IDs, and malformed headers (Task 3 review) ----------------------------------------
+
+ROW0 = [{"start": 0, "stop": 1, "step": 1}, {"start": 0, "stop": 16, "step": 1}]
+
+
+def _experiment(engine: Engine, base):
+    from wse.policy import SMALL_MODEL_POLICY_ID
+
+    grant = engine.grant_run("hf_edit_v1", SMALL_MODEL_POLICY_ID, base.checkpoint_id)
+    return engine.create_experiment(grant.run_id, "hf_edit_v1", SMALL_MODEL_POLICY_ID, "create-1")
+
+
+def _scale(base, tensor: str, selection=ROW0) -> dict:
+    return {"base_checkpoint_id": base.checkpoint_id, "hypothesis": "Scaling one row changes the output.",
+            "operations": [{"op": "scale_slice", "tensor": tensor, "selection": selection, "factor": 2.0}]}
+
+
+def test_candidate_manifests_record_the_blob_ids_of_edited_tensors(snapshots, engine, workspace):
+    base = _import(engine, snapshots["qwen3"])  # F16, untied
+    experiment = _experiment(engine, base)
+    edited = "model.layers.0.mlp.down_proj.weight"
+    preview = engine.preview_patch(experiment.experiment_id, _scale(base, edited), "preview-1")
+    blobs_before = _blob_files(workspace)
+    candidate = engine.apply_patch(experiment.experiment_id, preview.patch_id, "apply-1")
+    stored = engine.store.tensor_blob_ids(candidate.checkpoint_id)
+    assert {t.name: t.blob_id for t in candidate.tensors} == stored
+    base_ids = {t.name: t.blob_id for t in base.tensors}
+    assert stored[edited] != base_ids[edited]
+    assert {name: id_ for name, id_ in stored.items() if name != edited} == \
+        {name: id_ for name, id_ in base_ids.items() if name != edited}
+    assert set(_blob_files(workspace)) - set(blobs_before) == {stored[edited]}
+    handle = engine.open_checkpoint(candidate.checkpoint_id)
+    assert handle.identity == candidate.identity and blob_id(handle.tensor(edited)) == stored[edited]
+
+
+def test_a_manifest_with_stale_blob_ids_is_not_committed(snapshots, engine):
+    base = _import(engine, snapshots["qwen3"])
+    tensors = engine.store.load_tensors(base.checkpoint_id)
+    infos = [t.model_copy(update={"blob_id": "0" * 64}) if t.name == "model.norm.weight" else t for t in base.tensors]
+    stale = base.model_copy(update={"checkpoint_id": engine.store.new_checkpoint_id(), "tensors": infos})
+    error = _expect_error(ErrorCode.ARTIFACT_CORRUPT, engine.store.commit_checkpoint, stale, tensors,
+                          dedup_key=None, event_type="checkpoint.imported")
+    assert error.details == {"tensors": ["model.norm.weight"]}
+    assert engine.store.list_ready() == [base.checkpoint_id]
+
+
+def test_only_alias_group_members_refuse_edits(snapshots, engine):
+    base = _import(engine, snapshots["gemma3"])  # F32, tied
+    assert base.alias_groups == [["lm_head.weight", "model.embed_tokens.weight"]]
+    experiment = _experiment(engine, base)
+    for tensor in base.alias_groups[0]:
+        error = _expect_error(ErrorCode.UNSUPPORTED_CAPABILITY, engine.preview_patch, experiment.experiment_id,
+                              _scale(base, tensor), f"preview-{tensor}")
+        assert "alias group" in error.message
+    preview = engine.preview_patch(experiment.experiment_id, _scale(base, "model.layers.0.self_attn.q_proj.weight"),
+                                   "preview-q")
+    assert preview.changed_elements == 16
+
+
+def _rewrite_header(path: Path, edit) -> None:
+    raw = path.read_bytes()
+    (length,) = struct.unpack("<Q", raw[:8])
+    header = json.loads(raw[8:8 + length])
+    edit(header)
+    encoded = json.dumps(header).encode()
+    encoded += b" " * (-len(encoded) % 8)
+    path.write_bytes(struct.pack("<Q", len(encoded)) + encoded + raw[8 + length:])
+
+
+def test_overlapping_or_gapped_safetensors_offsets_are_rejected(copy_snapshot, engine, workspace):
+    def overlap(header):
+        source = header["model.layers.0.input_layernorm.weight"]["data_offsets"]
+        header["model.layers.0.post_attention_layernorm.weight"]["data_offsets"] = list(source)
+
+    def gap(header):
+        del header["model.norm.weight"]
+
+    for label, edit in (("overlap", overlap), ("gap", gap)):
+        snapshot = copy_snapshot("llama_tied", label)
+        _rewrite_header(snapshot / "model.safetensors", edit)
+        error = _expect_error(ErrorCode.INVALID_MODEL, _import, engine, snapshot)
+        assert "data section" in error.message or "overlap" in error.message, error.message
+    assert engine.store.list_ready() == []
+
+
+def test_import_model_refuses_snapshot_only_adapters(snapshots, engine):
+    from wse.adapters.hf_causal_lm import read_snapshot
+    from wse.schemas import ImportManifest
+
+    imported = read_snapshot(snapshots["qwen3"], repo=REPO, revision=REVISION, registry=engine.registry)
+    request = ImportManifest(adapter="hf_causal_lm@1", config=imported.config)
+    error = _expect_error(ErrorCode.INVALID_ARGUMENT, engine.import_model, request, imported.tensors)
+    assert "import_hf_snapshot" in error.message
+    assert engine.store.list_ready() == []

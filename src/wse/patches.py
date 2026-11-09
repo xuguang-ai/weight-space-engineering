@@ -186,9 +186,13 @@ def _edit_step(
     label, ref, operator = _resolve_operator(operator_id, registry, policy)
     capabilities = model.adapter.capabilities()
     require_capabilities(capabilities, operator.spec, adapter=str(model.adapter_ref), always=_EDIT_CAPABILITIES)
-    if capabilities.shared_parameters or model.architecture.alias_groups:
-        raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY, "edits of models with shared parameters are not supported")
     info = _info(model, tensor)
+    # Adapters with shared parameters list every alias group in their architecture
+    # (AdapterCapabilities.shared_parameters); only members of a group are refused.
+    if any(info.name in group for group in model.architecture.alias_groups):
+        raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY,
+                       f"tensor {info.name!r} belongs to an alias group (one shared parameter); edits of shared "
+                       "parameters are not supported", details={"tensor": info.name})
     if info.dtype not in EDITABLE_DTYPES:
         raise WSEError(
             ErrorCode.INVALID_ARGUMENT,

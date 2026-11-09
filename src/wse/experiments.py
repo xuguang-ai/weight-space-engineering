@@ -83,15 +83,17 @@ from wse.schemas import (
     Provenance,
     RunGrant,
     StorageCost,
+    TensorInfo,
     TensorStatistics,
     Usage,
     WSEError,
     canonical_json,
     json_hash,
 )
+from wse.tensors import blob_id
 
 if TYPE_CHECKING:
-    from wse.api import Engine
+    from wse.api import Engine, ModelHandle
     from wse.schemas import AnalysisResult, TensorSlice
 
 PATCH_URI_PREFIX = "wse://patches/"
@@ -135,6 +137,21 @@ def _hashable(value: Any) -> Any:
 
 def _number(value: Any) -> int | float:
     return int(value) if float(value).is_integer() else float(value)
+
+
+def _candidate_tensor_infos(base_manifest: ModelManifest, base: ModelHandle, candidate: ModelHandle) -> list[TensorInfo]:
+    """The base manifest's tensor entries with the blob IDs of the candidate's tensors.
+
+    Tensors a patch did not change are shared with the base handle and keep
+    their recorded blob IDs; changed tensors are hashed.
+    """
+    infos = []
+    for info in base_manifest.tensors:
+        tensor = candidate._tensors[info.name]
+        if info.blob_id is not None and tensor is not base._tensors[info.name]:
+            info = info.model_copy(update={"blob_id": blob_id(tensor)})
+        infos.append(info)
+    return infos
 
 
 class ExperimentService:
@@ -842,6 +859,7 @@ class ExperimentService:
             update={
                 "checkpoint_id": self.store.new_checkpoint_id(),
                 "weights_hash": candidate.weights_hash,
+                "tensors": _candidate_tensor_infos(base_manifest, base, candidate),
                 "provenance": Provenance(kind="patch", source=patch_id, parent_checkpoint_id=base_manifest.checkpoint_id),
             }
         )
