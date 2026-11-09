@@ -42,14 +42,16 @@ from wse.schemas import (
     ModelIdentity,
     ModelList,
     ModelManifest,
+    ModelSource,
     ModelSummary,
     TensorDiff,
     Usage,
     WSEError,
     canonical_json,
     json_hash,
+    model_identity,
 )
-from wse.tensors import normalize_tensors, weights_hash
+from wse.tensors import hash_weights, normalize_tensors, weights_hash_scheme
 
 if TYPE_CHECKING:
     from wse.adapters.base import AdapterCapabilities
@@ -99,7 +101,8 @@ class ModelHandle:
     """An in-memory model with content identity and adapter metadata.
 
     The handle owns private tensor copies; accessors return copies, so callers
-    cannot change the weights behind the recorded hash.
+    cannot change the weights behind the recorded hash. ``source`` is the
+    snapshot source of an imported open-weight model, part of its identity.
     """
 
     adapter_ref: ExtensionRef
@@ -109,12 +112,11 @@ class ModelHandle:
     architecture: Architecture
     adapter: ModelAdapter = field(repr=False)
     _tensors: Mapping[str, torch.Tensor] = field(repr=False)
+    source: ModelSource | None = None
 
     @property
     def identity(self) -> ModelIdentity:
-        return ModelIdentity(
-            adapter=self.adapter_ref, config_hash=self.config_hash, weights_hash=self.weights_hash
-        )
+        return model_identity(self.adapter_ref, self.config_hash, self.weights_hash, self.source)
 
     @property
     def config(self) -> dict[str, Any]:
@@ -258,10 +260,11 @@ def _build_handle(
         adapter_ref=adapter_ref,
         config_json=canonical_json(config),
         config_hash=json_hash(config),
-        weights_hash=weights_hash(ordered),
+        weights_hash=hash_weights(ordered, weights_hash_scheme(adapter)),
         architecture=architecture,
         adapter=adapter,
         _tensors=MappingProxyType(ordered),
+        source=getattr(manifest, "source", None),
     )
 
 
@@ -742,6 +745,64 @@ class Engine:
             dedup_key=dedup_key,
             event_type="checkpoint.imported",
         )
+
+    def import_hf_snapshot(
+        self,
+        snapshot: str | Path,
+        *,
+        repo: str,
+        revision: str,
+        family: str | ExtensionRef | None = None,
+        license: str = "unspecified",
+        max_bytes: int | None = None,
+    ) -> ModelManifest:
+        """Import a local Hugging Face snapshot through ``hf_causal_lm@1`` (operator only).
+
+        ``repo`` and ``revision`` name the source the operator downloaded; WSE
+        reads only allow-listed files and never unpickles or executes anything.
+        ``family`` names a family descriptor exactly; by default the single
+        registered descriptor that accepts the configuration's ``model_type`` is
+        used, and none at Level 0. Importing an identical snapshot again
+        returns the existing checkpoint and stores nothing.
+        """
+        from wse.adapters.hf_causal_lm import (
+            ADAPTER_ID,
+            ADAPTER_VERSION,
+            DEFAULT_MAX_HF_MODEL_BYTES,
+            INPUT_SEMANTICS,
+            OUTPUT_SEMANTICS,
+            read_snapshot,
+        )
+        from wse.schemas import Provenance
+        from wse.tensors import blob_weights_hash
+
+        self._require_operator("importing a model")
+        adapter_ref, _ = _resolve_adapter(self.registry, f"{ADAPTER_ID}@{ADAPTER_VERSION}")
+        imported = read_snapshot(snapshot, repo=repo, revision=revision, registry=self.registry, family=family,
+                                 max_bytes=DEFAULT_MAX_HF_MODEL_BYTES if max_bytes is None else max_bytes)
+        weights = blob_weights_hash(imported.tensors, {info.name: info.blob_id for info in imported.infos})
+        try:
+            manifest = ModelManifest(
+                checkpoint_id=self.store.new_checkpoint_id(),
+                weights_hash=weights,
+                config_hash=json_hash(imported.config),
+                adapter=adapter_ref,
+                config=imported.config,
+                tensors=imported.infos,
+                parameter_count=imported.parameter_count,
+                input_semantics=INPUT_SEMANTICS,
+                output_semantics=OUTPUT_SEMANTICS,
+                alias_groups=imported.alias_groups,
+                provenance=Provenance(kind="import", source=f"{repo}@{revision}"[:256]),
+                license=license,
+                source=imported.source,
+            )
+        except ValidationError as exc:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, f"invalid import request: {exc}") from exc
+        identity = manifest.model_dump(mode="json")
+        del identity["checkpoint_id"]
+        return self.store.commit_checkpoint(manifest, imported.tensors, dedup_key=json_hash({"import_hf": identity}),
+                                            event_type="checkpoint.imported")
 
     def import_bundle(self, path: str | Path) -> ModelManifest:
         """Import a bundle directory (operator only)."""

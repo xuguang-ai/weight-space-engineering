@@ -1,7 +1,7 @@
 """Explicit, versioned extension registration.
 
-The operator registers each adapter, operator, evaluator, or strategy under an
-exact ``(kind, extension_id, version)``. Resolution is exact: an unknown or
+The operator registers each adapter, operator, evaluator, strategy, or family
+descriptor under an exact ``(kind, extension_id, version)``. Resolution is exact: an unknown or
 missing version is rejected rather than replaced by the latest one. A
 reference without a version (``"mlp"``) resolves only through an alias the
 operator declares with ``register_alias`` (the built-in registry maps ``mlp``
@@ -18,7 +18,7 @@ from typing import Any, Literal, get_args
 
 from wse.schemas import EXTENSION_ID_PATTERN, ErrorCode, ExtensionRef, WSEError
 
-ExtensionKind = Literal["adapter", "operator", "evaluator", "strategy"]
+ExtensionKind = Literal["adapter", "operator", "evaluator", "strategy", "family"]
 EXTENSION_KINDS: tuple[str, ...] = get_args(ExtensionKind)
 
 Validator = Callable[[str, str, Any], None]
@@ -71,12 +71,19 @@ def _validate_strategy(extension_id: str, version: str, implementation: Any) -> 
     validate_strategy(extension_id, version, implementation)
 
 
+def _validate_family(extension_id: str, version: str, implementation: Any) -> None:
+    from wse.adapters.families import validate_family
+
+    validate_family(extension_id, version, implementation)
+
+
 # Per-kind compatibility checks run at registration time.
 KIND_VALIDATORS: dict[str, Validator] = {
     "adapter": _validate_adapter,
     "operator": _validate_operator,
     "evaluator": _validate_evaluator,
     "strategy": _validate_strategy,
+    "family": _validate_family,
 }
 
 
@@ -199,7 +206,14 @@ class Registry:
 
 
 def builtin_registry() -> Registry:
-    """Return a new registry containing the built-in M1 extensions."""
+    """Return a new registry containing the built-in extensions.
+
+    M1's extensions, plus the generic Hugging Face causal-LM adapter
+    ``hf_causal_lm@1`` and the built-in family descriptors (M2). None of them
+    imports ``transformers`` until it is used.
+    """
+    from wse.adapters.families import BUILTIN_FAMILIES
+    from wse.adapters.hf_causal_lm import HFCausalLMAdapter
     from wse.adapters.mlp import MLPAdapter
     from wse.evaluators.classification import ClassificationEvaluator
     from wse.evaluators.forward_batch import ForwardBatchEvaluator
@@ -210,6 +224,10 @@ def builtin_registry() -> Registry:
     adapter = MLPAdapter()
     registry.register("adapter", adapter.adapter_id, adapter.version, adapter)
     registry.register_alias("adapter", adapter.adapter_id, f"{adapter.adapter_id}@{adapter.version}")
+    hf_adapter = HFCausalLMAdapter(registry)
+    registry.register("adapter", hf_adapter.adapter_id, hf_adapter.version, hf_adapter)
+    for descriptor in BUILTIN_FAMILIES:
+        registry.register("family", descriptor.family_id, descriptor.version, descriptor)
     for operator in [*BUILTIN_ANALYSES.values(), *BUILTIN_EDITS.values()]:
         registry.register("operator", operator.spec.operator_id, operator.spec.version, operator)
     for evaluator in (ForwardBatchEvaluator(), ClassificationEvaluator()):

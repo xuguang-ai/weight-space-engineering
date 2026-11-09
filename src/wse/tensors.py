@@ -7,6 +7,15 @@ also includes the adapter and configuration hash.
 
 A blob ID (``blob_id``) identifies one tensor's raw bytes alone: the SHA-256
 of its little-endian row-major bytes in the stored dtype.
+
+Two weights-hash schemes exist. M1 checkpoints keep ``weights_hash`` (names,
+dtypes, shapes, and raw bytes), so their identities never change. Imported
+open-weight models use ``blob_weights_hash`` (M2 plan Section 2.1): names,
+dtypes, shapes, and blob IDs in canonical name order, which a blob manifest
+alone determines. An adapter selects its scheme with the attribute
+``weights_hash_scheme``; storage accepts a checkpoint whose recorded hash
+matches either scheme (``weights_hash_matches``), because the two are
+domain-separated.
 """
 
 from __future__ import annotations
@@ -36,6 +45,9 @@ _DTYPE_NAMES: dict[torch.dtype, str] = {
 }
 
 _WEIGHTS_HASH_DOMAIN = b"wse-weights-v1\x00"
+_BLOB_WEIGHTS_HASH_DOMAIN = b"wse-weights-blobs-v1\x00"
+WEIGHTS_HASH_RAW = "raw_bytes_v1"
+WEIGHTS_HASH_BLOBS = "blob_ids_v1"
 _TENSOR_HASH_DOMAIN = b"wse-tensor-v1\x00"
 
 if sys.byteorder != "little":  # pragma: no cover - all supported platforms are little-endian
@@ -224,6 +236,51 @@ def weights_hash(tensors: Mapping[str, torch.Tensor]) -> str:
     for name in names:
         _update_tensor(digest, name, tensors[name])
     return "sha256:" + digest.hexdigest()
+
+
+def blob_weights_hash(tensors: Mapping[str, torch.Tensor], blob_ids: Mapping[str, str] | None = None) -> str:
+    """Canonical hash of a set of named tensors over their blob IDs (M2 plan Section 2.1).
+
+    Each tensor contributes its name, dtype, shape, and blob ID, in canonical
+    (sorted) name order. ``blob_ids`` supplies already verified blob IDs, so
+    the hash of a stored checkpoint needs no second pass over its bytes.
+    """
+    digest = hashlib.sha256(_BLOB_WEIGHTS_HASH_DOMAIN)
+    names = sorted(tensors)
+    digest.update(struct.pack("<Q", len(names)))
+    for name in names:
+        tensor = tensors[name]
+        encoded_name = name.encode("utf-8")
+        encoded_dtype = dtype_name(tensor).encode("ascii")
+        digest.update(struct.pack("<Q", len(encoded_name)) + encoded_name)
+        digest.update(struct.pack("<Q", len(encoded_dtype)) + encoded_dtype)
+        digest.update(struct.pack("<Q", tensor.dim()))
+        for size in tensor.shape:
+            digest.update(struct.pack("<Q", size))
+        blob = blob_ids[name] if blob_ids is not None else blob_id(tensor)
+        digest.update(bytes.fromhex(blob))
+    return "sha256:" + digest.hexdigest()
+
+
+def hash_weights(tensors: Mapping[str, torch.Tensor], scheme: str = WEIGHTS_HASH_RAW) -> str:
+    """The weights hash of ``tensors`` under ``scheme`` (an adapter's ``weights_hash_scheme``)."""
+    if scheme == WEIGHTS_HASH_RAW:
+        return weights_hash(tensors)
+    if scheme == WEIGHTS_HASH_BLOBS:
+        return blob_weights_hash(tensors)
+    raise WSEError(ErrorCode.INVALID_MODEL, f"unknown weights-hash scheme {scheme!r}")
+
+
+def weights_hash_scheme(adapter: Any) -> str:
+    """The weights-hash scheme an adapter declares; M1 adapters use the raw-bytes scheme."""
+    return getattr(adapter, "weights_hash_scheme", WEIGHTS_HASH_RAW)
+
+
+def weights_hash_matches(
+    expected: str, tensors: Mapping[str, torch.Tensor], blob_ids: Mapping[str, str] | None = None
+) -> bool:
+    """True when ``expected`` is the weights hash of ``tensors`` under either scheme."""
+    return blob_weights_hash(tensors, blob_ids) == expected or weights_hash(tensors) == expected
 
 
 def resolve_selection(selection: Any, shape: Sequence[int], *, tensor: str) -> tuple[slice, ...]:

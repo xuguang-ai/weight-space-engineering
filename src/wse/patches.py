@@ -44,7 +44,7 @@ from wse.schemas import (
     TensorInfo,
     WSEError,
 )
-from wse.tensors import resolve_selection, tensor_hash, weights_hash
+from wse.tensors import hash_weights, resolve_selection, tensor_hash, weights_hash_scheme
 
 if TYPE_CHECKING:
     from wse.api import EditResult, ModelHandle
@@ -95,10 +95,11 @@ def _derive(model: ModelHandle, tensors: Mapping[str, torch.Tensor]) -> ModelHan
         adapter_ref=model.adapter_ref,
         config_json=model.config_json,
         config_hash=model.config_hash,
-        weights_hash=weights_hash(ordered),
+        weights_hash=hash_weights(ordered, weights_hash_scheme(model.adapter)),
         architecture=architecture,
         adapter=model.adapter,
         _tensors=MappingProxyType(ordered),
+        source=model.source,
     )
 
 

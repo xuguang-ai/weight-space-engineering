@@ -73,7 +73,7 @@ from wse.tensors import (
     dtype_name,
     raw_bytes_view,
     tensor_from_buffer,
-    weights_hash,
+    weights_hash_matches,
 )
 
 WEIGHTS_DIR = "weights"
@@ -260,8 +260,20 @@ class ArtifactStore:
 
     def _publish_weights(self, relpath: str, tensors: Mapping[str, torch.Tensor], expected: str) -> tuple[str, int]:
         def write(path: Path) -> None:
-            save_file({name: tensors[name] for name in sorted(tensors)}, str(path))
-            if weights_hash(load_file(str(path))) != expected:
+            # safetensors refuses tensors that share memory (an alias group's members
+            # can be one tensor), so every member after the first is written from a copy.
+            ordered: dict[str, torch.Tensor] = {}
+            storages: set[int] = set()
+            for name in sorted(tensors):
+                tensor = tensors[name]
+                pointer = tensor.untyped_storage().data_ptr() if tensor.numel() else None
+                if pointer is not None and pointer in storages:
+                    tensor = tensor.clone()
+                elif pointer is not None:
+                    storages.add(pointer)
+                ordered[name] = tensor
+            save_file(ordered, str(path))
+            if not weights_hash_matches(expected, load_file(str(path))):
                 raise WSEError(
                     ErrorCode.ARTIFACT_CORRUPT,
                     "written weights did not read back with the expected content hash",
@@ -367,7 +379,7 @@ class ArtifactStore:
         else:
             # The single-file path checks this on read-back; an index must not
             # register tensors under another weights hash either.
-            if weights_hash(tensors) != manifest.weights_hash:
+            if not weights_hash_matches(manifest.weights_hash, tensors, {e.name: e.blob_id for e in entries}):
                 raise WSEError(ErrorCode.ARTIFACT_CORRUPT, "tensors do not match the manifest's weights hash")
             weights_rel = f"{WEIGHTS_DIR}/{_hex(manifest.weights_hash)}.json"
             weights_sha, weights_size = self._publish_weights_index(weights_rel, manifest.weights_hash, entries)
@@ -472,7 +484,7 @@ class ArtifactStore:
             except WSEError:
                 continue  # every checkpoint that uses it is now CORRUPT
             tensors = load_file(str(path))
-            if weights_hash(tensors) != row["content_hash"]:
+            if not weights_hash_matches(row["content_hash"], tensors):
                 self._mark_corrupt_for_artifact(row["artifact_id"], "weights content hash mismatch")
                 continue
             entries = _tensor_entries(tensors)
@@ -751,14 +763,16 @@ class ArtifactStore:
         manifest = self.load_manifest(checkpoint_id)
         tensors: dict[str, torch.Tensor] = {}
         buffers: dict[str, bytearray] = {}
-        for entry in self._weight_entries(checkpoint_id):
+        entries = self._weight_entries(checkpoint_id)
+        for entry in entries:
             buffer = buffers.get(entry.blob_id)
             if buffer is None:
                 buffer = buffers[entry.blob_id] = self._read_blob(entry.blob_id)
             else:
                 buffer = bytearray(buffer)
             tensors[entry.name] = tensor_from_buffer(buffer, dtype_from_name(entry.dtype), entry.shape)
-        if weights_hash(tensors) != manifest.weights_hash:
+        # Every blob was checked against its ID, so the blob-ID scheme needs no second pass.
+        if not weights_hash_matches(manifest.weights_hash, tensors, {e.name: e.blob_id for e in entries}):
             self._mark_corrupt([checkpoint_id], "weights content hash mismatch")
             raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"weights of {checkpoint_id} failed their content hash")
         return tensors

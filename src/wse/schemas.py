@@ -230,14 +230,35 @@ class AxisSlice(_Frozen):
 # ---------------------------------------------------------------------------
 
 
+def _is_none(value: Any) -> bool:
+    return value is None
+
+
+def _optional(**kwargs: Any) -> Any:
+    """An optional field that is omitted from serialized output while unset.
+
+    M2 adds fields to M1 contracts this way, so M1 manifests, identities, and
+    their canonical JSON stay byte-identical.
+    """
+    return Field(default=None, exclude_if=_is_none, **kwargs)
+
+
 class TensorInfo(_Frozen):
-    """Name, shape, dtype, and per-axis semantics of one stored tensor."""
+    """Name, shape, dtype, and per-axis semantics of one stored tensor.
+
+    ``module_name`` is the parameter name in the runtime module when it differs
+    from the canonical (checkpoint) name or the model is imported from a
+    snapshot; ``blob_id`` is the tensor's content-addressed blob (M2 plan
+    Sections 2.1 and 3.1). Both are absent for M1 models.
+    """
 
     name: str
     shape: list[int]
     dtype: str
     axes: list[str]
     element_count: int
+    module_name: str | None = _optional(min_length=1)
+    blob_id: str | None = _optional(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")
     def _check_axes(self) -> TensorInfo:
@@ -335,12 +356,60 @@ class BundleManifest(_Frozen):
         )
 
 
+class ModelSource(_Frozen):
+    """Where an open-weight model snapshot came from, and the hashes of what was read (M2 plan Section 2.1).
+
+    ``files`` maps every snapshot file the importer read to its SHA-256.
+    ``tokenizer_hash`` covers the tokenizer files present, the chat template
+    hash covers the template text, and ``generation_config_hash`` the
+    generation configuration; each is ``None`` when the snapshot has none.
+    """
+
+    repository: str = Field(min_length=1, max_length=256)
+    revision: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9._/-]+$")
+    family: ExtensionRef | None = None
+    files: dict[str, str]
+    tokenizer_hash: str | None = Field(default=None, pattern=HASH_PATTERN.pattern)
+    chat_template_hash: str | None = Field(default=None, pattern=HASH_PATTERN.pattern)
+    generation_config_hash: str | None = Field(default=None, pattern=HASH_PATTERN.pattern)
+    dropped_tensor_count: int = Field(default=0, ge=0)
+
+
 class ModelIdentity(_Frozen):
-    """Behavioral model identity: architecture adapter, configuration, and weights."""
+    """Behavioral model identity: architecture adapter, configuration, and weights.
+
+    For an imported open-weight model it also comprises the tokenizer, chat
+    template, and generation-configuration hashes and the source repository and
+    revision (M1 plan Section 3, M2 plan Section 2.1). Those fields are absent
+    for M1 models.
+    """
 
     adapter: ExtensionRef
     config_hash: str
     weights_hash: str
+    tokenizer_hash: str | None = _optional()
+    chat_template_hash: str | None = _optional()
+    generation_config_hash: str | None = _optional()
+    source_repository: str | None = _optional()
+    source_revision: str | None = _optional()
+
+
+def model_identity(
+    adapter: ExtensionRef, config_hash: str, weights_hash: str, source: ModelSource | None = None
+) -> ModelIdentity:
+    """The identity of a model; a snapshot import adds its source's hashes, repository, and revision."""
+    if source is None:
+        return ModelIdentity(adapter=adapter, config_hash=config_hash, weights_hash=weights_hash)
+    return ModelIdentity(
+        adapter=adapter,
+        config_hash=config_hash,
+        weights_hash=weights_hash,
+        tokenizer_hash=source.tokenizer_hash,
+        chat_template_hash=source.chat_template_hash,
+        generation_config_hash=source.generation_config_hash,
+        source_repository=source.repository,
+        source_revision=source.revision,
+    )
 
 
 class ModelManifest(_Frozen):
@@ -359,6 +428,7 @@ class ModelManifest(_Frozen):
     alias_groups: list[list[str]] = Field(default_factory=list)
     provenance: Provenance
     license: str
+    source: ModelSource | None = _optional()
 
     @field_validator("config")
     @classmethod
@@ -367,11 +437,7 @@ class ModelManifest(_Frozen):
 
     @property
     def identity(self) -> ModelIdentity:
-        return ModelIdentity(
-            adapter=self.adapter,
-            config_hash=self.config_hash,
-            weights_hash=self.weights_hash,
-        )
+        return model_identity(self.adapter, self.config_hash, self.weights_hash, self.source)
 
     def tensor_info(self, name: str) -> TensorInfo:
         """Return the tensor with exactly this name, or raise ``NOT_FOUND``."""

@@ -41,7 +41,8 @@ def test_builtin_registry_contains_mlp_adapter():
     adapter = registry.resolve("adapter", "mlp", "1")
     assert isinstance(adapter, MLPAdapter)
     assert isinstance(adapter, ModelAdapter)
-    assert registry.list("adapter") == [ExtensionRef.parse("mlp@1")]
+    # M2 adds the generic Hugging Face causal-LM adapter to the built-ins.
+    assert registry.list("adapter") == [ExtensionRef.parse("hf_causal_lm@1"), ExtensionRef.parse("mlp@1")]
     assert registry.list("operator") == [
         ExtensionRef.parse("scale_slice@1"),
         ExtensionRef.parse("set_slice@1"),
@@ -126,7 +127,7 @@ def test_unknown_kind_and_malformed_ids_are_rejected():
         registry.register("operator", "Bad-Name", "1", object())
     with pytest.raises(WSEError):
         registry.register("operator", "ok", "latest", object())
-    assert set(EXTENSION_KINDS) == {"adapter", "operator", "evaluator", "strategy"}
+    assert set(EXTENSION_KINDS) == {"adapter", "operator", "evaluator", "strategy", "family"}  # family: M2
 
 
 def test_adapter_registration_validates_contract():

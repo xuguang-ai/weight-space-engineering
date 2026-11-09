@@ -1,6 +1,7 @@
 """Operator command-line interface (``wse``).
 
-This milestone provides ``wse import``, ``wse grant-run``, ``wse serve`` (the
+This milestone provides ``wse import``, ``wse import-hf`` (a local Hugging Face
+snapshot through ``hf_causal_lm@1``), ``wse grant-run``, ``wse serve`` (the
 stdio MCP server for one run grant; see ``wse.mcp_server``), ``wse worker``
 (the evaluation worker process; see ``wse.worker``), ``wse freeze``,
 ``wse final-evaluate``, ``wse report``, the read-only operator views
@@ -41,6 +42,15 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
     importer = commands.add_parser("import", help="import a model bundle and print its manifest")
     importer.add_argument("bundle", help="bundle directory containing wse_bundle.json")
+    import_hf = commands.add_parser(
+        "import-hf", help="import a local Hugging Face snapshot (hf_causal_lm@1) and print its manifest")
+    import_hf.add_argument("snapshot", help="snapshot directory (for example from 'hf download --local-dir')")
+    import_hf.add_argument("--repo", required=True, help="the source repository ID, for example Qwen/Qwen3.5-0.8B")
+    import_hf.add_argument("--revision", required=True, help="the source revision (commit SHA) that was downloaded")
+    import_hf.add_argument("--family", default=None,
+                           help="an exact family descriptor '<id>@<version>' (default: the one registered for the "
+                                "configuration's model_type, if any)")
+    import_hf.add_argument("--license", default="unspecified", help="the model's license label")
     grant = commands.add_parser("grant-run", help="issue a run grant (one experiment) and print it")
     grant.add_argument("task_id")
     grant.add_argument("policy_id")
@@ -207,6 +217,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         with Engine(args.workspace) as engine:
             if args.command == "import":
                 manifest = engine.import_bundle(args.bundle)
+                print(json.dumps(manifest.model_dump(mode="json"), indent=2, sort_keys=True))
+            elif args.command == "import-hf":
+                manifest = engine.import_hf_snapshot(args.snapshot, repo=args.repo, revision=args.revision,
+                                                     family=args.family, license=args.license)
                 print(json.dumps(manifest.model_dump(mode="json"), indent=2, sort_keys=True))
             elif args.command == "grant-run":
                 granted = engine.grant_run(args.task_id, args.policy_id, args.base_checkpoint_id)
