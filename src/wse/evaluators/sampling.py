@@ -21,6 +21,11 @@
 * **Seeds.** ``sample_seed`` derives each (problem, sample) pair's seed from
   the profile seed, the evaluation seed, the problem ID, and the sample index,
   so a row's draws do not depend on the other rows of its batch.
+* **Prompts.** ``render_prompt`` applies the model's chat template with the
+  profile's arguments and a fixed clock (``template_clock``): a template that
+  prints the current date through ``strftime_now`` (a "Today Date" line, for
+  example) prints ``TEMPLATE_DATE`` instead, so one profile renders one
+  prompt on every day.
 
 This module imports neither ``transformers`` nor ``math_verify``.
 """
@@ -30,7 +35,10 @@ from __future__ import annotations
 import hashlib
 import math
 import re
-from collections.abc import Mapping
+import threading
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from datetime import datetime, tzinfo
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -64,6 +72,10 @@ QWEN35THINK = GenerationProfile(
     source="lm_understand-logs exp8_math/code/profiles.py (qwen35think)",
 )
 BUILTIN_PROFILES = (QWEN35THINK,)
+
+# The clock a chat template sees through strftime_now: fixed, so a rendered prompt never depends on the day it is
+# rendered (the M2 plan's start date; changing it changes every prompt that reads the date).
+TEMPLATE_DATE = datetime(2026, 11, 9)
 
 DEFAULT_PROFILE_VERSION = "1"
 DEFAULT_PROFILE_SUFFIX = "_default"
@@ -275,20 +287,70 @@ def user_message(profile: GenerationProfile, problem: str) -> str:
     return problem + profile.user_suffix
 
 
+class _TemplateClock(datetime):
+    """A ``datetime`` whose ``now()`` is ``TEMPLATE_DATE``: the clock chat templates see while WSE renders them."""
+
+    @classmethod
+    def now(cls, tz: tzinfo | None = None) -> datetime:  # type: ignore[override]
+        return TEMPLATE_DATE if tz is None else TEMPLATE_DATE.replace(tzinfo=tz)
+
+
+_CLOCK_LOCK = threading.Lock()
+
+
+@contextmanager
+def template_clock(chat_template: str) -> Iterator[None]:
+    """Render ``chat_template`` with its ``strftime_now`` reading ``TEMPLATE_DATE`` instead of the current time.
+
+    ``transformers`` gives templates a ``strftime_now`` global that formats
+    ``datetime.now()`` of its ``chat_template_utils`` module, and it turns
+    every template argument into plain JSON data, so the function cannot be
+    passed as an argument. While a template that mentions ``strftime_now``
+    renders, that module's ``datetime`` is therefore this module's
+    ``_TemplateClock`` (under a lock, restored afterwards). Templates that do
+    not mention it render unchanged.
+    """
+    if "strftime_now" not in chat_template:
+        yield
+        return
+    from transformers.utils import chat_template_utils
+
+    with _CLOCK_LOCK:
+        original = getattr(chat_template_utils, "datetime", None)
+        if not (isinstance(original, type) and issubclass(original, datetime)):
+            raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY,
+                           "the chat template reads the current date, and this transformers version does not let WSE "
+                           "fix the date it sees")
+        chat_template_utils.datetime = _TemplateClock
+        try:
+            yield
+        finally:
+            chat_template_utils.datetime = original
+
+
 def render_prompt(tokenizer: Any, profile: GenerationProfile, problem: str) -> str:
-    """The prompt text: the user message through the model's chat template with the profile's arguments."""
+    """The prompt text: the user message through the model's chat template with the profile's arguments.
+
+    The template sees ``TEMPLATE_DATE`` as the current date
+    (``template_clock``), so a template that prints today's date renders the
+    same prompt on every day; a profile may still set a template variable
+    such as ``date_string`` through ``chat_template_kwargs``.
+    """
     content = user_message(profile, problem)
     if not profile.chat_template:
         return content
-    if not getattr(tokenizer, "chat_template", None):
+    template = getattr(tokenizer, "chat_template", None)
+    if not template:
         raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY,
                        f"profile {profile.ref} uses a chat template, but the model has none")
     messages = ([{"role": "system", "content": profile.system_prompt}] if profile.system_prompt is not None else []) \
         + [{"role": "user", "content": content}]
-    return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
-                                         **profile.chat_template_kwargs)
+    with template_clock(template if isinstance(template, str) else str(template)):
+        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                             **profile.chat_template_kwargs)
 
 
 __all__ = ["BOXED_INSTRUCTION", "BOXED_SUFFIX", "BUILTIN_PROFILES", "DEFAULT_MAX_NEW_TOKENS", "PresencePenalty",
-           "QWEN35THINK", "default_profile_id", "logits_processors", "processed_scores", "profile_from_generation_config",
-           "profile_sampling", "render_prompt", "resolve_profile", "sample_seed", "user_message", "with_overrides"]
+           "QWEN35THINK", "TEMPLATE_DATE", "default_profile_id", "logits_processors", "processed_scores",
+           "profile_from_generation_config", "profile_sampling", "render_prompt", "resolve_profile", "sample_seed",
+           "template_clock", "user_message", "with_overrides"]

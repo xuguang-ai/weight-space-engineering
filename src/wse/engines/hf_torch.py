@@ -204,6 +204,16 @@ class HFTorchModel:
         self._logits_to_keep = "logits_to_keep" in parameters
         self._position_ids = "position_ids" in parameters
 
+    @property
+    def max_positions(self) -> int | None:
+        """The model's context length (``max_position_embeddings`` or ``n_positions``), if its configuration sets one."""
+        config = getattr(self.module, "config", None)
+        for key in ("max_position_embeddings", "n_positions"):
+            value = getattr(config, key, None)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                return value
+        return None
+
     def info(self) -> dict[str, Any]:
         """Device, stored dtypes, model class, attention implementation, and library versions."""
         transformers = _transformers()
@@ -269,7 +279,9 @@ class HFTorchModel:
         """Decode up to ``max_new_tokens`` per row with a KV cache; greedy unless ``sampling`` is given.
 
         Prompts in a batch are left-padded and masked by ``attention_mask``.
-        Sampling needs one seed per row. Each logits processor receives the
+        The prompt width plus ``max_new_tokens`` must fit the model's context
+        (``max_positions``), as vLLM requires of a request. Sampling needs one
+        seed per row. Each logits processor receives the
         token IDs so far (prompt and output, ``[batch, length]``) and float32
         scores ``[batch, vocab]`` and returns new scores.
         """
@@ -277,6 +289,12 @@ class HFTorchModel:
         batch = input_ids.shape[0]
         if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int) or max_new_tokens < 1:
             raise _invalid_argument("max_new_tokens must be a positive integer")
+        context = self.max_positions
+        if context is not None and input_ids.shape[1] + max_new_tokens > context:
+            raise _invalid_argument(
+                f"a prompt of {input_ids.shape[1]} tokens plus max_new_tokens {max_new_tokens} exceeds the model's "
+                f"context of {context} positions", prompt_tokens=int(input_ids.shape[1]),
+                max_new_tokens=max_new_tokens, context=context)
         stops = [int(token) for token in stop_token_ids]
         if any(not 0 <= token < self._vocab_size for token in [*stops, pad_token_id]):
             raise _invalid_argument(f"stop and pad token IDs must lie in [0, {self._vocab_size})")

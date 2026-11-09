@@ -179,7 +179,8 @@ def test_each_problem_and_sample_has_its_own_reproducible_seed(llama):
 
     handle, files = llama
     text_model = load_text_model(handle, files, device="cpu")
-    profile = _profile(max_new_tokens=10, chat_template_kwargs={})
+    # No instruction suffix: the longest prompt plus 10 new tokens must fit the fixture's 128 positions.
+    profile = _profile(max_new_tokens=10, chat_template_kwargs={}, user_suffix="")
     items = [TextItem(item_id="p0", problem="add two and two", reference="4"),
              TextItem(item_id="p1", problem="what is six", reference="6"),
              TextItem(item_id="p2", problem="a much longer problem text that pads the others", reference="1")]
@@ -564,3 +565,98 @@ def test_model_files_are_stored_at_import_and_verified_on_read(hf_snapshots, tmp
         again = engine.import_hf_snapshot(snapshot, repo=REPO, revision=REVISION)
         assert again.checkpoint_id == manifest.checkpoint_id
         assert engine.model_files(manifest.checkpoint_id) == files
+
+
+# -- review fixes: a fixed template clock, prompt identities, and the context limit --------------------
+
+
+def test_a_template_that_reads_the_date_renders_the_fixed_template_date(llama, monkeypatch):
+    import datetime as dt
+
+    from transformers.utils import chat_template_utils
+
+    from wse.evaluators.generation import load_text_model
+    from wse.evaluators.sampling import TEMPLATE_DATE, render_prompt
+
+    class OtherDay(dt.datetime):  # the host's clock on another day
+        @classmethod
+        def now(cls, tz=None):
+            return dt.datetime(2031, 3, 4)
+
+    monkeypatch.setattr(chat_template_utils, "datetime", OtherDay)
+    handle, files = llama
+    tokenizer = load_text_model(handle, files, device="cpu").tokenizer
+    tokenizer.chat_template = "Today Date: {{ strftime_now('%d %b %Y') }}|" + tokenizer.chat_template
+    messages = [{"role": "user", "content": "x"}]
+    # Without the fixed clock the prompt would depend on the day it is rendered.
+    assert tokenizer.apply_chat_template(messages, tokenize=False).startswith("Today Date: 04 Mar 2031|")
+    profile = _profile(chat_template_kwargs={})
+    rendered = render_prompt(tokenizer, profile, "x")
+    assert rendered == f"Today Date: {TEMPLATE_DATE:%d %b %Y}|<user>x\n{INSTRUCTION}<assistant>"
+    assert chat_template_utils.datetime is OtherDay  # the module's clock is restored afterwards
+    assert render_prompt(tokenizer, profile, "x") == rendered
+    # A profile argument still takes precedence where the template reads one.
+    tokenizer.chat_template = "{% if date_string is not defined %}{% set date_string = strftime_now('%Y') %}" \
+                              "{% endif %}{{ date_string }}|{{ messages[0]['content'] }}"
+    assert render_prompt(tokenizer, _profile(chat_template_kwargs={"date_string": "D"}), "x").startswith("D|")
+    assert render_prompt(tokenizer, profile, "x").startswith(f"{TEMPLATE_DATE:%Y}|")
+
+
+def test_prompt_hashes_bind_reports_and_refuse_comparisons_of_different_prompts(llama):
+    from wse.evaluators.generation import (TextModel, compare_generation, evaluate_generation, load_text_model,
+                                           prompts_hash, token_hash)
+    from wse.evaluators.sampling import render_prompt
+    from wse.schemas import TextItem
+
+    handle, files = llama
+    real = load_text_model(handle, files, device="cpu")
+    script = {"one": "\\boxed{4}<STOP>", "two": "\\boxed{5}<STOP>"}
+    items = [TextItem(item_id="a", problem="problem one", reference="4"),
+             TextItem(item_id="b", problem="problem two", reference="4")]
+    suite = _text_suite(items)
+
+    def run(tokenizer):
+        text_model = TextModel(runtime=ScriptedRuntime(tokenizer, script, real.stop_token_ids[0]), tokenizer=tokenizer,
+                               stop_token_ids=real.stop_token_ids, pad_token_id=real.pad_token_id)
+        return evaluate_generation(handle, suite, EvalConfig(sample_count=2, seed=0), text_model=text_model,
+                                   profile_overrides={"max_new_tokens": 20})
+
+    base = run(real.tokenizer)
+    expected = [token_hash(real.tokenizer(render_prompt(real.tokenizer, _profile(max_new_tokens=20), item.problem),
+                                          add_special_tokens=False)["input_ids"]) for item in items]
+    assert [p.prompt_sha256 for p in base.problems] == expected
+    assert base.execution.parameters["prompts_hash"] == prompts_hash(expected)
+    assert compare_generation(base, run(real.tokenizer)).differences["accuracy"].estimate == 0
+    # The same suite, profile, and seed, but a prompt rendered differently, is another configuration.
+    other = load_text_model(handle, files, device="cpu").tokenizer
+    other.chat_template = "[sys]" + other.chat_template
+    changed = run(other)
+    assert changed.metrics == base.metrics and changed.evaluator_config_hash != base.evaluator_config_hash
+    error = _expect(ErrorCode.INCOMPATIBLE_REPORTS, compare_generation, base, changed)
+    assert error.details["mismatched"] == ["evaluator_config_hash"]
+    # Per-problem prompt hashes are checked as well.
+    import dataclasses
+
+    swapped = dataclasses.replace(changed, evaluator_config_hash=base.evaluator_config_hash)
+    error = _expect(ErrorCode.INCOMPATIBLE_REPORTS, compare_generation, base, swapped)
+    assert error.details["mismatched"] == ["problems"]
+
+
+def test_generation_beyond_the_model_context_is_refused(hf_snapshots, tmp_path):
+    from wse.evaluators.generation import generate_samples, load_text_model
+    from wse.schemas import TextItem
+
+    with Engine(tmp_path / "workspace") as engine:
+        manifest = engine.import_hf_snapshot(hf_snapshots["gpt2"], repo="example-org/gpt2", revision=REVISION)
+        handle, files = engine.open_checkpoint(manifest.checkpoint_id), engine.model_files(manifest.checkpoint_id)
+    text_model = load_text_model(handle, files, device="cpu")  # GPT-2 fixture: learned positions, n_positions 128
+    assert text_model.runtime.max_positions == 128
+    items = [TextItem(item_id="p", problem="add one and one", reference="2")]
+    profile = _profile(max_new_tokens=128, chat_template_kwargs={}, user_suffix="")
+    error = _expect(ErrorCode.INVALID_ARGUMENT, generate_samples, text_model, profile, items, [(0, 0)], eval_seed=0)
+    assert error.details["context"] == 128 and error.details["max_new_tokens"] == 128
+    prompt = error.details["prompt_tokens"]
+    assert 0 < prompt < 64
+    fits = generate_samples(text_model, profile.model_copy(update={"max_new_tokens": 128 - prompt}), items,
+                            [(0, 0)], eval_seed=0)
+    assert len(fits[0].tokens) <= 128 - prompt

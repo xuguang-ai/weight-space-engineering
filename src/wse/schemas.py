@@ -1479,10 +1479,16 @@ class SampleResult(_Frozen):
 
 
 class ProblemResult(_Frozen):
-    """The samples of one problem of a generation suite, in sample order."""
+    """The samples of one problem of a generation suite, in sample order.
+
+    ``prompt_sha256`` identifies the prompt's token IDs as the model received
+    them (rendered with the profile's chat template), so two evaluations that
+    rendered a problem differently are recognized as incomparable.
+    """
 
     index: int = Field(ge=0)
     item_id: str
+    prompt_sha256: str = Field(pattern=HASH_PATTERN.pattern)
     samples: list[SampleResult] = Field(min_length=1)
 
 

@@ -25,11 +25,13 @@ problems.
 * **Identity.** The result binds the model identity (weights, configuration,
   tokenizer, chat template, generation configuration), the suite and data
   hashes, and an execution configuration whose parameters add the resolved
-  profile's hash, so a changed profile, grader, or limit is a different
-  configuration. ``runtime`` records the engine's device, stored dtypes, and
+  profile's hash and ``prompts_hash`` (over every evaluated problem's prompt
+  token IDs), so a changed profile, grader, limit, or rendered prompt is a
+  different configuration. ``runtime`` records the engine's device, stored dtypes, and
   library versions.
-* **Per-problem results.** Every sample's seed, grade, read answer, length,
-  and limit hit, plus a hash of its tokens (``ProblemResult``).
+* **Per-problem results.** The hash of the problem's prompt tokens, and
+  every sample's seed, grade, read answer, length, and limit hit, plus a hash
+  of its tokens (``ProblemResult``).
 
 ``compare_generation`` pairs two evaluations of one suite and configuration.
 Managed generation jobs (metered tokens, the worker's model cache) are not
@@ -165,7 +167,7 @@ def load_text_model(handle: ModelHandle, files: Mapping[str, bytes], *, device: 
 
 @dataclass(frozen=True)
 class SampleOutput:
-    """One generated row: its problem index, sample index, seed, tokens (stop token included), and text."""
+    """One generated row: its problem index, sample index, seed, prompt hash, tokens (stop token included), and text."""
 
     index: int
     sample: int
@@ -174,6 +176,17 @@ class SampleOutput:
     tokens: list[int]
     finished: bool
     text: str
+    prompt_sha256: str
+
+
+def token_hash(tokens: Sequence[int]) -> str:
+    """``sha256:`` of token IDs as little-endian int64: the identity of a prompt or an output."""
+    return "sha256:" + hashlib.sha256(np.asarray(list(tokens), dtype="<i8").tobytes()).hexdigest()
+
+
+def prompts_hash(prompt_hashes: Sequence[str]) -> str:
+    """The hash of an evaluation's prompts: SHA-256 over the per-problem prompt hashes, in problem order."""
+    return "sha256:" + hashlib.sha256("\n".join(prompt_hashes).encode("ascii")).hexdigest()
 
 
 def _encode(text_model: TextModel, profile: GenerationProfile, prompt: str) -> list[int]:
@@ -198,6 +211,7 @@ def generate_samples(text_model: TextModel, profile: GenerationProfile, items: S
     sampling = profile_sampling(profile)
     prompts = {index: _encode(text_model, profile, render_prompt(text_model.tokenizer, profile, items[index].problem))
                for index in sorted({index for index, _ in rows})}
+    prompt_hashes = {index: token_hash(ids) for index, ids in prompts.items()}
     outputs: list[SampleOutput] = []
     for start in range(0, len(rows), batch_size):
         if check is not None:
@@ -220,7 +234,8 @@ def generate_samples(text_model: TextModel, profile: GenerationProfile, items: S
             body = tokens[:-1] if finished and tokens else tokens  # the text excludes the stop token
             text = text_model.tokenizer.decode(body, skip_special_tokens=True)
             outputs.append(SampleOutput(index=index, sample=sample, item_id=items[index].item_id, seed=seed,
-                                        tokens=list(tokens), finished=bool(finished), text=text))
+                                        tokens=list(tokens), finished=bool(finished), text=text,
+                                        prompt_sha256=prompt_hashes[index]))
     return outputs
 
 
@@ -349,11 +364,10 @@ class GenerationEvaluator:
 
 def _grade(grader: Any, output: SampleOutput, reference: str, max_new_tokens: int) -> SampleResult:
     graded = grader.grade(output.text, reference)
-    digest = hashlib.sha256(np.asarray(output.tokens, dtype="<i8").tobytes()).hexdigest()
     return SampleResult(sample=output.sample, seed=output.seed, correct=bool(graded.correct), answer=graded.answer,
                         generated_tokens=len(output.tokens), finished=output.finished,
                         limit_hit=not output.finished and len(output.tokens) >= max_new_tokens,
-                        output_sha256="sha256:" + digest)
+                        output_sha256=token_hash(output.tokens))
 
 
 def _library_versions() -> dict[str, str]:
@@ -417,18 +431,21 @@ def evaluate_generation(
     outputs = generate_samples(text_model, profile, items, rows, eval_seed=eval_config.seed, batch_size=batch_size,
                                check=check)
     by_problem: dict[int, list[SampleResult]] = {}
+    prompt_hashes: dict[int, str] = {}
     for output in outputs:
         by_problem.setdefault(output.index, []).append(_grade(grader, output, items[output.index].reference,
                                                               profile.max_new_tokens))
+        prompt_hashes[output.index] = output.prompt_sha256
     elapsed = time.perf_counter() - start
-    problems = tuple(ProblemResult(index=index, item_id=items[index].item_id,
+    problems = tuple(ProblemResult(index=index, item_id=items[index].item_id, prompt_sha256=prompt_hashes[index],
                                    samples=sorted(by_problem[index], key=lambda s: s.sample))
                      for index in range(count))
     metrics, intervals, clusters = generation_metrics(problems)
     samples, cluster_ids = _flatten(problems)
     runtime = {**text_model.runtime.info(), **_library_versions()}
     execution = ExecutionConfig(evaluator=suite.evaluator,
-                                parameters={**parameters, "profile_hash": profile.profile_hash},
+                                parameters={**parameters, "profile_hash": profile.profile_hash,
+                                            "prompts_hash": prompts_hash([p.prompt_sha256 for p in problems])},
                                 eval_config=eval_config, batch_size=batch_size, device=runtime.get("device", "cpu"))
     batches = -(-len(rows) // batch_size)
     steps = sum(max(len(o.tokens) for o in outputs[b * batch_size : (b + 1) * batch_size]) for b in range(batches))
@@ -469,9 +486,10 @@ def compare_generation(base: Any, candidate: Any) -> GenerationComparison:
                        "and configuration", details={"mismatched": mismatched})
     if base.problems is None or candidate.problems is None:
         raise WSEError(ErrorCode.INCOMPATIBLE_REPORTS, "both evaluations need per-problem results")
-    keys = [[(p.item_id, s.sample, s.seed) for s in p.samples] for p in base.problems]
-    if keys != [[(p.item_id, s.sample, s.seed) for s in p.samples] for p in candidate.problems]:
-        raise WSEError(ErrorCode.INCOMPATIBLE_REPORTS, "the evaluations cover different problems, samples, or seeds",
+    keys = [[(p.item_id, p.prompt_sha256, s.sample, s.seed) for s in p.samples] for p in base.problems]
+    if keys != [[(p.item_id, p.prompt_sha256, s.sample, s.seed) for s in p.samples] for p in candidate.problems]:
+        raise WSEError(ErrorCode.INCOMPATIBLE_REPORTS,
+                       "the evaluations cover different problems, prompts, samples, or seeds",
                        details={"mismatched": ["problems"]})
     base_samples, clusters = _flatten(base.problems)
     candidate_samples, _ = _flatten(candidate.problems)
@@ -493,4 +511,4 @@ def compare_generation(base: Any, candidate: Any) -> GenerationComparison:
 
 __all__ = ["GenerationEvaluator", "SampleOutput", "TextModel", "compare_generation", "evaluate_generation",
            "generate_samples", "generation_metrics", "load_text_model", "mean_interval", "model_stop_tokens",
-           "paired_mean_difference", "suite_parameters"]
+           "paired_mean_difference", "prompts_hash", "suite_parameters", "token_hash"]
