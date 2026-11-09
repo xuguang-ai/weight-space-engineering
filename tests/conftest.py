@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 from types import ModuleType
 
@@ -38,3 +39,16 @@ def workspace(tmp_path: Path) -> Path:
 def engine(workspace: Path):
     with Engine(workspace) as managed:
         yield managed
+
+
+HF_SKIP_REASON = "the models-hf extra (transformers) is not installed"
+
+
+@pytest.fixture(scope="session")
+def hf_snapshots(tmp_path_factory) -> dict[str, Path]:
+    """Tiny random Hugging Face snapshots built offline (tests/hf_fixtures.py), once per session."""
+    pytest.importorskip("transformers", reason=HF_SKIP_REASON)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import hf_fixtures
+
+    return hf_fixtures.build_all(tmp_path_factory.mktemp("hf_snapshots"))

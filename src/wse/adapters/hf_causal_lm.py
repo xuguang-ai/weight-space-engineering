@@ -43,6 +43,8 @@ import torch
 from pydantic import ValidationError
 
 from wse.adapters.base import (
+    CAP_FORWARD_LOGITS,
+    CAP_GENERATE_TEXT,
     CAP_WEIGHTS_READ,
     CAP_WEIGHTS_SLICE_EDIT,
     AdapterCapabilities,
@@ -63,6 +65,7 @@ from wse.schemas import (
 from wse.tensors import WEIGHTS_HASH_BLOBS, blob_id, dtype_name, require_finite
 
 if TYPE_CHECKING:
+    from wse.engines.hf_torch import HFTorchModel
     from wse.registry import Registry
 
 ADAPTER_ID = "hf_causal_lm"
@@ -190,7 +193,7 @@ def _axes(module: torch.nn.Module, local_name: str, parameter: torch.Tensor) -> 
     return axes if len(axes) == dim else ("unknown",) * dim
 
 
-def _causal_lm(model_config: dict[str, Any], descriptor: FamilyDescriptor | None) -> tuple[Any, Any]:
+def causal_lm_class(model_config: dict[str, Any], descriptor: FamilyDescriptor | None) -> tuple[Any, Any]:
     """The ``transformers`` causal-LM class and its configuration object for ``model_config``."""
     transformers = _transformers()
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
@@ -233,7 +236,7 @@ def _causal_lm(model_config: dict[str, Any], descriptor: FamilyDescriptor | None
 
 def module_layout(model_config: dict[str, Any], descriptor: FamilyDescriptor | None) -> ModuleLayout:
     """Instantiate the causal LM on the meta device and describe every parameter."""
-    model_class, config = _causal_lm(model_config, descriptor)
+    model_class, config = causal_lm_class(model_config, descriptor)
     try:
         with torch.device("meta"):
             module = model_class(config)
@@ -422,8 +425,10 @@ class HFCausalLMAdapter:
     """Level 0 adapter for causal LMs that ``transformers`` implements natively.
 
     ``registry`` resolves the family descriptor a configuration names. Forward
-    passes, generation, and probes arrive with the engine (M2 plan Task 4);
-    until then the adapter advertises only weight reads and slice edits.
+    passes and generation run through ``wse.engines.hf_torch``: ``runtime``
+    builds the module for a configuration and its stored tensors. The M1
+    ``forward(tensors, inputs)`` contract carries no configuration, so model
+    handles call ``runtime`` instead (``ModelHandle.forward``).
     """
 
     adapter_id = ADAPTER_ID
@@ -434,8 +439,10 @@ class HFCausalLMAdapter:
         self._registry = registry
 
     def capabilities(self) -> AdapterCapabilities:
-        return AdapterCapabilities(capabilities=frozenset({CAP_WEIGHTS_READ, CAP_WEIGHTS_SLICE_EDIT}),
-                                   shared_parameters=True)
+        return AdapterCapabilities(
+            capabilities=frozenset({CAP_WEIGHTS_READ, CAP_WEIGHTS_SLICE_EDIT, CAP_FORWARD_LOGITS, CAP_GENERATE_TEXT}),
+            shared_parameters=True,
+        )
 
     def _parse(self, config: Mapping[str, Any]) -> tuple[dict[str, Any], FamilyDescriptor | None]:
         if not isinstance(config, Mapping) or set(config) != {"model_config", "family"}:
@@ -494,9 +501,22 @@ class HFCausalLMAdapter:
         require_finite(tensors)
         return architecture.model_copy(update={"tensors": infos})
 
+    def runtime(self, config: Mapping[str, Any], tensors: Mapping[str, torch.Tensor], architecture: Architecture,
+                *, device: str | torch.device | None = None) -> HFTorchModel:
+        """Build the module for ``config`` with ``tensors`` (canonical names) on ``device``."""
+        from wse.engines.hf_torch import build_model
+
+        model_config, descriptor = self._parse(config)
+        # Members of an alias group are one parameter: the module gets one tensor for all of them.
+        source = {name: group[0] for group in architecture.alias_groups for name in group}
+        by_module = {info.module_name or info.name: tensors[source.get(info.name, info.name)]
+                     for info in architecture.tensors}
+        return build_model(model_config, descriptor, by_module, device=device)
+
     def forward(self, tensors: Mapping[str, torch.Tensor], inputs: torch.Tensor) -> torch.Tensor:
         raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY,
-                       "hf_causal_lm@1 runs forward passes through wse.engines.hf_torch, which is not available yet")
+                       "hf_causal_lm@1 needs the model configuration to run; call ModelHandle.forward or "
+                       "ModelHandle.runtime, which build the module through wse.engines.hf_torch")
 
 
 def _count(shape: tuple[int, ...]) -> int:

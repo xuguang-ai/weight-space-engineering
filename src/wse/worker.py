@@ -352,7 +352,7 @@ class Worker:
 
         def run_forward(inputs: torch.Tensor) -> torch.Tensor:
             with torch.inference_mode():
-                return handle.adapter.forward(handle._tensors, inputs)
+                return handle.forward(inputs)
 
         meter.bind(run_forward)
         return evaluate_candidate(handle, suite, config, registry=self.engine.registry, forward=meter,

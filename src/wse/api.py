@@ -113,6 +113,7 @@ class ModelHandle:
     adapter: ModelAdapter = field(repr=False)
     _tensors: Mapping[str, torch.Tensor] = field(repr=False)
     source: ModelSource | None = None
+    _runtimes: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def identity(self) -> ModelIdentity:
@@ -141,8 +142,27 @@ class ModelHandle:
     def tensors(self) -> dict[str, torch.Tensor]:
         return {name: self._tensors[name].clone() for name in self.tensor_names()}
 
+    def runtime(self, device: str | torch.device | None = None) -> Any:
+        """The adapter's inference module for these weights on ``device`` (default: ``mps`` when available).
+
+        Only adapters that run through an engine (``hf_causal_lm@1``) provide
+        one. It is built once per device and shares the handle's tensors on
+        CPU; it is for direct library use and the worker only.
+        """
+        build = getattr(self.adapter, "runtime", None)
+        if not callable(build):
+            raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY, f"adapter {self.adapter_ref} has no engine runtime")
+        from wse.engines.hf_torch import select_device
+
+        key = select_device(device).type
+        if key not in self._runtimes:
+            self._runtimes[key] = build(self.config, self._tensors, self.architecture, device=key)
+        return self._runtimes[key]
+
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         """Unmanaged inference through the adapter (direct library use only)."""
+        if callable(getattr(self.adapter, "runtime", None)):
+            return self.runtime().logits(inputs)
         return self.adapter.forward(self._tensors, inputs)
 
 

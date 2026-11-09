@@ -139,7 +139,9 @@ def _number(value: Any) -> int | float:
     return int(value) if float(value).is_integer() else float(value)
 
 
-def _candidate_tensor_infos(base_manifest: ModelManifest, base: ModelHandle, candidate: ModelHandle) -> list[TensorInfo]:
+def _candidate_tensor_infos(
+    base_manifest: ModelManifest, base: ModelHandle, candidate: ModelHandle
+) -> list[TensorInfo]:
     """The base manifest's tensor entries with the blob IDs of the candidate's tensors.
 
     Tensors a patch did not change are shared with the base handle and keep

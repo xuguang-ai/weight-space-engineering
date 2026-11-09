@@ -27,6 +27,7 @@ from wse.tensors import dtype_name
 CAP_WEIGHTS_READ = "weights.read"
 CAP_WEIGHTS_SLICE_EDIT = "weights.slice_edit"
 CAP_FORWARD_LOGITS = "forward.logits"
+CAP_GENERATE_TEXT = "generate.text"
 
 
 class AdapterCapabilities(BaseModel):

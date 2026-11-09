@@ -31,13 +31,11 @@ import hf_fixtures  # noqa: E402
 
 REPO = "example-org/tiny-model"
 REVISION = "0123456789abcdef0123456789abcdef01234567"
-SKIP_REASON = "the models-hf extra (transformers) is not installed"
 
 
 @pytest.fixture(scope="session")
-def snapshots(tmp_path_factory) -> dict[str, Path]:
-    pytest.importorskip("transformers", reason=SKIP_REASON)
-    return hf_fixtures.build_all(tmp_path_factory.mktemp("hf_snapshots"))
+def snapshots(hf_snapshots) -> dict[str, Path]:
+    return hf_snapshots
 
 
 @pytest.fixture
