@@ -356,6 +356,54 @@ class BundleManifest(_Frozen):
         )
 
 
+class GenerationProfile(_Frozen):
+    """A registered, versioned sampling configuration for generation (M2 plan Section 4.2).
+
+    The prompt is the problem followed by ``user_suffix``, rendered as the
+    user turn of the model's chat template with ``chat_template_kwargs``
+    (for example ``{"enable_thinking": true}``), after an optional system
+    turn; with ``chat_template`` false the prompt is that text alone.
+    Decoding is greedy unless ``do_sample``; sampling applies the presence
+    penalty, then temperature, top-k (``None`` keeps every token), and top-p.
+    Each (problem, sample) pair draws from its own seed, derived from
+    ``seed``. ``stop_token_ids`` ``None`` stops at the model's end-of-sequence
+    tokens. ``source`` says where the settings came from, and
+    ``ignored_settings`` lists settings of that source that WSE does not apply.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    profile_id: str = Field(pattern=EXTENSION_ID_PATTERN.pattern)
+    version: str = Field(pattern=VERSION_PATTERN.pattern)
+    description: str = Field(default="", max_length=1024)
+    chat_template: bool = True
+    chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
+    system_prompt: str | None = Field(default=None, max_length=8192)
+    user_suffix: str = Field(default="", max_length=8192)
+    do_sample: bool
+    temperature: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    top_k: StrictInt | None = Field(default=None, ge=1)
+    top_p: float = Field(default=1.0, gt=0, le=1, allow_inf_nan=False)
+    presence_penalty: float = Field(default=0.0, allow_inf_nan=False)
+    max_new_tokens: StrictInt = Field(ge=1, le=1_048_576)
+    seed: StrictInt = Field(default=0, ge=0)
+    stop_token_ids: list[StrictInt] | None = None
+    source: str | None = Field(default=None, max_length=256)
+    ignored_settings: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("chat_template_kwargs", "ignored_settings")
+    @classmethod
+    def _plain(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _check_json_object(value)
+
+    @property
+    def ref(self) -> ExtensionRef:
+        return ExtensionRef(extension_id=self.profile_id, version=self.version)
+
+    @property
+    def profile_hash(self) -> str:
+        return json_hash(self.model_dump(mode="json"))
+
+
 class ModelSource(_Frozen):
     """Where an open-weight model snapshot came from, and the hashes of what was read (M2 plan Section 2.1).
 
@@ -363,6 +411,8 @@ class ModelSource(_Frozen):
     ``tokenizer_hash`` covers the tokenizer files present, the chat template
     hash covers the template text, and ``generation_config_hash`` the
     generation configuration; each is ``None`` when the snapshot has none.
+    ``default_profile`` is the model's default generation profile, frozen from
+    its ``generation_config.json`` at import (M2 plan Section 4.2).
     """
 
     repository: str = Field(min_length=1, max_length=256)
@@ -373,6 +423,7 @@ class ModelSource(_Frozen):
     chat_template_hash: str | None = Field(default=None, pattern=HASH_PATTERN.pattern)
     generation_config_hash: str | None = Field(default=None, pattern=HASH_PATTERN.pattern)
     dropped_tensor_count: int = Field(default=0, ge=0)
+    default_profile: GenerationProfile | None = _optional()
 
 
 class ModelIdentity(_Frozen):
@@ -1089,6 +1140,83 @@ class DatasetManifest(_Frozen):
         )
 
 
+class TextItem(_Frozen):
+    """One problem of a text suite: a stable ID, the problem text, and the reference its grader reads."""
+
+    item_id: str = Field(min_length=1, max_length=256)
+    problem: str = Field(min_length=1)
+    reference: str
+
+    @field_validator("problem")
+    @classmethod
+    def _nonblank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("a problem must not be blank")
+        return value
+
+
+class TextSuiteData(_Frozen):
+    """Problems of a generation suite (M2 plan Section 4.3). Every problem is its own cluster."""
+
+    kind: Literal["text"] = "text"
+    items: list[TextItem] = Field(min_length=1)
+    cluster_unit: Literal["problem"] = "problem"
+
+    @model_validator(mode="after")
+    def _unique(self) -> TextSuiteData:
+        ids = [item.item_id for item in self.items]
+        if len(set(ids)) != len(ids):
+            raise ValueError("item IDs must be unique")
+        return self
+
+    @property
+    def example_count(self) -> int:
+        return len(self.items)
+
+    def cluster_ids(self) -> list[int]:
+        return list(range(len(self.items)))
+
+    def cuts_clusters(self, sample_count: int) -> bool:
+        return False
+
+    @property
+    def data_hash(self) -> str:
+        return json_hash(self.model_dump(mode="json"))
+
+
+class TextDatasetManifest(_Frozen):
+    """Description of a text dataset held in evaluator storage, without its problems.
+
+    ``source_format`` and ``source_sha256`` name the JSON Lines file the
+    problems were read from and its SHA-256.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    kind: Literal["text"] = "text"
+    data_hash: str = Field(pattern=HASH_PATTERN.pattern)
+    example_count: int = Field(ge=1)
+    cluster_unit: Literal["problem"] = "problem"
+    cluster_count: int = Field(ge=1)
+    source_format: str | None = None
+    source_sha256: str | None = Field(default=None, pattern=HASH_PATTERN.pattern)
+
+    @classmethod
+    def from_data(cls, data: TextSuiteData, *, source_format: str | None = None,
+                  source_sha256: str | None = None) -> TextDatasetManifest:
+        return cls(data_hash=data.data_hash, example_count=data.example_count, cluster_count=data.example_count,
+                   source_format=source_format, source_sha256=source_sha256)
+
+
+def dataset_manifest_matches(data: SuiteData | TextSuiteData, manifest: DatasetManifest | TextDatasetManifest) -> bool:
+    """Whether ``manifest`` describes ``data`` (a text manifest's source fields are not part of the data)."""
+    if isinstance(data, TextSuiteData) != isinstance(manifest, TextDatasetManifest):
+        return False
+    if isinstance(manifest, TextDatasetManifest):
+        return TextDatasetManifest.from_data(data, source_format=manifest.source_format,
+                                             source_sha256=manifest.source_sha256) == manifest
+    return DatasetManifest.from_data(data) == manifest
+
+
 class EvaluationSuite(_Frozen):
     """An operator-registered evaluation suite.
 
@@ -1113,8 +1241,8 @@ class EvaluationSuite(_Frozen):
     parameters: dict[str, Any] = Field(default_factory=dict)
     sample_counts: list[StrictInt] = Field(min_length=1)
     seeds: list[StrictInt] = Field(min_length=1)
-    data: SuiteData | None = None
-    dataset: DatasetManifest | None = None
+    data: SuiteData | TextSuiteData | None = None
+    dataset: DatasetManifest | TextDatasetManifest | None = None
 
     @field_validator("parameters")
     @classmethod
@@ -1126,7 +1254,7 @@ class EvaluationSuite(_Frozen):
         if self.data is None and self.dataset is None:
             raise ValueError("a suite needs inline data or a dataset manifest")
         if self.data is not None and self.dataset is not None \
-                and DatasetManifest.from_data(self.data) != self.dataset:
+                and not dataset_manifest_matches(self.data, self.dataset):
             raise ValueError("the attached examples do not match the suite's dataset manifest")
         size = self.example_count
         if any(not 1 <= count <= size for count in self.sample_counts):
@@ -1157,7 +1285,7 @@ class EvaluationSuite(_Frozen):
         """The form stored at registration: stored examples are detached."""
         return self.model_copy(update={"data": None}) if self.dataset is not None else self
 
-    def resolved(self, data: SuiteData) -> EvaluationSuite:
+    def resolved(self, data: SuiteData | TextSuiteData) -> EvaluationSuite:
         """This suite with its stored examples attached (in memory only)."""
         return EvaluationSuite.model_validate({**self.model_dump(mode="json"), "data": data.model_dump(mode="json")})
 
@@ -1296,7 +1424,8 @@ class ExecutionConfig(_Frozen):
     parameters: dict[str, Any]
     eval_config: EvalConfig
     batch_size: int = Field(ge=1)
-    device: Literal["cpu"] = EVALUATION_DEVICE
+    # M1 evaluations run on the CPU; generation evaluations record the engine's device (M2 plan Section 4.1).
+    device: Literal["cpu", "mps"] = EVALUATION_DEVICE
 
     @property
     def config_hash(self) -> str:
@@ -1331,6 +1460,32 @@ class ClusterSummary(_Frozen):
     fully_correct: int
 
 
+class SampleResult(_Frozen):
+    """One generated sample of a problem: its seed, grade, length, and whether it reached the token limit.
+
+    ``answer`` is the answer the grader read (at most 200 characters; ``None``
+    when there was none). ``output_sha256`` identifies the generated token
+    IDs, so identical generations can be recognized without the text.
+    """
+
+    sample: int = Field(ge=0)
+    seed: int = Field(ge=0)
+    correct: bool
+    answer: str | None = None
+    generated_tokens: int = Field(ge=0)
+    finished: bool
+    limit_hit: bool
+    output_sha256: str = Field(pattern=HASH_PATTERN.pattern)
+
+
+class ProblemResult(_Frozen):
+    """The samples of one problem of a generation suite, in sample order."""
+
+    index: int = Field(ge=0)
+    item_id: str
+    samples: list[SampleResult] = Field(min_length=1)
+
+
 class EvaluationReport(_Frozen):
     """A persisted, managed evaluation bound to exact model, data, and configuration identities.
 
@@ -1340,6 +1495,10 @@ class EvaluationReport(_Frozen):
     when the task declares no accuracy target; otherwise it is whether the
     report is of the task's own development suite, covers all of its
     ``development_examples``, and meets the target.
+
+    Generation reports (M2) add ``problems`` (per-problem samples: grades,
+    lengths, limit hits; development reports only) and ``runtime`` (the
+    engine's device, stored dtypes, model class, and library versions).
     """
 
     schema_version: Literal["1"] = SCHEMA_VERSION
@@ -1371,6 +1530,8 @@ class EvaluationReport(_Frozen):
     truncation_count: int = 0
     management: Management = "managed"
     created_at: str
+    problems: list[ProblemResult] | None = _optional()
+    runtime: dict[str, Any] | None = _optional()
 
     @property
     def report_uri(self) -> str:
@@ -1381,6 +1542,27 @@ class EvaluationReport(_Frozen):
         return {"report_id": self.report_id, "report_uri": self.report_uri, "metrics": dict(self.metrics),
                 "sample_count": self.sample_count, "errors": list(self.errors),
                 "truncation_count": self.truncation_count, "target_met": self.target_met}
+
+
+class GenerationComparison(_Frozen):
+    """Paired candidate-minus-base differences of two generation evaluations on one suite and configuration.
+
+    ``differences`` holds ``accuracy``, ``limit_hit_rate``, and
+    ``mean_generated_tokens``, each with a paired cluster-bootstrap interval
+    over problems.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    suite_id: str
+    data_hash: str
+    evaluator_config_hash: str
+    base_model: ModelIdentity
+    candidate_model: ModelIdentity
+    problems: int
+    samples: int
+    base: dict[str, float]
+    candidate: dict[str, float]
+    differences: dict[str, IntervalEstimate]
 
 
 class ComparisonReport(_Frozen):

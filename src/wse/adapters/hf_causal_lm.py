@@ -26,6 +26,10 @@ formats, and encoder-decoder models are rejected.
   (``wse.tensors.blob_weights_hash``); the manifest's ``source`` records the
   repository, revision, every file read with its SHA-256, and the tokenizer,
   chat-template, and generation-configuration hashes.
+* **Generation.** The import freezes the model's default generation profile
+  from its ``generation_config.json`` (``wse.evaluators.sampling``) into the
+  manifest's ``source``, and returns the bytes of the tokenizer, chat-template,
+  and generation-configuration files for the store to keep.
 
 ``transformers`` is imported lazily, only when a layout is built, so ``import
 wse`` and the registry work without the ``models-hf`` extra.
@@ -51,7 +55,8 @@ from wse.adapters.base import (
     Architecture,
 )
 from wse.adapters.families import FamilyDescriptor, map_names, select_family
-from wse.hf_snapshot import CONFIG_FILE, STORED_DTYPES, SnapshotReader, TensorHeader
+from wse.evaluators.sampling import profile_from_generation_config
+from wse.hf_snapshot import CONFIG_FILE, GENERATION_CONFIG_FILE, STORED_DTYPES, SnapshotReader, TensorHeader
 from wse.schemas import (
     ErrorCode,
     ExtensionRef,
@@ -274,6 +279,7 @@ class SnapshotImport:
     parameter_count: int
     source: ModelSource
     read_log: list[str] = field(default_factory=list)
+    model_files: dict[str, bytes] = field(default_factory=dict)  # tokenizer, chat template, generation config
 
 
 def _canonical(descriptor: FamilyDescriptor | None, module_name: str) -> str:
@@ -401,11 +407,16 @@ def read_snapshot(
     tokenizer_hash = reader.tokenizer_hash()
     chat_template_hash = reader.chat_template_hash()
     generation_config_hash = reader.generation_config_hash()
+    generation_config = reader.read_json(GENERATION_CONFIG_FILE) if generation_config_hash is not None else None
+    default_profile = profile_from_generation_config(
+        repo, generation_config, has_chat_template=chat_template_hash is not None,
+        source=f"{GENERATION_CONFIG_FILE} {generation_config_hash}" if generation_config_hash else None)
     try:
         source = ModelSource(
             repository=repo, revision=revision, family=family_ref, files=dict(sorted(reader.files.items())),
             tokenizer_hash=tokenizer_hash, chat_template_hash=chat_template_hash,
             generation_config_hash=generation_config_hash, dropped_tensor_count=len(dropped),
+            default_profile=default_profile,
         )
     except ValidationError as exc:  # pragma: no cover - inputs are checked above
         raise WSEError(ErrorCode.INVALID_ARGUMENT, f"invalid model source: {exc}") from exc
@@ -413,6 +424,7 @@ def read_snapshot(
         config={"model_config": model_config, "family": str(family_ref) if family_ref is not None else None},
         tensors=tensors, infos=infos, alias_groups=sorted(canonical_groups),
         parameter_count=layout.unique_parameter_count, source=source, read_log=reader.read_log,
+        model_files=dict(sorted(reader.contents.items())),
     )
 
 

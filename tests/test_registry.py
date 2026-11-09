@@ -127,7 +127,8 @@ def test_unknown_kind_and_malformed_ids_are_rejected():
         registry.register("operator", "Bad-Name", "1", object())
     with pytest.raises(WSEError):
         registry.register("operator", "ok", "latest", object())
-    assert set(EXTENSION_KINDS) == {"adapter", "operator", "evaluator", "strategy", "family"}  # family: M2
+    # family, profile, and grader: M2
+    assert set(EXTENSION_KINDS) == {"adapter", "operator", "evaluator", "strategy", "family", "profile", "grader"}
 
 
 def test_adapter_registration_validates_contract():

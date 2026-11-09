@@ -329,7 +329,8 @@ CORE_MODULES = (
     "wse.evaluators.datasets, wse.jobs, wse.worker, wse.budget, wse.runner, wse.hf_snapshot, "
     "wse.adapters.mlp, wse.adapters.families, wse.adapters.hf_causal_lm, wse.operators.base, "
     "wse.operators.tensor, wse.strategies.scripted, wse.engines, wse.engines.hf_torch, wse.patch_blocks, "
-    "wse.external_patches"
+    "wse.external_patches, wse.evaluators.sampling, wse.evaluators.graders, wse.evaluators.text_suites, "
+    "wse.evaluators.generation"
 )
 
 
@@ -343,7 +344,8 @@ def test_core_modules_import_no_transformers():
         f"""
         import sys
         import {CORE_MODULES}
-        print(sorted(m for m in sys.modules if m.split(".")[0] in ("transformers", "mcp", "agents", "openai")))
+        print(sorted(m for m in sys.modules
+                     if m.split(".")[0] in ("transformers", "math_verify", "mcp", "agents", "openai")))
         """
     )
     assert loaded.returncode == 0, loaded.stderr

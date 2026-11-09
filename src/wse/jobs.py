@@ -54,6 +54,8 @@ from wse.schemas import (
     EvaluationSuite,
     Job,
     JobProgress,
+    TextDatasetManifest,
+    TextSuiteData,
     Usage,
     WSEError,
     canonical_json,
@@ -147,16 +149,22 @@ class JobService:
             parsed = suite if isinstance(suite, EvaluationSuite) else EvaluationSuite.model_validate(dict(suite))
         except (ValidationError, TypeError) as exc:
             raise WSEError(ErrorCode.INVALID_ARGUMENT, f"invalid evaluation suite: {exc}") from exc
-        self.engine.registry.resolve_ref("evaluator", parsed.evaluator)
-        if parsed.split == "final" and parsed.dataset is None:
+        evaluator = self.engine.registry.resolve_ref("evaluator", parsed.evaluator)
+        if (parsed.split == "final" or isinstance(parsed.data, TextSuiteData)) and parsed.dataset is None:
             parsed = parsed.model_copy(update={"dataset": self.engine.datasets.put(parsed.data)})
         elif parsed.dataset is not None and parsed.data is not None:
             self.engine.datasets.put(parsed.data)
+        resolved = parsed
         if parsed.dataset is not None:
             try:
-                parsed.resolved(self.engine.datasets.load(parsed.dataset))  # verifies data and preregistration
+                resolved = parsed.resolved(self.engine.datasets.load(parsed.dataset))  # verifies data and preregistration
             except ValidationError as exc:
                 raise WSEError(ErrorCode.INVALID_ARGUMENT, f"invalid evaluation suite: {exc}") from exc
+        validate = getattr(evaluator, "validate_suite", None)
+        if callable(validate):
+            validate(resolved, self.engine.registry)
+        if isinstance(resolved.data, TextSuiteData):
+            self._check_text_overlap(resolved)
         if parsed.split == "final" and parsed.example_count not in parsed.sample_counts:
             raise WSEError(ErrorCode.INVALID_ARGUMENT,
                            f"a final suite must preregister its full size ({parsed.example_count}) as a sample count")
@@ -192,6 +200,36 @@ class JobService:
                     details={"suite_id": parsed.suite_id, "registered_hash": row["suite_hash"]},
                 )
         return parsed
+
+    def _check_text_overlap(self, suite: EvaluationSuite) -> None:
+        """Refuse development problems that occur in a final suite (M2 plan Section 4.3), in either order.
+
+        Problems compare by normalized text (``wse.evaluators.text_suites``).
+        Every registered suite of the other split counts, in every task, so a
+        practice set can never contain a final-suite problem.
+        """
+        from wse.evaluators.text_suites import overlapping_items
+
+        rows = self.db.conn.execute("SELECT suite_id FROM suites WHERE split != ? AND suite_id != ? "
+                                    "ORDER BY created_at, rowid", (suite.split, suite.suite_id)).fetchall()
+        for row in rows:
+            other = self._read_suite(row["suite_id"])
+            if not isinstance(other.dataset, TextDatasetManifest):
+                continue
+            other_data = self.engine.datasets.load(other.dataset)
+            dev_data, final_data = (suite.data, other_data) if suite.split == "development" else \
+                (other_data, suite.data)
+            overlap = overlapping_items(dev_data, final_data)
+            if overlap:
+                final_id = other.suite_id if suite.split == "development" else suite.suite_id
+                dev_id = suite.suite_id if suite.split == "development" else other.suite_id
+                raise WSEError(
+                    ErrorCode.INVALID_ARGUMENT,
+                    f"{len(overlap)} problems of development suite {dev_id} also occur (normalized) in final suite "
+                    f"{final_id}; remove them from the practice set (wse.evaluators.text_suites.exclude_overlap)",
+                    details={"overlapping_items": overlap[:50], "overlap_count": len(overlap),
+                             "development_suite_id": dev_id, "final_suite_id": final_id},
+                )
 
     def get_suite(self, suite_id: Any) -> EvaluationSuite:
         """A registered suite. A run-bound service sees only development suites of its run's task."""

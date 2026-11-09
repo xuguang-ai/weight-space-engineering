@@ -77,11 +77,13 @@ if TYPE_CHECKING:
         PatchPreview,
         PatchSpec,
         FinalEvaluationReport,
+        ProblemResult,
         Reservation,
         RunGrant,
         SuiteData,
         TaskDefinition,
         TensorSlice,
+        TextDatasetManifest,
     )
     from wse.store import ArtifactStore, RecoveryReport
     from wse.audit import ExportManifest, ReplayResult
@@ -200,7 +202,10 @@ class EvaluationResult:
     ``cluster_ids`` the cluster of every example; ``intervals`` holds the
     cluster-bootstrap accuracy interval and the Clopper-Pearson interval on
     fully correct clusters. The managed worker persists this result as an
-    ``EvaluationReport``; direct results stay ``unmanaged``.
+    ``EvaluationReport``; direct results stay ``unmanaged``. Generation
+    evaluations (``wse.evaluators.generation``) add ``problems`` (per-problem
+    samples) and ``runtime`` (device, stored dtypes, library versions); their
+    scores are per sample, clustered by problem.
     """
 
     metrics: Mapping[str, float]
@@ -221,6 +226,8 @@ class EvaluationResult:
     truncation_count: int
     elapsed_seconds: float
     management: Management = "unmanaged"
+    problems: tuple[ProblemResult, ...] | None = None
+    runtime: Mapping[str, Any] | None = None
 
 
 MODEL_PAGE_SIZE = 50
@@ -840,8 +847,76 @@ class Engine:
             raise WSEError(ErrorCode.INVALID_ARGUMENT, f"invalid import request: {exc}") from exc
         identity = manifest.model_dump(mode="json")
         del identity["checkpoint_id"]
+        for name, data in imported.model_files.items():  # content-addressed, so a re-import stores nothing new
+            digest = self.store.publish_model_file(data)
+            if imported.source.files.get(name) != "sha256:" + digest:  # pragma: no cover - read once, hashed once
+                raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"snapshot file {name} changed while it was imported")
         return self.store.commit_checkpoint(manifest, imported.tensors, dedup_key=json_hash({"import_hf": identity}),
                                             event_type="checkpoint.imported")
+
+    def model_files(self, checkpoint_id: str) -> dict[str, bytes]:
+        """The stored tokenizer, chat-template, and generation-configuration files of an imported model.
+
+        Operator and worker use only. Each file is read from the store by the
+        SHA-256 its manifest recorded at import and verified. A model imported
+        before files were kept has none (``NOT_FOUND``; import it again).
+        """
+        from wse.hf_snapshot import MODEL_TEXT_FILES
+
+        self._require_unbound("model_files")
+        manifest = self._manifest(self.require_visible(checkpoint_id))
+        if manifest.source is None:
+            raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY,
+                           f"checkpoint {checkpoint_id} is not an imported open-weight model and has no model files")
+        files = {}
+        for name, digest in manifest.source.files.items():
+            if name not in MODEL_TEXT_FILES:
+                continue
+            data = self.store.read_model_file(digest.removeprefix("sha256:"))
+            if data is None:
+                raise WSEError(ErrorCode.NOT_FOUND, f"model file {name} of checkpoint {checkpoint_id} is missing or "
+                               "does not match its recorded hash; import the snapshot again to store it",
+                               details={"file": name, "sha256": digest})
+            files[name] = data
+        return files
+
+    def register_text_dataset(self, path: str | Path, *, format: str,
+                              id_prefix: str | None = None) -> TextDatasetManifest:
+        """Read a JSON Lines file of problems into evaluator storage and return its manifest (operator only).
+
+        Formats are those of ``wse.evaluators.text_suites`` (``math500``,
+        ``gsm8k``, ``math``). The manifest records the data hash and the
+        file's SHA-256; a suite then references it as its ``dataset``.
+        """
+        from wse.evaluators.text_suites import read_jsonl
+
+        self._require_operator("storing evaluation data")
+        data, manifest = read_jsonl(path, format=format, id_prefix=id_prefix)
+        self.datasets.put(data)
+        return manifest
+
+    def evaluate_generation(self, checkpoint_id: str, suite_id: str, config: EvalConfig | Mapping[str, Any], *,
+                            device: str | None = None, batch_size: int = 8) -> EvaluationResult:
+        """Evaluate a checkpoint on a registered generation suite, directly (operator only, unmanaged).
+
+        The suite's problems come from evaluator storage; the profile, grader,
+        and samples per problem from its parameters. ``device`` defaults to
+        ``mps`` when available. The result is not persisted.
+        """
+        from wse.evaluators.generation import evaluate_generation
+
+        self._require_operator("direct generation evaluation")
+        suite = self.jobs._read_suite(suite_id)
+        if suite.data is None:
+            suite = suite.resolved(self.datasets.load(suite.dataset))
+        config = _as_eval_config(config)
+        if config.sample_count not in suite.sample_counts or config.seed not in suite.seeds:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                           f"eval_config must use a preregistered sample count {suite.sample_counts} and seed "
+                           f"{suite.seeds}")
+        handle = self.open_checkpoint(checkpoint_id)
+        return evaluate_generation(handle, suite, config, files=self.model_files(checkpoint_id),
+                                   registry=self.registry, batch_size=batch_size, device=device)
 
     def import_patch(
         self,

@@ -2,7 +2,8 @@
 
 Datasets live under ``<workspace>/evaluator/datasets/``, outside
 ``artifacts/``, as read-only canonical JSON named by the hex digest of their
-``data_hash``. An optional generation record (for example the generator and
+``data_hash``: tensor examples (``SuiteData``) or the problems of a
+generation suite (``TextSuiteData``, M2). An optional generation record (for example the generator and
 seed of a pregenerated final set) is stored next to the data and is read
 only by operator code. Suites, reports, and comparisons refer to a dataset
 only through its ``DatasetManifest``.
@@ -27,8 +28,11 @@ from wse.schemas import (
     DatasetManifest,
     ErrorCode,
     SuiteData,
+    TextDatasetManifest,
+    TextSuiteData,
     WSEError,
     canonical_json,
+    dataset_manifest_matches,
 )
 
 EVALUATOR_DIR = "evaluator"
@@ -71,12 +75,18 @@ class DatasetStore:
         finally:
             os.close(directory)
 
-    def put(self, data: SuiteData | Mapping[str, Any], *,
-            generation: Mapping[str, Any] | None = None) -> DatasetManifest:
+    def put(self, data: SuiteData | TextSuiteData | Mapping[str, Any], *,
+            generation: Mapping[str, Any] | None = None) -> DatasetManifest | TextDatasetManifest:
         """Store a dataset (operator only) and return its manifest; storing it again is a no-op."""
         self._require_open("storing evaluation data")
-        parsed = data if isinstance(data, SuiteData) else SuiteData.model_validate(dict(data))
-        manifest = DatasetManifest.from_data(parsed)
+        if isinstance(data, (SuiteData, TextSuiteData)):
+            parsed = data
+        elif dict(data).get("kind") == "text":
+            parsed = TextSuiteData.model_validate(dict(data))
+        else:
+            parsed = SuiteData.model_validate(dict(data))
+        manifest = TextDatasetManifest.from_data(parsed) if isinstance(parsed, TextSuiteData) \
+            else DatasetManifest.from_data(parsed)
         self._write(self._path(manifest.data_hash), parsed.canonical_json())
         if generation is not None:
             self._write(self._path(manifest.data_hash, ".generation.json"), canonical_json(dict(generation)))
@@ -86,21 +96,24 @@ class DatasetStore:
         self._require_open("reading evaluation data")
         return self._path(data_hash).is_file()
 
-    def load(self, dataset: DatasetManifest | str) -> SuiteData:
+    def load(self, dataset: DatasetManifest | TextDatasetManifest | str) -> SuiteData | TextSuiteData:
         """The verified examples of a stored dataset (evaluator and operator use only)."""
         self._require_open("reading evaluation data")
-        data_hash = dataset.data_hash if isinstance(dataset, DatasetManifest) else dataset
+        manifest = dataset if isinstance(dataset, (DatasetManifest, TextDatasetManifest)) else None
+        data_hash = manifest.data_hash if manifest is not None else dataset
         path = self._path(data_hash)
         if not path.is_file():
             raise WSEError(ErrorCode.NOT_FOUND, f"dataset {data_hash} is not in evaluator storage",
                            details={"data_hash": data_hash})
         try:
-            data = SuiteData.model_validate_json(path.read_text(encoding="utf-8"))
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            text_data = isinstance(raw, dict) and raw.get("kind") == "text"
+            data = TextSuiteData.model_validate(raw) if text_data else SuiteData.model_validate(raw)
         except ValueError as exc:
             raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"stored dataset {data_hash} is unreadable") from exc
         if data.data_hash != data_hash:
             raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"stored dataset {data_hash} does not match its hash")
-        if isinstance(dataset, DatasetManifest) and DatasetManifest.from_data(data) != dataset:
+        if manifest is not None and not dataset_manifest_matches(data, manifest):
             raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"stored dataset {data_hash} does not match its manifest")
         return data
 

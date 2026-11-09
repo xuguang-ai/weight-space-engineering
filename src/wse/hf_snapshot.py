@@ -36,6 +36,9 @@ TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json", "special_tokens_ma
 CHAT_TEMPLATE_FILES = ("chat_template.jinja", "chat_template.json")
 ALLOWED_FILES = frozenset({CONFIG_FILE, GENERATION_CONFIG_FILE, INDEX_FILE, *TOKENIZER_FILES,
                            *CHAT_TEMPLATE_FILES})
+# Files whose contents an import keeps (in the store's model_files/), so generation can tokenize and render
+# prompts exactly as the identity hashes describe, without the snapshot directory.
+MODEL_TEXT_FILES = (*TOKENIZER_FILES, *CHAT_TEMPLATE_FILES, GENERATION_CONFIG_FILE)
 _SAFETENSORS_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,200}\.safetensors$")
 PICKLE_SUFFIXES = (".bin", ".pt", ".pth", ".ckpt", ".pkl", ".pickle")
 
@@ -80,6 +83,7 @@ class SnapshotReader:
             raise WSEError(ErrorCode.NOT_FOUND, f"snapshot directory {path} does not exist")
         self.root = path.resolve()
         self.files: dict[str, str] = {}
+        self.contents: dict[str, bytes] = {}  # the bytes read of MODEL_TEXT_FILES
 
     @property
     def read_log(self) -> list[str]:
@@ -105,6 +109,8 @@ class SnapshotReader:
             raise _invalid(f"snapshot file {name} is {size} bytes; the limit is {max_bytes}", file=name)
         data = path.read_bytes()
         self._record(name, hashlib.sha256(data).hexdigest())
+        if name in MODEL_TEXT_FILES:
+            self.contents[name] = data
         return data
 
     def read_json(self, name: str) -> Any:

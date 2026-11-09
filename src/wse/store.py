@@ -81,6 +81,8 @@ MANIFESTS_DIR = "manifests"
 ANALYSES_DIR = "analyses"
 PATCHES_DIR = "patches"
 BLOBS_DIR = "blobs"
+# Content-addressed model files other than weights (tokenizer, chat template, generation configuration), by SHA-256.
+MODEL_FILES_DIR = "model_files"
 ANALYSIS_URI_PREFIX = "wse://analyses/"
 TMP_DIR = "tmp"
 DEFAULT_RECOVERY_GRACE_SECONDS = 600.0
@@ -90,7 +92,8 @@ DEFAULT_SINGLE_FILE_MAX_BYTES = 64 * 1024 * 1024
 WEIGHTS_INDEX_FORMAT = "wse-weights-index-v1"
 _RELPATH_PATTERN = re.compile(
     r"^(?:weights/[0-9a-f]{64}\.(?:safetensors|json)|manifests/[0-9a-f]{64}\.json"
-    r"|analyses/[0-9a-f]{64}\.json|patches/[0-9a-f]{64}\.(?:json|wsepatch)|blobs/[0-9a-f]{64})$"
+    r"|analyses/[0-9a-f]{64}\.json|patches/[0-9a-f]{64}\.(?:json|wsepatch)|blobs/[0-9a-f]{64}"
+    r"|model_files/[0-9a-f]{64})$"
 )
 # Integer dtypes whose bit patterns carry a stored dtype of the same width.
 _BIT_DTYPES: dict[int, tuple[type, torch.dtype]] = {
@@ -194,6 +197,7 @@ class ArtifactStore:
             self.artifacts_dir / ANALYSES_DIR,
             self.artifacts_dir / PATCHES_DIR,
             self.artifacts_dir / BLOBS_DIR,
+            self.artifacts_dir / MODEL_FILES_DIR,
         ):
             directory.mkdir(parents=True, exist_ok=True)
         self.db = Database(self.workspace / "metadata.sqlite")
@@ -558,6 +562,31 @@ class ArtifactStore:
         relpath = f"{PATCHES_DIR}/{digest}.{'wsepatch' if binary else 'json'}"
         file_sha, size = self._publish_bytes(relpath, data)
         return relpath, file_sha, size
+
+    def publish_model_file(self, data: bytes) -> str:
+        """Publish a model file (tokenizer, chat template, generation configuration) by content; return its SHA-256.
+
+        Files are named by their SHA-256 under ``model_files/``, which a
+        manifest's ``source.files`` records, so an identical file is stored
+        once. They are small, never change, and are not reference counted.
+        """
+        digest = hashlib.sha256(data).hexdigest()
+        path = self._artifact_path(f"{MODEL_FILES_DIR}/{digest}")
+        if not (path.is_file() and _file_sha256(path) == digest):
+            self._publish(f"{MODEL_FILES_DIR}/{digest}", lambda target: target.write_bytes(data),
+                          expected_sha256=digest)
+        return digest
+
+    def read_model_file(self, digest: str) -> bytes | None:
+        """The bytes of a published model file after a hash check; ``None`` if it is missing or altered."""
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            return None
+        path = self._artifact_path(f"{MODEL_FILES_DIR}/{digest}")
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            return None
+        return data if hashlib.sha256(data).hexdigest() == digest else None
 
     def require_published(self, relpath: str) -> None:
         """Inside a write transaction: fail if a published file vanished."""

@@ -156,6 +156,8 @@ class EvaluationService:
             errors=list(result.errors),
             truncation_count=result.truncation_count,
             created_at=utc_now(),
+            problems=list(result.problems) if keep_scores and result.problems is not None else None,
+            runtime=dict(result.runtime) if result.runtime is not None else None,
         )
 
     @staticmethod

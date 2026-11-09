@@ -24,9 +24,10 @@
 * **Generation.** ``generate`` decodes a batch with a KV cache: the prompt is
   prefilled once, then each step feeds one token per row. Greedy decoding
   takes the first maximal logit, as ``transformers``' ``generate`` does.
-  Sampling applies the caller's logits processors, then temperature, top-k,
-  and top-p, and draws each row from its own seeded CPU generator, so a row's
-  tokens depend on its seed and not on its batch position. Rows that emit a
+  Sampling applies the caller's logits processors (for example a presence
+  penalty) to the raw float32 scores, then temperature, top-k, and top-p
+  (``warp_scores``), and draws each row from its own seeded CPU generator, so
+  a row's tokens depend on its seed and not on its batch position. Rows that emit a
   stop token finish; later positions are padding and are not reported.
 
 In managed experiments only the worker runs this engine; a run-bound engine
@@ -332,8 +333,14 @@ def positions_from_mask(mask: torch.Tensor) -> torch.Tensor:
     return (mask.cumsum(-1) - 1).masked_fill(mask == 0, 0)
 
 
-def _sample(scores: torch.Tensor, sampling: Sampling, generators: Sequence[torch.Generator]) -> torch.Tensor:
-    """Temperature, top-k, and top-p (as ``transformers``' warpers), then one draw per row from its generator."""
+def warp_scores(scores: torch.Tensor, sampling: Sampling) -> torch.Tensor:
+    """Temperature, then top-k, then top-p, as ``transformers``' warpers apply them; removed tokens become ``-inf``.
+
+    The order matches vLLM's sampler as well (temperature, then top-k and
+    top-p). Top-p keeps the smallest set of most likely tokens whose
+    probability reaches ``top_p`` (computed after top-k), and always keeps the
+    most likely token.
+    """
     scores = scores / sampling.temperature
     if sampling.top_k is not None and sampling.top_k < scores.shape[-1]:
         kth = torch.topk(scores, sampling.top_k, dim=-1).values[..., -1, None]
@@ -344,6 +351,45 @@ def _sample(scores: torch.Tensor, sampling: Sampling, generators: Sequence[torch
         remove = cumulative <= (1 - sampling.top_p)
         remove[..., -1:] = False  # always keep the most likely token
         scores = scores.masked_fill(remove.scatter(1, order, remove), float("-inf"))
-    probabilities = scores.softmax(dim=-1)
+    return scores
+
+
+def _sample(scores: torch.Tensor, sampling: Sampling, generators: Sequence[torch.Generator]) -> torch.Tensor:
+    """Warp the scores (``warp_scores``), then draw one token per row from that row's generator."""
+    probabilities = warp_scores(scores, sampling).softmax(dim=-1)
     return torch.stack([torch.multinomial(probabilities[row], 1, generator=generators[row])[0]
                         for row in range(scores.shape[0])])
+
+
+def load_tokenizer(files: Mapping[str, bytes]) -> Any:
+    """A ``transformers`` tokenizer from a model's stored tokenizer and chat-template files.
+
+    ``files`` maps snapshot file names (the allow-listed tokenizer files and
+    the chat template) to their bytes, as the importer stored them. They are
+    written to a private temporary directory and loaded from there, offline
+    and without remote code; a tokenizer configuration with ``auto_map``
+    (custom tokenizer code) is refused.
+    """
+    import json
+    import tempfile
+    from pathlib import Path
+
+    from wse.hf_snapshot import CHAT_TEMPLATE_FILES, TOKENIZER_FILES
+
+    transformers = _transformers()
+    allowed = set(TOKENIZER_FILES) | set(CHAT_TEMPLATE_FILES)
+    names = sorted(name for name in files if name in allowed)
+    if not any(name in names for name in ("tokenizer.json", "tokenizer.model", "vocab.json")):
+        raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY, "the model has no stored tokenizer files")
+    if "tokenizer_config.json" in files:
+        try:
+            config = json.loads(files["tokenizer_config.json"])
+        except ValueError as exc:
+            raise WSEError(ErrorCode.INVALID_MODEL, f"tokenizer_config.json is not valid JSON: {exc}") from exc
+        if isinstance(config, dict) and "auto_map" in config:
+            raise WSEError(ErrorCode.INVALID_MODEL, "tokenizer_config.json names custom tokenizer code (auto_map), "
+                           "which WSE never runs")
+    with tempfile.TemporaryDirectory(prefix="wse-tokenizer-") as directory:
+        for name in names:
+            (Path(directory) / name).write_bytes(files[name])
+        return transformers.AutoTokenizer.from_pretrained(directory, local_files_only=True, trust_remote_code=False)

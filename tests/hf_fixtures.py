@@ -19,9 +19,14 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 DECOYS = ("training_args.bin", "original/consolidated.00.pth", "onnx/model.onnx")
-VOCAB = ["<pad>", "<s>", "</s>", "<unk>"] + [chr(c) for c in range(97, 123)] + [str(d) for d in range(10)] + [" "]
+# Lowercase letters, digits, a space, and the characters of boxed answers and chat markup.
+VOCAB = ["<pad>", "<s>", "</s>", "<unk>"] + [chr(c) for c in range(97, 123)] + [str(d) for d in range(10)] + [" "] \
+    + list("\\{}#.,$<>/-^\n")
 VOCAB_SIZE = 64  # model vocabulary; the tokenizer uses the first len(VOCAB) entries
-CHAT_TEMPLATE = "{% for m in messages %}<{{ m['role'] }}>{{ m['content'] }}{% endfor %}"
+# A minimal template with a thinking switch, like the Qwen templates (enable_thinking opens a <think> block).
+CHAT_TEMPLATE = ("{% for m in messages %}<{{ m['role'] }}>{{ m['content'] }}{% endfor %}"
+                 "{% if add_generation_prompt %}<assistant>{% if enable_thinking is defined and enable_thinking %}"
+                 "<think>{% endif %}{% endif %}")
 
 LLAMA = dict(vocab_size=VOCAB_SIZE, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
              num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=128)
@@ -50,12 +55,13 @@ def _seed(seed: int) -> None:
 
 
 def write_tokenizer(snapshot: Path) -> None:
-    """A character-level WordLevel tokenizer with a chat template and a special-tokens map."""
-    from tokenizers import Tokenizer, models, pre_tokenizers
+    """A character-level WordLevel tokenizer (decoding joins the characters) with a chat template and a special-tokens map."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
 
     tokenizer = Tokenizer(models.WordLevel(vocab={t: i for i, t in enumerate(VOCAB)}, unk_token="<unk>"))
     tokenizer.pre_tokenizer = pre_tokenizers.Split("", "isolated")
+    tokenizer.decoder = decoders.Fuse()  # characters decode back to the text, without separators
     fast = PreTrainedTokenizerFast(tokenizer_object=tokenizer, bos_token="<s>", eos_token="</s>",
                                    unk_token="<unk>", pad_token="<pad>")
     fast.chat_template = CHAT_TEMPLATE
