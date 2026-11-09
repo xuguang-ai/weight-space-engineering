@@ -67,7 +67,7 @@ Capabilities: `weights.read`, `weights.slice_edit`, `weights.direction_edit`, `f
 - **Identity.** A model's identity comprises:
   - `weights_hash`, over per-tensor blob IDs in canonical name order;
   - `config_hash`;
-  - `tokenizer_hash`, over `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`, and `vocab.json` with `merges.txt` when present;
+  - `tokenizer_hash`, over every tokenizer file present that `transformers` reads: `tokenizer.json`, `tokenizer_config.json`, `special_tokens_map.json`, `added_tokens.json`, `tokenizer.model`, `vocab.json`, and `merges.txt`;
   - `chat_template_hash`;
   - `generation_config_hash`;
   - the source repository and revision.
@@ -80,7 +80,11 @@ Capabilities: `weights.read`, `weights.slice_edit`, `weights.direction_edit`, `f
   - a one-dimensional parameter of a normalization module is `[features]`;
   - any other parameter has axes `unknown`. It stays readable, and it accepts only shape-checked elementwise edits.
 - **Alias groups.** Parameters that are the same object in the instantiated module, such as tied input and output embeddings, form one alias group, stored as one blob. The default policies protect alias groups from edits. Whole-group edit semantics remain deferred (M1 plan Section 5.2).
-- **Forward and generation.** The engine builds the module with `from_config` on the meta device, loads WSE tensors with `load_state_dict(..., assign=True)`, and runs on `mps`, falling back to `cpu`, in the stored dtype. In managed experiments only the worker runs it.
+- **Forward and generation.** The engine builds the module with `from_config` on the meta device, loads WSE tensors with `load_state_dict(..., assign=True)`, and runs on `mps`, falling back to `cpu`. In managed experiments only the worker runs it.
+- **Stored dtypes are kept.** Every tensor runs in its stored dtype. This differs from `from_pretrained(dtype="auto")`:
+  - That call casts Qwen3.5-0.8B's 36 F32 tensors (`A_log` and `linear_attn.norm.weight` in its 18 linear-attention layers) to BF16, which moves logits by up to 0.53.
+  - With those tensors kept in F32, `from_pretrained` matches WSE bitwise on CPU and MPS (Task 4), so parity checks use that reference.
+  - Results can therefore differ slightly from tools that cast these tensors.
 - **Hidden states.** The adapter reads the residual stream at layer boundaries through `output_hidden_states=True`.
 
 ### 2.2 Level 1: family descriptors
@@ -181,6 +185,7 @@ The published SHA-256 decides exactness. If the low-rank path's rounding ever di
 
 - `wse.engines.hf_torch` builds the module and runs forward passes, teacher-forced reads, and batched generation with a KV cache.
 - Device selection is explicit: `mps` when available, otherwise `cpu`. The worker records the device, dtype, and library versions in every report.
+- Batched generation derives `position_ids` from the attention mask (the cumulative sum minus one), at prefill and at every decode step, as `transformers`' `generate` does. A left-padded row must compute the same logits as the same prompt run alone. Without this, a padded row is shifted by its padding: on Llama-3.2-1B-Instruct, the first-step logits of a row with 16 pads moved by 0.156.
 - Bitwise reproducibility holds within one device and library version, not across them (M1 plan Section 7.3).
 
 ### 4.2 Generation profiles
@@ -351,10 +356,10 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
 
 **Files:** `pyproject.toml`, `uv.lock`.
 
-- [ ] Add `models-hf = ["transformers>=5.22.2", "math-verify>=0.9"]` to the optional dependencies. `transformers` 5.22.2 was the latest release on PyPI on 2026-11-09, and its source tree contains `models/qwen3_5` with pure-PyTorch fallbacks for the Gated DeltaNet layers. The lock pins the exact versions.
-- [ ] **(operator)** In the user's own terminal (Claude Code's auto mode refuses installs from PyPI), run `uv lock` and then `uv sync --extra agents-openai --extra models-hf`.
-- [ ] **(operator)** On Hugging Face, request access to `meta-llama/Llama-3.2-1B-Instruct`; approval is manual. It is a `LlamaForCausalLM` with 1,235,814,400 BF16 parameters under the Llama 3.2 Community License.
-- [ ] **(operator)** From the repository root, download the snapshots, fetching only allow-listed files. Llama repositories also hold an `original/` folder with a pickled checkpoint. The `hf` command comes with `transformers` and is installed in the project environment:
+- [x] Add `models-hf = ["transformers>=5.22.2", "math-verify>=0.9"]` to the optional dependencies. `transformers` 5.22.2 was the latest release on PyPI on 2026-11-09, and its source tree contains `models/qwen3_5` with pure-PyTorch fallbacks for the Gated DeltaNet layers. The lock pins the exact versions.
+- [x] **(operator)** In the user's own terminal (Claude Code's auto mode refuses installs from PyPI), run `uv lock` and then `uv sync --extra agents-openai --extra models-hf`.
+- [x] **(operator)** On Hugging Face, request access to `meta-llama/Llama-3.2-1B-Instruct`; approval is manual. It is a `LlamaForCausalLM` with 1,235,814,400 BF16 parameters under the Llama 3.2 Community License.
+- [x] **(operator)** From the repository root, download the snapshots, fetching only allow-listed files. Llama repositories also hold an `original/` folder with a pickled checkpoint. The `hf` command comes with `transformers` and is installed in the project environment:
 
   ```bash
   M=~/Desktop/wse-models
@@ -365,53 +370,54 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
   ```
 
   Record the Llama revision that the download resolved. It is listed under the snapshot's `.cache/huggingface/download/` metadata.
-- [ ] **(operator)** Fetch the article's edits and code, and the datasets:
+- [x] **(operator)** Fetch the article's edits and code, and the datasets:
 
   ```bash
   git clone --filter=blob:none --sparse https://github.com/RikiyaT/lm_understand-logs "$M/lm_understand-logs"
   git -C "$M/lm_understand-logs" sparse-checkout set exp8_math/code exp8_math/runs/p10c/edit exp8_math/runs/p25c/edit exp8_math/runs/p50c/edit
   uv run --no-sync hf download HuggingFaceH4/MATH-500 test.jsonl --repo-type dataset --revision 6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be --local-dir "$M/datasets/MATH-500"
   curl -L -o "$M/datasets/gsm8k-train.jsonl" https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/train.jsonl
+  curl -L -o "$M/datasets/gsm8k-test.jsonl" https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl
   ```
 
-- [ ] Verify the environment:
+- [x] Verify the environment:
   - `uv run --no-sync python -c "from transformers import Qwen3_5ForCausalLM, LlamaForCausalLM; import math_verify"` succeeds;
   - the full suite still passes 366 tests;
   - the installed versions are recorded for `docs/m2-q1-report.md`.
-- [ ] Commit `pyproject.toml` and `uv.lock`.
+- [x] Commit `pyproject.toml` and `uv.lock`.
 
 ### Task 2: Per-tensor content-addressed storage and stored dtypes
 
 **Files:** modify `src/wse/store.py`, `src/wse/database.py` (migration 8), and `src/wse/tensors.py`; create `tests/test_blob_store.py`.
 
-- [ ] Write failing tests:
+- [x] Write failing tests:
   - `test_blob_id_is_sha256_of_little_endian_row_major_bytes`: a 2×3 BF16 tensor of known values (1.0, −2.0, 0.5, −0.0, a subnormal, 3.0). The expected bit patterns (`0x3F80`, `0xC000`, `0x3F00`, `0x8000`, …) are packed with `struct.pack("<6H", ...)` and hashed in the test.
   - `test_a_candidate_differing_in_one_tensor_adds_one_blob`.
   - `test_bf16_f16_f32_round_trip_bitwise_including_signed_zero_and_subnormals`.
   - `test_migration_8_keeps_m1_identities`: build an M1 workspace at schema version 7, migrate it, and check that `weights_hash`, manifests, tensors, and selected checkpoints are unchanged.
   - `test_a_tampered_blob_marks_every_checkpoint_that_uses_it_corrupt`.
-- [ ] Run `uv run --no-sync pytest tests/test_blob_store.py -q`. The tests must fail because the blob store is missing.
-- [ ] Implement:
+- [x] Run `uv run --no-sync pytest tests/test_blob_store.py -q`. The tests must fail because the blob store is missing.
+- [x] Implement:
   - blobs under `artifacts/blobs/<sha256>`, published by atomic rename as in M1's Section 5.3;
   - manifests that reference blobs;
   - reference counting for recovery;
   - migration 8;
   - dtype-aware loading of BF16 and F16 through `torch.frombuffer` on the raw bytes.
-- [ ] Run the new tests and the full suite; all must pass.
-- [ ] Review and commit.
+- [x] Run the new tests and the full suite; all must pass.
+- [x] Review and commit.
 
 ### Task 3: Generic import, identity, and the Qwen3.5 name map
 
 **Files:** create `src/wse/hf_snapshot.py`, `src/wse/adapters/hf_causal_lm.py`, `src/wse/adapters/families.py`, and `tests/hf_fixtures.py`; modify `src/wse/registry.py` (kind `family` and built-ins), `src/wse/schemas.py`, and `src/wse/cli.py` (`wse import-hf SNAPSHOT --repo ID --revision SHA`); create `tests/test_hf_import.py`.
 
-- [ ] Write `tests/hf_fixtures.py`. It builds tiny random checkpoints offline with `save_pretrained(safe_serialization=True)`:
+- [x] Write `tests/hf_fixtures.py`. It builds tiny random checkpoints offline with `save_pretrained(safe_serialization=True)`:
   - a Llama-style model with tied embeddings and one without them (`LlamaConfig`: 2 layers, hidden 16, 4 heads, 2 KV heads);
   - a Qwen3 model (`Qwen3Config`);
   - a Gemma 3 text model (`Gemma3TextConfig`);
   - a Qwen3.5 multimodal wrapper (`Qwen3_5Config` with a 2-layer text config, one linear-attention and one full-attention layer, and a 1-block vision config) that carries `model.language_model.*`, `model.visual.*`, and `mtp.*` tensors.
 
   The helper also adds decoy files: `training_args.bin`, `original/consolidated.00.pth`, and `onnx/model.onnx`.
-- [ ] Write failing tests in `tests/test_hf_import.py`:
+- [x] Write failing tests in `tests/test_hf_import.py`:
   - `test_only_allow_listed_files_are_read`: the importer's read log contains no decoy;
   - `test_a_snapshot_with_only_pickled_weights_is_rejected`;
   - `test_auto_map_in_config_is_rejected`;
@@ -423,16 +429,16 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
   - `test_unmapped_names_fail_with_the_list_of_names`;
   - `test_reimporting_a_snapshot_creates_no_new_checkpoint_or_blob`;
   - `test_llama_style_checkpoints_import_without_a_descriptor`.
-- [ ] Run the tests; they must fail.
-- [ ] Implement:
+- [x] Run the tests; they must fail.
+- [x] Implement:
   - snapshot reading through safetensors headers and memory-mapped tensors;
   - the meta-device module walk for axes and alias groups;
   - the descriptor registry and `qwen3_5@1`'s name map. If `Qwen3_5ForCausalLM` expects `model.layers.*`, the rule `model.language_model.` → `model.` applies; the fixture test pins whichever prefix the class actually uses. Its drop rules cover `model.visual.` and `mtp.`;
   - the identity hashes;
   - `wse import-hf`.
-- [ ] Run the new tests and the full suite.
-- [ ] **(real model)** Import both snapshots and record, for each: tensor count, parameter count, dtypes, alias groups, and identity hashes. Qwen3.5-0.8B's index lists 488 tensors (320 `model.language_model.*`, 153 `model.visual.*`, and 15 `mtp.*`), and its config ties input and output embeddings.
-- [ ] Review and commit.
+- [x] Run the new tests and the full suite.
+- [x] **(real model)** Import both snapshots and record, for each: tensor count, parameter count, dtypes, alias groups, and identity hashes. Qwen3.5-0.8B's index lists 488 tensors (320 `model.language_model.*`, 153 `model.visual.*`, and 15 `mtp.*`), and its config ties input and output embeddings.
+- [x] Review and commit.
 
 ### Task 4: Engine, logits parity, and greedy generation
 
