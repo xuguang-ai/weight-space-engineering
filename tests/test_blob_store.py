@@ -310,7 +310,6 @@ def _downgrade_to_m1(workspace: Path) -> None:
 
 
 def test_migration_8_keeps_m1_identities(workspace, bundles, tmp_path):
-    assert LATEST_SCHEMA_VERSION == 8 and [v for v, _ in MIGRATIONS][:7] == list(range(1, 8))
     with Engine(workspace) as engine:
         base = engine.import_bundle(bundles["task"])
         grant = engine.grant_run(TASK, SMALL_MODEL_POLICY_ID, base.checkpoint_id)
@@ -321,6 +320,13 @@ def test_migration_8_keeps_m1_identities(workspace, bundles, tmp_path):
         candidate = engine.apply_patch(experiment.experiment_id, preview.patch_id, "apply-1")
         engine.select_checkpoint(experiment.experiment_id, candidate.checkpoint_id, base.checkpoint_id, "select-1")
     _downgrade_to_m1(workspace)
+    _assert_migration_8_keeps_identities(workspace, base, candidate, experiment.experiment_id, tmp_path)
+
+
+def _assert_migration_8_keeps_identities(workspace: Path, base: ModelManifest, candidate: ModelManifest,
+                                         experiment_id: str, tmp_path: Path) -> None:
+    """Open an M1 (schema 7) workspace with the current code and check that nothing M1 wrote changed."""
+    assert LATEST_SCHEMA_VERSION == 8 and [v for v, _ in MIGRATIONS][:7] == list(range(1, 8))
 
     # The downgraded database has exactly the M1 schema (migrations 1-7).
     reference = tmp_path / "m1.sqlite"
@@ -360,7 +366,7 @@ def test_migration_8_keeps_m1_identities(workspace, bundles, tmp_path):
                 assert loaded[name].numpy().tobytes() == tensor.numpy().tobytes()
                 assert ids[name] == blob_id(tensor)
                 assert (workspace / "artifacts" / "blobs" / ids[name]).read_bytes() == tensor.numpy().tobytes()
-        state = engine.get_experiment(experiment.experiment_id)
+        state = engine.get_experiment(experiment_id)
         assert state.selected_checkpoint_id == candidate.checkpoint_id
         assert state.budget["candidate_commits"].consumed == 1
         # Base and candidate differ in one tensor, so they share every other blob.
@@ -375,6 +381,73 @@ def test_migration_8_keeps_m1_identities(workspace, bundles, tmp_path):
         assert engine.store.db.conn.execute(
             "SELECT COUNT(*) FROM audit_events WHERE event_type = 'weights.blobs_indexed'").fetchone()[0] == 2
         assert engine.store.recover(grace_seconds=0).removed_blobs == []
+
+
+# The last commit whose code is M1 (schema version 7, single safetensors weights files).
+M1_COMMIT = "32dc45d"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+M1_WRITER = """
+import json, sys
+from pathlib import Path
+import wse
+from wse.api import Engine
+from wse.policy import SMALL_MODEL_POLICY_ID
+m1_src, bundle, workspace, oracle = Path(sys.argv[1]), sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+assert Path(wse.__file__).resolve().is_relative_to(m1_src.resolve()), wse.__file__
+with Engine(workspace) as engine:
+    assert engine.store.db.schema_version() == 7
+    base = engine.import_bundle(bundle)
+    grant = engine.grant_run("signed_sum_v1", SMALL_MODEL_POLICY_ID, base.checkpoint_id)
+    experiment = engine.create_experiment(grant.run_id, "signed_sum_v1", SMALL_MODEL_POLICY_ID, "create-1")
+    spec = {"base_checkpoint_id": base.checkpoint_id, "hypothesis": "One output row has the wrong sign.",
+            "operations": [oracle]}
+    preview = engine.preview_patch(experiment.experiment_id, spec, "preview-1")
+    candidate = engine.apply_patch(experiment.experiment_id, preview.patch_id, "apply-1")
+    engine.select_checkpoint(experiment.experiment_id, candidate.checkpoint_id, base.checkpoint_id, "select-1")
+print(json.dumps({"base": base.model_dump(mode="json"), "candidate": candidate.model_dump(mode="json"),
+                  "experiment_id": experiment.experiment_id}))
+"""
+
+
+def _m1_source(destination: Path) -> Path | None:
+    """Extract M1's ``src`` tree from git history, or return None when it is unavailable."""
+    import io
+    import subprocess
+    import tarfile
+
+    git = shutil.which("git")
+    if git is None:
+        return None
+    archive = subprocess.run([git, "-C", str(REPO_ROOT), "archive", "--format=tar", M1_COMMIT, "src"],
+                             capture_output=True, timeout=60)
+    if archive.returncode != 0:
+        return None
+    with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tar:
+        tar.extractall(destination, filter="data")
+    return destination / "src"
+
+
+def test_migration_8_on_a_workspace_written_by_m1_code(workspace, bundles, tmp_path):
+    """The M1 workspace comes from M1's own code (git history), not from a downgrade of new output."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    m1_src = _m1_source(tmp_path / "m1")
+    if m1_src is None:
+        pytest.skip(f"M1 code (commit {M1_COMMIT}) is not available from git history")
+    env = {**os.environ, "PYTHONPATH": str(m1_src)}
+    written = subprocess.run(
+        [sys.executable, "-c", M1_WRITER, str(m1_src), str(bundles["task"]), str(workspace), json.dumps(ORACLE)],
+        capture_output=True, text=True, env=env, cwd=tmp_path, timeout=120)
+    assert written.returncode == 0, written.stderr
+    result = json.loads(written.stdout)
+    assert not (workspace / "artifacts" / "blobs").exists()
+    with sqlite3.connect(workspace / "metadata.sqlite") as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 7
+    base, candidate = (ModelManifest.model_validate(result[key]) for key in ("base", "candidate"))
+    _assert_migration_8_keeps_identities(workspace, base, candidate, result["experiment_id"], tmp_path)
 
 
 def test_slices_of_scalar_and_empty_tensors_and_unknown_names(workspace):
