@@ -300,6 +300,7 @@ def _downgrade_to_m1(workspace: Path) -> None:
     """Remove every migration-8 object so the workspace is exactly what M1 (schema 7) wrote."""
     conn = sqlite3.connect(workspace / "metadata.sqlite")
     try:
+        conn.execute("DROP TABLE imported_patches")  # migration 9
         conn.execute("DROP TABLE weight_tensors")
         conn.execute("DROP TABLE blobs")
         conn.execute("PRAGMA user_version = 7")
@@ -326,7 +327,7 @@ def test_migration_8_keeps_m1_identities(workspace, bundles, tmp_path):
 def _assert_migration_8_keeps_identities(workspace: Path, base: ModelManifest, candidate: ModelManifest,
                                          experiment_id: str, tmp_path: Path) -> None:
     """Open an M1 (schema 7) workspace with the current code and check that nothing M1 wrote changed."""
-    assert LATEST_SCHEMA_VERSION == 8 and [v for v, _ in MIGRATIONS][:7] == list(range(1, 8))
+    assert LATEST_SCHEMA_VERSION >= 8 and [v for v, _ in MIGRATIONS] == list(range(1, LATEST_SCHEMA_VERSION + 1))
 
     # The downgraded database has exactly the M1 schema (migrations 1-7).
     reference = tmp_path / "m1.sqlite"
@@ -348,7 +349,7 @@ def _assert_migration_8_keeps_identities(workspace: Path, base: ModelManifest, c
     m1_tensors = {path.name: load_file(str(path)) for path in (workspace / "artifacts" / "weights").iterdir()}
 
     with Engine(workspace) as engine:
-        assert engine.store.db.schema_version() == 8
+        assert engine.store.db.schema_version() == LATEST_SCHEMA_VERSION
         assert engine.last_recovery.corrupted_checkpoints == []
         with sqlite3.connect(workspace / "metadata.sqlite") as conn:
             assert {table: _rows(conn, table) for table in tables} == before_rows

@@ -1,7 +1,8 @@
 """Operator command-line interface (``wse``).
 
 This milestone provides ``wse import``, ``wse import-hf`` (a local Hugging Face
-snapshot through ``hf_causal_lm@1``), ``wse grant-run``, ``wse serve`` (the
+snapshot through ``hf_causal_lm@1``), ``wse import-patch`` (a published edit
+recorded as an exact patch with its candidate; see ``wse.external_patches``), ``wse grant-run``, ``wse serve`` (the
 stdio MCP server for one run grant; see ``wse.mcp_server``), ``wse worker``
 (the evaluation worker process; see ``wse.worker``), ``wse freeze``,
 ``wse final-evaluate``, ``wse report``, the read-only operator views
@@ -51,6 +52,13 @@ def _parser() -> argparse.ArgumentParser:
                            help="an exact family descriptor '<id>@<version>' (default: the one registered for the "
                                 "configuration's model_type, if any)")
     import_hf.add_argument("--license", default="unspecified", help="the model's license label")
+    import_patch = commands.add_parser(
+        "import-patch", help="import a published edit as an exact patch, commit its candidate, and print the record")
+    import_patch.add_argument("edit_dir", help="the edit directory (manifest.json and edit.npz)")
+    import_patch.add_argument("--format", required=True, choices=["lm-understand-v1"], help="the edit format")
+    import_patch.add_argument("--base", required=True, help="the checkpoint ID of the base model")
+    import_patch.add_argument("--repo", default=None, help="the source repository of the edit, for provenance")
+    import_patch.add_argument("--revision", default=None, help="the source revision of the edit, for provenance")
     grant = commands.add_parser("grant-run", help="issue a run grant (one experiment) and print it")
     grant.add_argument("task_id")
     grant.add_argument("policy_id")
@@ -222,6 +230,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 manifest = engine.import_hf_snapshot(args.snapshot, repo=args.repo, revision=args.revision,
                                                      family=args.family, license=args.license)
                 print(json.dumps(manifest.model_dump(mode="json"), indent=2, sort_keys=True))
+            elif args.command == "import-patch":
+                record = engine.import_patch(args.edit_dir, base_checkpoint_id=args.base, format=args.format,
+                                             repo=args.repo, revision=args.revision)
+                print(json.dumps(record.model_dump(mode="json"), indent=2, sort_keys=True))
             elif args.command == "grant-run":
                 granted = engine.grant_run(args.task_id, args.policy_id, args.base_checkpoint_id)
                 print(json.dumps(granted.model_dump(mode="json"), indent=2, sort_keys=True))

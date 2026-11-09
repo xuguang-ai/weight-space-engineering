@@ -82,7 +82,9 @@ class TensorRegion:
     """A read-only view of one selected region of a tensor.
 
     ``values`` has the region's shape and the stored dtype and is not
-    writeable. ``selection`` locates it inside the full tensor.
+    writeable; a BF16 region, which NumPy cannot hold, arrives as its exact
+    float32 widening (``dtype`` still names the stored dtype). ``selection``
+    locates it inside the full tensor.
     """
 
     tensor: str

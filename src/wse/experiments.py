@@ -60,6 +60,7 @@ from pydantic import ValidationError
 from wse.audit import experiment_events, record_event, record_failure
 from wse.budget import BudgetLedger, budget_error
 from wse.database import utc_now
+from wse.patch_blocks import read_patch_file, write_patch_file
 from wse.patches import materialize_patch, replay_patch
 from wse.policy import LEDGER_COUNTERS, ExperimentPolicy, builtin_experiment_policies
 from wse.schemas import (
@@ -669,7 +670,12 @@ class ExperimentService:
 
     def _artifact(self, experiment_id: str, patch_id: str) -> PatchArtifact:
         self._experiment_row(experiment_id)
-        return PatchArtifact.model_validate_json(self.store.read_patch(self._patch_row(experiment_id, patch_id)))
+        return self._artifact_and_blocks(self._patch_row(experiment_id, patch_id))[0]
+
+    def _artifact_and_blocks(self, patch_row: sqlite3.Row) -> tuple[PatchArtifact, dict[str, bytes]]:
+        """A stored patch artifact and its binary blocks (none for a JSON patch), hash-verified."""
+        document, blocks = read_patch_file(self.store.read_patch(patch_row))
+        return PatchArtifact.model_validate(document), blocks
 
     def audit_log(self, experiment_id: str) -> list[dict[str, Any]]:
         self._experiment_row(experiment_id)
@@ -749,8 +755,12 @@ class ExperimentService:
             ],
         )
         artifact = PatchArtifact(spec=frozen, patch=edit.patch)
-        data = artifact.canonical_json().encode("utf-8")
-        relpath, file_sha, size = self.store.publish_patch(data)
+        if edit.blocks:  # an open-weight model's steps: one binary patch file with their blocks
+            data = write_patch_file(artifact.model_dump(mode="json"), edit.blocks)
+            relpath, file_sha, size = self.store.publish_patch(data, binary=True)
+        else:
+            data = artifact.canonical_json().encode("utf-8")
+            relpath, file_sha, size = self.store.publish_patch(data)
         patch_id = _new_id("patch")
         diffs = list(edit.diff)
         changed = sum(diff.changed_elements for diff in diffs)
@@ -850,12 +860,12 @@ class ExperimentService:
         if self._remaining(self.db.conn, experiment_id, "candidate_commits") < 1:
             raise self._budget_error(self.db.conn, experiment_id, "candidate_commits", 1)
         self.ledger.require(self.db.conn, experiment_id, {"compute_seconds": 0})
-        artifact = PatchArtifact.model_validate_json(self.store.read_patch(patch_row))
+        artifact, blocks = self._artifact_and_blocks(patch_row)
         self._owned_checkpoint(self.db.conn, experiment_id, artifact.spec.base_checkpoint_id)
         base = self.engine._open_checkpoint(artifact.spec.base_checkpoint_id)
         if base.weights_hash != artifact.spec.base_weights_hash:
             raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"base of patch {patch_id} no longer matches its frozen hash")
-        candidate = replay_patch(base, artifact.patch)  # stored values only; no editing operator runs
+        candidate = replay_patch(base, artifact.patch, blocks=blocks)  # stored values only; no operator runs
         base_manifest = self.store.load_manifest(artifact.spec.base_checkpoint_id)
         manifest = base_manifest.model_copy(
             update={

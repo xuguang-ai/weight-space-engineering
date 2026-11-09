@@ -368,6 +368,29 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "CREATE INDEX weight_tensors_blob ON weight_tensors (blob_id)",
         ],
     ),
+    (
+        9,
+        [
+            # External patches imported as exact WSE patches (M2 plan Section 3.4), with the
+            # candidate each produced. One row per (base, source files); the binary patch
+            # file at relpath is referenced here, so recovery keeps it.
+            """
+            CREATE TABLE imported_patches (
+                patch_id              TEXT PRIMARY KEY,
+                format                TEXT NOT NULL,
+                dedup_key             TEXT NOT NULL UNIQUE,
+                base_checkpoint_id    TEXT NOT NULL REFERENCES checkpoints (checkpoint_id),
+                checkpoint_id         TEXT NOT NULL REFERENCES checkpoints (checkpoint_id),
+                result_weights_hash   TEXT NOT NULL,
+                relpath               TEXT NOT NULL,
+                file_sha256           TEXT NOT NULL,
+                size_bytes            INTEGER NOT NULL,
+                record_json           TEXT NOT NULL,
+                created_at            TEXT NOT NULL
+            )
+            """,
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

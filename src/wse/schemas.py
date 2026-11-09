@@ -562,13 +562,48 @@ class TensorDiff(_Frozen):
     all_finite: bool
 
 
+_BLOB_ID = r"^[0-9a-f]{64}$"
+
+
+class PatchBlock(_Frozen):
+    """A binary block: the exact stored bits one step writes into one tensor (M2 plan Section 3.3).
+
+    The block's bytes live in a binary patch artifact, keyed by ``block_id``,
+    the SHA-256 hex digest of those bytes. A ``sparse`` block holds ``count``
+    flat row-major indices into the tensor (little-endian ``uint64``) followed
+    by as many bit patterns of the stored dtype (little-endian); a ``dense``
+    block holds the bit patterns of the contiguous ``selection``, row-major.
+    ``base_blob_id`` and ``result_blob_id`` bind the block to the tensor's
+    bytes before and after it: replay refuses another base and verifies the
+    result.
+    """
+
+    kind: Literal["sparse", "dense"]
+    dtype: str
+    tensor_shape: list[int]
+    selection: list[AxisSlice] | None = None
+    count: int = Field(ge=0)
+    block_id: str = Field(pattern=_BLOB_ID)
+    base_blob_id: str = Field(pattern=_BLOB_ID)
+    result_blob_id: str = Field(pattern=_BLOB_ID)
+
+    @model_validator(mode="after")
+    def _selection_matches_kind(self) -> PatchBlock:
+        if (self.kind == "dense") != (self.selection is not None):
+            raise ValueError("a dense block has a selection and a sparse block has none")
+        return self
+
+
 class PatchStep(_Frozen):
     """One materialized edit step: the exact after-values of one region.
 
-    ``values`` are row-major, in the stored dtype's shortest round-trip
-    digits, so replaying a step writes exactly these bytes without running
-    the editing operator. ``before_hash``/``after_hash`` are the tensor's
-    content hashes around this step.
+    A step records its result in one of two forms. M1 models keep inline
+    ``values``: row-major, in the stored dtype's shortest round-trip digits.
+    Open-weight models record a binary ``block`` (M2 plan Section 3.3) whose
+    bytes are stored next to the patch. Either way, replaying a step writes
+    exactly these bytes without running the editing operator.
+    ``before_hash``/``after_hash`` are the tensor's content hashes around this
+    step.
     """
 
     op: str
@@ -579,8 +614,25 @@ class PatchStep(_Frozen):
     dtype: str
     before_hash: str
     after_hash: str
-    values: list[float]
+    values: list[float] | None = _optional()
+    block: PatchBlock | None = _optional()
     changed_elements: int
+
+    @model_validator(mode="after")
+    def _one_form(self) -> PatchStep:
+        if (self.values is None) == (self.block is None):
+            raise ValueError("a patch step records either inline values or a binary block")
+        return self
+
+
+class ExternalPatchSource(_Frozen):
+    """Where an imported patch came from: its format, repository, revision, run, and file hashes."""
+
+    format: str
+    repository: str | None = None
+    revision: str | None = None
+    run: str
+    files: dict[str, str] = Field(description="file name -> SHA-256 hex digest of each file read")
 
 
 class MaterializedPatch(_Frozen):
@@ -588,13 +640,40 @@ class MaterializedPatch(_Frozen):
 
     Steps apply in order to one snapshot. ``base`` is the full identity
     (adapter, configuration, weights) the patch was materialized against; an
-    exact patch is specific to that base revision.
+    exact patch is specific to that base revision. ``source`` describes an
+    imported external patch.
     """
 
     schema_version: Literal["1"] = SCHEMA_VERSION
     base: ModelIdentity
     result_weights_hash: str
     steps: list[PatchStep]
+    source: ExternalPatchSource | None = _optional()
+
+
+class ImportedPatchTensor(_Frozen):
+    """One tensor of an imported patch, verified against its published hashes."""
+
+    tensor: str
+    form: str
+    base_sha256: str
+    edited_sha256: str
+    changed_elements: int
+    block: Literal["sparse", "dense"]
+
+
+class ImportedPatch(_Frozen):
+    """An external patch recorded as an exact WSE patch, with the candidate it produced."""
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    patch_id: str
+    base_checkpoint_id: str
+    checkpoint_id: str
+    result_weights_hash: str
+    source: ExternalPatchSource
+    tensors: list[ImportedPatchTensor]
+    changed_elements: int
+    patch_bytes: int
 
 
 Management = Literal["unmanaged", "managed"]

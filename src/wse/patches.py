@@ -9,13 +9,23 @@ database, or MCP:
 * ``materialize_patch(model, operations)`` applies several operations in list
   order to one snapshot through ``apply_operator``; if any step fails, no
   candidate is produced.
-* ``replay_patch(model, patch)`` writes a materialized patch's stored
-  after-values onto its base without running any editing operator, verifying
-  every tensor hash along the way.
+* ``replay_patch(model, patch, blocks=...)`` writes a materialized patch's
+  stored after-values onto its base without running any editing operator,
+  verifying every tensor hash along the way.
 
-Edits are computed in FP32 and cast back to the stored dtype; only the
-selected region is written, and bytes outside it are preserved. Changed
-elements are those whose stored bytes differ after the write.
+Edits support the stored dtypes BF16, F16, and F32 (M2 plan Section 3.2).
+Operators compute in FP32 (a BF16 region arrives as its exact float32
+widening), and results are written back to the stored dtype with
+round-to-nearest-even; only the selected region is written, and bytes outside
+it are preserved. Changed elements are those whose stored bits differ after
+the write.
+
+A step records its result in one of two forms. M1 models (raw-bytes weights
+hash) keep M1's inline ``values``. Open-weight models (blob weights hash)
+record a binary block (``wse.patch_blocks``, M2 plan Section 3.3), whose bytes
+travel next to the patch in ``EditResult.blocks`` and in binary patch files.
+M1's limit on elements per patch counts inline values and inline
+``set_slice`` values, not operator results recorded as blocks.
 """
 
 from __future__ import annotations
@@ -31,6 +41,7 @@ from pydantic import BaseModel
 
 from wse.adapters.base import CAP_WEIGHTS_READ, CAP_WEIGHTS_SLICE_EDIT
 from wse.operators.base import TensorRegion
+from wse.patch_blocks import apply_block, make_block
 from wse.operators.tensor import shortest_floats
 from wse.policy import OperationPolicy, default_operation_policy, require_capabilities
 from wse.schemas import (
@@ -44,13 +55,23 @@ from wse.schemas import (
     TensorInfo,
     WSEError,
 )
-from wse.tensors import hash_weights, resolve_selection, tensor_hash, weights_hash_scheme
+from wse.tensors import (
+    WEIGHTS_HASH_BLOBS,
+    bits_to_values,
+    hash_weights,
+    resolve_selection,
+    tensor_bits,
+    tensor_hash,
+    values_to_bits,
+    weights_hash_scheme,
+)
 
 if TYPE_CHECKING:
     from wse.api import EditResult, ModelHandle
     from wse.registry import Registry
 
-EDITABLE_DTYPES = {"float32": np.float32, "float16": np.float16}
+# Stored dtypes that edits support, with the NumPy dtype of M1's inline values (BF16 records only blocks).
+EDITABLE_DTYPES = {"float32": np.float32, "float16": np.float16, "bfloat16": None}
 _EDIT_CAPABILITIES = (CAP_WEIGHTS_READ, CAP_WEIGHTS_SLICE_EDIT)
 
 
@@ -70,14 +91,30 @@ def _info(model: ModelHandle, tensor: Any) -> TensorInfo:
     )
 
 
-def _bits(array: np.ndarray) -> np.ndarray:
-    """The stored bit patterns of ``array`` (bytes, not values, are compared)."""
-    flat = np.ascontiguousarray(array).reshape(-1)
-    return flat.view(f"u{flat.dtype.itemsize}")
-
-
 def _changed(before: np.ndarray, after: np.ndarray) -> int:
-    return int(np.count_nonzero(_bits(before) != _bits(after)))
+    """Elements whose stored bit patterns differ (bits, not values, are compared)."""
+    return int(np.count_nonzero(np.asarray(before).reshape(-1) != np.asarray(after).reshape(-1)))
+
+
+_SQUARE_CHUNK = 1 << 22
+
+
+def _sum_of_squares(bits: np.ndarray, dtype: str, other: np.ndarray | None = None) -> float:
+    """Sum of squares in float64 of a tensor's values, or of the difference to ``other``, in chunks."""
+    flat = bits.reshape(-1)
+    other_flat = None if other is None else other.reshape(-1)
+    total = 0.0
+    for start in range(0, flat.size, _SQUARE_CHUNK):
+        values = bits_to_values(flat[start:start + _SQUARE_CHUNK], dtype).astype(np.float64)
+        if other_flat is not None:
+            values = bits_to_values(other_flat[start:start + _SQUARE_CHUNK], dtype).astype(np.float64) - values
+        total += float(np.sum(np.square(values)))
+    return total
+
+
+def records_blocks(model: ModelHandle) -> bool:
+    """True when ``model``'s patches record binary blocks: open-weight models (the blob weights hash)."""
+    return weights_hash_scheme(model.adapter) == WEIGHTS_HASH_BLOBS
 
 
 def _derive(model: ModelHandle, tensors: Mapping[str, torch.Tensor]) -> ModelHandle:
@@ -127,23 +164,50 @@ def tensor_diffs(base: ModelHandle, candidate: ModelHandle) -> tuple[TensorDiff,
     """Per-tensor differences between two handles of the same architecture."""
     diffs = []
     for name in base.tensor_names():
-        before = base._tensors[name].numpy()
-        after = candidate._tensors[name].numpy()
-        delta = after.astype(np.float64) - before.astype(np.float64)
-        before_l2 = math.sqrt(float(np.sum(np.square(before, dtype=np.float64))))
-        l2 = math.sqrt(float(np.sum(np.square(delta))))
+        info = _info(base, name)
+        before_tensor, after_tensor = base._tensors[name], candidate._tensors[name]
+        if info.dtype not in EDITABLE_DTYPES:
+            before_bits = before_tensor.numpy()
+            after_bits = after_tensor.numpy()
+            before = before_bits.astype(np.float64)
+            after = after_bits.astype(np.float64)
+            changed = _changed(before_bits.view(f"u{before_bits.itemsize}"), after_bits.view(f"u{after_bits.itemsize}"))
+            before_square = float(np.sum(np.square(before)))
+            delta = after - before
+            delta_square = float(np.sum(np.square(delta)))
+            max_abs = float(np.max(np.abs(delta))) if delta.size else 0.0
+            finite = bool(np.all(np.isfinite(after)))
+            before_hash = tensor_hash(name, before_tensor)
+            after_hash = tensor_hash(name, after_tensor)
+        else:
+            before_bits, after_bits = tensor_bits(before_tensor), tensor_bits(after_tensor)
+            before_square = _sum_of_squares(before_bits, info.dtype)
+            before_hash = tensor_hash(name, before_tensor)
+            if after_tensor is before_tensor:  # shared, unchanged
+                changed, delta_square, max_abs, finite, after_hash = 0, 0.0, 0.0, True, before_hash
+            else:
+                differs = np.flatnonzero(before_bits.reshape(-1) != after_bits.reshape(-1))
+                changed = int(differs.size)
+                delta_square = _sum_of_squares(before_bits, info.dtype, other=after_bits)
+                changed_after = bits_to_values(after_bits.reshape(-1)[differs], info.dtype).astype(np.float64)
+                changed_before = bits_to_values(before_bits.reshape(-1)[differs], info.dtype).astype(np.float64)
+                max_abs = float(np.max(np.abs(changed_after - changed_before))) if changed else 0.0
+                finite = bool(np.all(np.isfinite(changed_after)))
+                after_hash = tensor_hash(name, after_tensor)
+        before_l2 = math.sqrt(before_square)
+        l2 = math.sqrt(delta_square)
         diffs.append(
             TensorDiff(
                 tensor=name,
-                before_hash=tensor_hash(name, base._tensors[name]),
-                after_hash=tensor_hash(name, candidate._tensors[name]),
-                changed_elements=_changed(before, after),
-                element_count=int(before.size),
+                before_hash=before_hash,
+                after_hash=after_hash,
+                changed_elements=changed,
+                element_count=int(before_tensor.numel()),
                 l2_delta=l2,
-                max_abs_delta=float(np.max(np.abs(delta))) if delta.size else 0.0,
+                max_abs_delta=max_abs,
                 before_l2=before_l2,
                 relative_l2_delta=(l2 / before_l2) if before_l2 > 0 else None,
-                all_finite=bool(np.all(np.isfinite(after))),
+                all_finite=finite,
             )
         )
     return tuple(diffs)
@@ -175,7 +239,7 @@ def _edit_step(
     *,
     registry: Registry,
     policy: OperationPolicy,
-) -> tuple[ModelHandle, PatchStep]:
+) -> tuple[ModelHandle, PatchStep, dict[str, bytes]]:
     if not isinstance(parameters, Mapping):
         raise WSEError(ErrorCode.INVALID_ARGUMENT, "edit parameters must be an object with tensor and selection")
     raw = dict(parameters)
@@ -202,7 +266,8 @@ def _edit_step(
     slices = resolve_selection(selection, info.shape, tensor=info.name)
     entries = [AxisSlice(start=s.start, stop=s.stop, step=1) for s in slices]
     current = model._tensors[info.name]
-    before = current.numpy()[slices]
+    before_bits = tensor_bits(current)[slices]
+    before = bits_to_values(before_bits, info.dtype)  # the stored values; BF16 as its exact float32 widening
     view = before.view()
     view.flags.writeable = False
     region = TensorRegion(
@@ -224,8 +289,8 @@ def _edit_step(
             ErrorCode.WORKER_FAILED,
             f"operator {ref} returned shape {list(computed.shape)} for a region of shape {list(before.shape)}",
         )
-    with np.errstate(over="ignore", invalid="ignore"):
-        after = computed.astype(EDITABLE_DTYPES[info.dtype])
+    after_bits = values_to_bits(computed, info.dtype)  # round to nearest even in the stored dtype
+    after = bits_to_values(after_bits, info.dtype)
     bad = int(np.count_nonzero(~np.isfinite(after)))
     if bad:
         raise WSEError(
@@ -234,12 +299,19 @@ def _edit_step(
             f"{info.dtype}); every weight must stay finite",
             details={"tensor": info.name, "nonfinite_count": bad},
         )
-    updated = current.clone()
-    updated.numpy()[slices] = after
+    updated = current.clone(memory_format=torch.contiguous_format)
+    tensor_bits(updated)[slices] = after_bits
     tensors = dict(model._tensors)
     tensors[info.name] = updated
     candidate = _derive(model, tensors)
     resolved_parameters = resolved.model_dump(mode="json") if isinstance(resolved, BaseModel) else {}
+    blocks: dict[str, bytes] = {}
+    if records_blocks(model):
+        block, data = make_block(current, updated, selection=entries)
+        blocks[block.block_id] = data
+        form: dict[str, Any] = {"block": block}
+    else:
+        form = {"values": shortest_floats(after)}
     step = PatchStep(
         op=label,
         operator=ref,
@@ -249,17 +321,28 @@ def _edit_step(
         dtype=info.dtype,
         before_hash=tensor_hash(info.name, current),
         after_hash=tensor_hash(info.name, updated),
-        values=shortest_floats(after),
-        changed_elements=_changed(before, after),
+        changed_elements=_changed(before_bits, after_bits),
+        **form,
     )
-    return candidate, step
+    return candidate, step, blocks
 
 
-def _result(base: ModelHandle, candidate: ModelHandle, steps: list[PatchStep]) -> EditResult:
+def _result(base: ModelHandle, candidate: ModelHandle, steps: list[PatchStep],
+            blocks: Mapping[str, bytes]) -> EditResult:
     from wse.api import EditResult
 
     patch = MaterializedPatch(base=base.identity, result_weights_hash=candidate.weights_hash, steps=steps)
-    return EditResult(candidate=candidate, patch=patch, diff=tensor_diffs(base, candidate))
+    return EditResult(candidate=candidate, patch=patch, diff=tensor_diffs(base, candidate),
+                      blocks=MappingProxyType(dict(blocks)))
+
+
+def _inline_elements(step: PatchStep) -> int:
+    """Elements that count toward M1's per-patch limit: inline values (M1 steps and ``set_slice`` input)."""
+    if step.values is not None:
+        return len(step.values)
+    if "values" in step.parameters:
+        return math.prod(entry.stop - entry.start for entry in step.selection)
+    return 0
 
 
 def apply_operator(
@@ -280,14 +363,14 @@ def apply_operator(
     """
     from wse.registry import builtin_registry
 
-    candidate, step = _edit_step(
+    candidate, step, blocks = _edit_step(
         model,
         operator_id,
         parameters,
         registry=registry or builtin_registry(),
         policy=policy or default_operation_policy(),
     )
-    return _result(model, candidate, [step])
+    return _result(model, candidate, [step], blocks)
 
 
 def materialize_patch(
@@ -320,6 +403,7 @@ def materialize_patch(
         )
     current = model
     steps: list[PatchStep] = []
+    blocks: dict[str, bytes] = {}
     written = 0
     for index, operation in enumerate(operations):
         if not isinstance(operation, Mapping) or "op" not in operation:
@@ -328,27 +412,32 @@ def materialize_patch(
         request = dict(operation)
         op = request.pop("op")
         try:
-            current, step = _edit_step(current, op, request, registry=registry, policy=policy)
+            current, step, step_blocks = _edit_step(current, op, request, registry=registry, policy=policy)
         except WSEError as exc:
             raise _wrap_step_error(index, op, exc) from exc
-        written += len(step.values)
+        blocks.update(step_blocks)
+        written += _inline_elements(step)
         if written > limits.max_patch_elements:
             raise WSEError(
                 ErrorCode.INVALID_PATCH,
-                f"a patch may write at most {limits.max_patch_elements} elements in total; operation "
+                f"a patch may write at most {limits.max_patch_elements} inline elements in total; operation "
                 f"{index} brings it to {written}",
                 details={"operation_index": index, "max_patch_elements": limits.max_patch_elements},
             )
         steps.append(step)
-    return _result(model, current, steps)
+    return _result(model, current, steps, blocks)
 
 
-def replay_patch(model: ModelHandle, patch: MaterializedPatch) -> ModelHandle:
+def replay_patch(
+    model: ModelHandle, patch: MaterializedPatch, *, blocks: Mapping[str, bytes] | None = None
+) -> ModelHandle:
     """Recreate a patch's candidate from its stored after-values.
 
-    No editing operator runs: each step writes its recorded values, and the
-    base identity, every per-step tensor hash, and the final weights hash are
-    verified, so a replay reproduces identical tensor bytes or fails.
+    No editing operator runs: each step writes its recorded values or its
+    binary block (from ``blocks``, block ID -> bytes, as stored with the
+    patch), and the base identity, every per-step tensor hash and blob ID, and
+    the final weights hash are verified, so a replay reproduces identical
+    tensor bytes or fails.
     """
     if model.identity != patch.base:
         raise WSEError(
@@ -367,6 +456,23 @@ def replay_patch(model: ModelHandle, patch: MaterializedPatch) -> ModelHandle:
         if tensor_hash(info.name, current) != step.before_hash:
             raise WSEError(ErrorCode.INVALID_PATCH, f"step {index}: tensor {info.name!r} does not match the "
                            "recorded before-hash", details={"step": index})
+        if step.block is not None:
+            data = (blocks or {}).get(step.block.block_id)
+            if data is None:
+                raise WSEError(ErrorCode.INVALID_PATCH, f"step {index}: the binary block {step.block.block_id} is "
+                               "missing; replay reads the blocks stored with the patch", details={"step": index})
+            try:
+                updated = apply_block(current, step.block, data)
+            except WSEError as exc:
+                raise WSEError(ErrorCode.INVALID_PATCH, f"step {index}: {exc.message}",
+                               details={**exc.details, "step": index}) from exc
+            if tensor_hash(info.name, updated) != step.after_hash:
+                raise WSEError(ErrorCode.INVALID_PATCH, f"step {index}: replayed tensor {info.name!r} does not "
+                               "match the recorded after-hash", details={"step": index})
+            tensors[info.name] = updated
+            continue
+        if EDITABLE_DTYPES[step.dtype] is None or step.values is None:
+            raise WSEError(ErrorCode.INVALID_PATCH, f"step {index} records no values for a {step.dtype} tensor")
         slices = resolve_selection(step.selection, info.shape, tensor=info.name)
         shape = tuple(s.stop - s.start for s in slices)
         values = np.array(step.values, dtype=EDITABLE_DTYPES[step.dtype])

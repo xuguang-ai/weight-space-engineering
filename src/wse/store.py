@@ -90,7 +90,7 @@ DEFAULT_SINGLE_FILE_MAX_BYTES = 64 * 1024 * 1024
 WEIGHTS_INDEX_FORMAT = "wse-weights-index-v1"
 _RELPATH_PATTERN = re.compile(
     r"^(?:weights/[0-9a-f]{64}\.(?:safetensors|json)|manifests/[0-9a-f]{64}\.json"
-    r"|analyses/[0-9a-f]{64}\.json|patches/[0-9a-f]{64}\.json|blobs/[0-9a-f]{64})$"
+    r"|analyses/[0-9a-f]{64}\.json|patches/[0-9a-f]{64}\.(?:json|wsepatch)|blobs/[0-9a-f]{64})$"
 )
 # Integer dtypes whose bit patterns carry a stored dtype of the same width.
 _BIT_DTYPES: dict[int, tuple[type, torch.dtype]] = {
@@ -546,14 +546,16 @@ class ArtifactStore:
 
     # -- patch artifacts ------------------------------------------------------
 
-    def publish_patch(self, data: bytes) -> tuple[str, str, int]:
+    def publish_patch(self, data: bytes, *, binary: bool = False) -> tuple[str, str, int]:
         """Publish a patch artifact; return its relpath, SHA-256 hex, and size.
 
-        The file is invisible until a ``patches`` row references it; callers
-        must check ``require_published`` inside their commit transaction.
+        ``binary`` patch files (``wse.patch_blocks``) get the suffix
+        ``.wsepatch``, JSON patches ``.json``. The file is invisible until a
+        ``patches`` or ``imported_patches`` row references it; callers must
+        check ``require_published`` inside their commit transaction.
         """
         digest = hashlib.sha256(data).hexdigest()
-        relpath = f"{PATCHES_DIR}/{digest}.json"
+        relpath = f"{PATCHES_DIR}/{digest}.{'wsepatch' if binary else 'json'}"
         file_sha, size = self._publish_bytes(relpath, data)
         return relpath, file_sha, size
 
@@ -883,6 +885,7 @@ class ArtifactStore:
         with self.db.transaction() as conn:
             referenced = {row["relpath"] for row in conn.execute("SELECT relpath FROM artifacts")}
             referenced |= {row["relpath"] for row in conn.execute("SELECT relpath FROM patches")}
+            referenced |= {row["relpath"] for row in conn.execute("SELECT relpath FROM imported_patches")}
             for directory in (WEIGHTS_DIR, MANIFESTS_DIR, PATCHES_DIR):
                 for path in sorted((self.artifacts_dir / directory).iterdir()):
                     relpath = f"{directory}/{path.name}"

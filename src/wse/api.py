@@ -35,6 +35,7 @@ from wse.schemas import (
     EvaluationSuite,
     ExecutionConfig,
     ExtensionRef,
+    ImportedPatch,
     ImportManifest,
     IntervalEstimate,
     Management,
@@ -175,12 +176,18 @@ class ModelHandle:
 
 @dataclass(frozen=True)
 class EditResult:
-    """Outcome of a direct edit: the immutable candidate, exact patch, and diff."""
+    """Outcome of a direct edit: the immutable candidate, exact patch, and diff.
+
+    ``blocks`` holds the bytes of the patch's binary blocks by block ID
+    (open-weight models; empty for M1 models, whose steps carry inline values).
+    Replay needs them: ``replay_patch(base, result.patch, blocks=result.blocks)``.
+    """
 
     candidate: ModelHandle
     patch: MaterializedPatch
     diff: tuple[TensorDiff, ...]
     management: Management = "unmanaged"
+    blocks: Mapping[str, bytes] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -835,6 +842,98 @@ class Engine:
         del identity["checkpoint_id"]
         return self.store.commit_checkpoint(manifest, imported.tensors, dedup_key=json_hash({"import_hf": identity}),
                                             event_type="checkpoint.imported")
+
+    def import_patch(
+        self,
+        edit_dir: str | Path,
+        *,
+        base_checkpoint_id: str,
+        format: str = "lm-understand-v1",
+        repo: str | None = None,
+        revision: str | None = None,
+    ) -> ImportedPatch:
+        """Import a published edit as an exact patch and commit its candidate (operator only; M2 plan Section 3.4).
+
+        Every base hash is verified before anything is rebuilt, and every
+        rebuilt tensor must equal its published hash; otherwise nothing is
+        stored. The binary patch file, the candidate checkpoint (whose parent
+        is the base), and the record are committed together. ``repo`` and
+        ``revision`` label the source the operator downloaded; the record also
+        names the run and the SHA-256 of every file read. Importing the same
+        files onto the same base again returns the existing record.
+        """
+        from wse.database import insert_audit_event, utc_now
+        from wse.experiments import _candidate_tensor_infos, _new_id
+        from wse.external_patches import FORMATS, materialize_lm_understand, read_lm_understand
+        from wse.patch_blocks import write_patch_file
+        from wse.schemas import ExternalPatchSource, ImportedPatch, Provenance
+
+        self._require_operator("importing a patch")
+        if format not in FORMATS:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, f"unknown patch format {format!r}; supported: {list(FORMATS)}")
+        edit = read_lm_understand(edit_dir)
+        source = ExternalPatchSource(format=format, repository=repo, revision=revision, run=edit.run,
+                                     files=edit.files)
+        dedup_key = json_hash({"import_patch": {"base_checkpoint_id": base_checkpoint_id,
+                                                "source": source.model_dump(mode="json")}})
+        existing = self.store.db.conn.execute("SELECT record_json FROM imported_patches WHERE dedup_key = ?",
+                                              (dedup_key,)).fetchone()
+        if existing is not None:
+            return ImportedPatch.model_validate_json(existing["record_json"])
+        base = self._open_checkpoint(base_checkpoint_id)
+        result = materialize_lm_understand(base, edit, source)
+        data = write_patch_file(result.patch.model_dump(mode="json"), result.blocks)
+        relpath, file_sha, size = self.store.publish_patch(data, binary=True)
+        patch_id = _new_id("patch")
+        base_manifest = self.store.load_manifest(base_checkpoint_id)
+        manifest = ModelManifest.model_validate(base_manifest.model_copy(update={
+            "checkpoint_id": self.store.new_checkpoint_id(),
+            "weights_hash": result.candidate.weights_hash,
+            "tensors": _candidate_tensor_infos(base_manifest, base, result.candidate),
+            "provenance": Provenance(kind="patch", source=patch_id, parent_checkpoint_id=base_checkpoint_id),
+        }).model_dump(mode="json"))
+        record = ImportedPatch(patch_id=patch_id, base_checkpoint_id=base_checkpoint_id,
+                               checkpoint_id=manifest.checkpoint_id, result_weights_hash=manifest.weights_hash,
+                               source=source, tensors=result.tensors,
+                               changed_elements=sum(t.changed_elements for t in result.tensors), patch_bytes=size)
+
+        def on_commit(conn: Any, committed: ModelManifest) -> None:
+            self.store.require_published(relpath)
+            conn.execute(
+                "INSERT INTO imported_patches (patch_id, format, dedup_key, base_checkpoint_id, checkpoint_id, "
+                "result_weights_hash, relpath, file_sha256, size_bytes, record_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (patch_id, format, dedup_key, base_checkpoint_id, committed.checkpoint_id, committed.weights_hash,
+                 relpath, file_sha, size, record.canonical_json(), utc_now()))
+            insert_audit_event(conn, "patch.imported", patch_id,
+                               {"format": format, "base_checkpoint_id": base_checkpoint_id,
+                                "checkpoint_id": committed.checkpoint_id, "source": source.model_dump(mode="json"),
+                                "changed_elements": record.changed_elements})
+
+        self.store.commit_checkpoint(manifest, dict(result.candidate._tensors), dedup_key=None,
+                                     event_type="checkpoint.candidate", on_commit=on_commit)
+        return record
+
+    def read_imported_patch(self, patch_id: str) -> tuple[MaterializedPatch, dict[str, bytes]]:
+        """An imported patch's exact materialized patch and its binary blocks (operator only; hash-verified)."""
+        import hashlib
+
+        from wse.patch_blocks import read_patch_file
+
+        self._require_operator("reading an imported patch")
+        row = self.store.db.conn.execute("SELECT * FROM imported_patches WHERE patch_id = ?",
+                                         (str(patch_id),)).fetchone()
+        if row is None:
+            raise WSEError(ErrorCode.NOT_FOUND, f"imported patch {patch_id!r} does not exist")
+        try:
+            data = (self.store.artifacts_dir / row["relpath"]).read_bytes()
+        except FileNotFoundError:
+            data = None
+        if data is None or hashlib.sha256(data).hexdigest() != row["file_sha256"]:
+            raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"imported patch {patch_id}: the patch file is missing or "
+                           "does not match its recorded hash", details={"patch_id": patch_id})
+        document, blocks = read_patch_file(data)
+        return MaterializedPatch.model_validate(document), blocks
 
     def import_bundle(self, path: str | Path) -> ModelManifest:
         """Import a bundle directory (operator only)."""

@@ -197,6 +197,73 @@ def blob_id(tensor: torch.Tensor) -> str:
     return hashlib.sha256(raw_bytes_view(tensor)).hexdigest()
 
 
+# -- stored bit patterns -------------------------------------------------------
+#
+# Edits read and write stored values as bit patterns (M2 plan Section 3.2).
+# NumPy has no bfloat16, so a BF16 value is handled as its uint16 bit pattern
+# and computed on as its exact float32 widening.
+
+# Stored dtype name -> (torch integer dtype of the same width, NumPy unsigned bit-pattern dtype).
+BIT_PATTERN_DTYPES: dict[str, tuple[torch.dtype, type]] = {
+    "float32": (torch.int32, np.uint32),
+    "float16": (torch.int16, np.uint16),
+    "bfloat16": (torch.int16, np.uint16),
+}
+
+
+def bf16_to_f32(bits: np.ndarray) -> np.ndarray:
+    """BF16 bit patterns (uint16) to their exact float32 values: the pattern becomes the high half."""
+    return (np.asarray(bits, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
+
+
+def f32_to_bf16_bits_rne(values: np.ndarray) -> np.ndarray:
+    """float32 values to BF16 bit patterns (uint16), rounding the float32 bit pattern to nearest even.
+
+    For finite values and infinities this equals ``torch``'s float32 to
+    bfloat16 conversion and the article's ``st_numpy.bf16_bits``: add
+    ``0x7FFF`` plus the lowest kept bit, then drop the low 16 bits; a value
+    beyond the largest BF16 rounds to infinity. A NaN stays a quiet NaN with
+    its sign, where the bit arithmetic alone could carry it into infinity.
+    """
+    u = np.ascontiguousarray(values, dtype=np.float32).view(np.uint32)
+    rounded = ((u.astype(np.uint64) + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16)
+    nan = np.isnan(u.view(np.float32))
+    if nan.any():
+        rounded = np.where(nan, ((u >> 16) | 0x0040).astype(np.uint16), rounded)
+    return rounded
+
+
+def tensor_bits(tensor: torch.Tensor) -> np.ndarray:
+    """The stored bit patterns of a CPU tensor as an unsigned NumPy array of its shape.
+
+    The array shares memory with ``tensor`` when it is contiguous, so writing
+    to it writes the tensor.
+    """
+    name = dtype_name(tensor)
+    if name not in BIT_PATTERN_DTYPES:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, f"tensors of dtype {name} have no supported bit-pattern view")
+    integer, unsigned = BIT_PATTERN_DTYPES[name]
+    return tensor.detach().contiguous().view(integer).numpy().view(unsigned)
+
+
+def bits_to_values(bits: np.ndarray, dtype: str) -> np.ndarray:
+    """Values of stored bit patterns: float32 and float16 as themselves, BF16 as its exact float32 widening."""
+    if dtype == "bfloat16":
+        return bf16_to_f32(bits)
+    return np.asarray(bits).view(np.float32 if dtype == "float32" else np.float16)
+
+
+def values_to_bits(values: np.ndarray, dtype: str) -> np.ndarray:
+    """float32 values written back to ``dtype``'s bit patterns, rounding to nearest even."""
+    values = np.asarray(values, dtype=np.float32)
+    if dtype == "bfloat16":
+        return f32_to_bf16_bits_rne(values)
+    if dtype == "float16":
+        with np.errstate(over="ignore", invalid="ignore"):
+            return values.astype(np.float16).view(np.uint16)
+    return np.ascontiguousarray(values).view(np.uint32)
+
+
 def tensor_from_buffer(buffer: bytearray, dtype: torch.dtype, shape: Sequence[int]) -> torch.Tensor:
     """Interpret raw little-endian row-major bytes as a tensor without copying.
 

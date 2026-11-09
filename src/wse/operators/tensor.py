@@ -3,7 +3,8 @@
 Analyses ``tensor_stats@1``, ``tensor_norm@1``, and ``tensor_top_k@1`` read
 only the region the engine passes in and accumulate in float64 without
 copying it. Edits ``set_slice@1`` and ``scale_slice@1`` return new values for
-that region, computed in FP32. None of them calls the model adapter's
+that region, computed in FP32; the patch engine writes them back to the
+stored dtype (BF16, F16, or F32) with round-to-nearest-even. None of them calls the model adapter's
 ``forward``. Element values in results use the shortest decimal digits that
 round-trip the stored dtype.
 """

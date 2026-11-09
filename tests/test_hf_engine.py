@@ -328,7 +328,8 @@ CORE_MODULES = (
     "wse.policy, wse.patches, wse.experiments, wse.audit, wse.evaluation, wse.evaluators.classification, "
     "wse.evaluators.datasets, wse.jobs, wse.worker, wse.budget, wse.runner, wse.hf_snapshot, "
     "wse.adapters.mlp, wse.adapters.families, wse.adapters.hf_causal_lm, wse.operators.base, "
-    "wse.operators.tensor, wse.strategies.scripted, wse.engines, wse.engines.hf_torch"
+    "wse.operators.tensor, wse.strategies.scripted, wse.engines, wse.engines.hf_torch, wse.patch_blocks, "
+    "wse.external_patches"
 )
 
 
