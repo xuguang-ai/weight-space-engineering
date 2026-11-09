@@ -4,6 +4,9 @@ The weights hash is computed over tensor names (in sorted order), dtypes,
 shapes, and raw bytes, so it is independent of dictionary insertion order and
 of the safetensors file layout. It identifies weights only; model identity
 also includes the adapter and configuration hash.
+
+A blob ID (``blob_id``) identifies one tensor's raw bytes alone: the SHA-256
+of its little-endian row-major bytes in the stored dtype.
 """
 
 from __future__ import annotations
@@ -136,9 +139,61 @@ def require_finite(tensors: Mapping[str, torch.Tensor]) -> None:
             )
 
 
+def dtype_from_name(name: str) -> torch.dtype:
+    """Inverse of :func:`dtype_name`; raise ``ARTIFACT_CORRUPT`` for an unknown name."""
+    for dtype, known in _DTYPE_NAMES.items():
+        if known == name:
+            return dtype
+    candidate = getattr(torch, name, None) if name.isidentifier() else None
+    if isinstance(candidate, torch.dtype):
+        return candidate
+    raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"stored dtype {name!r} is not a torch dtype")
+
+
+def raw_bytes_view(tensor: torch.Tensor) -> np.ndarray:
+    """The tensor's raw bytes as a uint8 array: little-endian, row-major, stored dtype.
+
+    The array may share memory with ``tensor`` when it is already contiguous;
+    callers must not modify it.
+    """
+    flat = tensor.detach().cpu().contiguous().reshape(-1)
+    return flat.view(torch.uint8).numpy()
+
+
 def _raw_bytes(tensor: torch.Tensor) -> bytes:
-    flat = tensor.detach().contiguous().reshape(-1)
-    return flat.view(torch.uint8).numpy().tobytes()
+    return raw_bytes_view(tensor).tobytes()
+
+
+def blob_id(tensor: torch.Tensor) -> str:
+    """The SHA-256 hex digest of the tensor's raw bytes in its stored dtype (M2 plan Section 3.1).
+
+    This is the convention of the published ``apply_edit.py`` hashes: the
+    bytes are little-endian (every supported platform is) and row-major, so a
+    non-contiguous view hashes its logical element order. Shape and dtype are
+    not part of the digest; manifests record them next to the blob ID.
+    """
+    return hashlib.sha256(raw_bytes_view(tensor)).hexdigest()
+
+
+def tensor_from_buffer(buffer: bytearray, dtype: torch.dtype, shape: Sequence[int]) -> torch.Tensor:
+    """Interpret raw little-endian row-major bytes as a tensor without copying.
+
+    BF16 and F16 (and every other dtype) load through ``torch.frombuffer`` on
+    the raw bytes, so stored bit patterns, signed zeros, and subnormals are
+    preserved exactly. The tensor shares memory with ``buffer``.
+    """
+    count = 1
+    for size in shape:
+        count *= int(size)
+    element_size = torch.empty((), dtype=dtype).element_size()
+    if len(buffer) != count * element_size:
+        raise WSEError(
+            ErrorCode.ARTIFACT_CORRUPT,
+            f"stored tensor has {len(buffer)} bytes; shape {list(shape)} of {dtype} needs {count * element_size}",
+        )
+    if count == 0:
+        return torch.empty(tuple(shape), dtype=dtype)
+    return torch.frombuffer(buffer, dtype=dtype, count=count).reshape(tuple(shape))
 
 
 def _update_tensor(digest: Any, name: str, tensor: torch.Tensor) -> None:

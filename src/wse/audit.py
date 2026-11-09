@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import json
 import platform
-import shutil
 import sqlite3
 import sys
 from collections.abc import Mapping
@@ -434,7 +433,7 @@ def export_experiment(engine: Engine, experiment_id: str, output_dir: str | Path
 def _export_bundle(engine: Engine, checkpoint_id: str, directory: Path, files: dict[str, str]) -> None:
     manifest = engine.load_manifest(checkpoint_id)
     directory.mkdir(parents=True)
-    shutil.copyfile(engine.store.weights_path(checkpoint_id), directory / "model.safetensors")
+    engine.store.export_safetensors(checkpoint_id, directory / "model.safetensors")
     files[f"{BASE_BUNDLE_DIR}/model.safetensors"] = content_hash((directory / "model.safetensors").read_bytes())
     root = directory.parent
     _write_json(root, f"{BASE_BUNDLE_DIR}/config.json", manifest.config, files)

@@ -14,50 +14,91 @@ Commit protocol (the filesystem and SQLite share no transaction):
 Patch previews follow the same protocol: their content-addressed JSON file
 is published first and becomes visible only through a ``patches`` row.
 
+Tensors are stored per tensor as content-addressed blobs (M2 plan Section
+3.1): ``artifacts/blobs/<sha256>`` holds one tensor's raw little-endian
+row-major bytes in its stored dtype, and its name is the SHA-256 of those
+bytes (``wse.tensors.blob_id``). Each weights artifact has a blob manifest in
+the ``weight_tensors`` table that maps canonical tensor names to blob IDs,
+dtypes, and shapes, so a candidate stores only the blobs that differ from its
+parent and tensors with identical bytes share one blob. A blob's reference
+count is its number of ``weight_tensors`` rows. Blobs are published before the
+weights artifact, by the same write-sync-rename sequence, and become visible
+with the commit transaction that references them.
+
+The weights artifact itself is M1's single safetensors file for checkpoints of
+at most ``single_file_max_bytes`` (so M1 layouts and exports are unchanged), and
+a canonical JSON blob index (``weights/<hash>.json``) above that limit, so a
+large candidate never copies its unchanged tensors.
+
 Only READY checkpoints can be listed or loaded. Recovery removes expired
-temporary files and unreferenced artifacts, and marks checkpoints whose files
-are missing or fail their hash check as CORRUPT, which prohibits loading.
+temporary files, unreferenced artifacts, and unreferenced blobs, and marks
+checkpoints whose files are missing or fail their hash check as CORRUPT, which
+prohibits loading. A tampered blob marks every checkpoint that uses it CORRUPT.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import stat
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 
+import numpy as np
 import torch
-from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 from wse.database import Database, insert_audit_event, utc_now
 from wse.schemas import (
     CHECKPOINT_ID_PATTERN,
+    SCHEMA_VERSION,
     ErrorCode,
     ModelManifest,
     WSEError,
+    canonical_json,
     content_hash,
 )
-from wse.tensors import weights_hash
+from wse.tensors import (
+    blob_id,
+    dtype_from_name,
+    dtype_name,
+    raw_bytes_view,
+    tensor_from_buffer,
+    weights_hash,
+)
 
 WEIGHTS_DIR = "weights"
 MANIFESTS_DIR = "manifests"
 ANALYSES_DIR = "analyses"
 PATCHES_DIR = "patches"
+BLOBS_DIR = "blobs"
 ANALYSIS_URI_PREFIX = "wse://analyses/"
 TMP_DIR = "tmp"
 DEFAULT_RECOVERY_GRACE_SECONDS = 600.0
+# Checkpoints up to this size keep M1's single safetensors weights file next to
+# their blobs; larger ones get a JSON blob index as their weights artifact.
+DEFAULT_SINGLE_FILE_MAX_BYTES = 64 * 1024 * 1024
+WEIGHTS_INDEX_FORMAT = "wse-weights-index-v1"
 _RELPATH_PATTERN = re.compile(
-    r"^(?:weights/[0-9a-f]{64}\.safetensors|manifests/[0-9a-f]{64}\.json"
-    r"|analyses/[0-9a-f]{64}\.json|patches/[0-9a-f]{64}\.json)$"
+    r"^(?:weights/[0-9a-f]{64}\.(?:safetensors|json)|manifests/[0-9a-f]{64}\.json"
+    r"|analyses/[0-9a-f]{64}\.json|patches/[0-9a-f]{64}\.json|blobs/[0-9a-f]{64})$"
 )
+# Integer dtypes whose bit patterns carry a stored dtype of the same width.
+_BIT_DTYPES: dict[int, tuple[type, torch.dtype]] = {
+    1: (np.uint8, torch.uint8),
+    2: (np.int16, torch.int16),
+    4: (np.int32, torch.int32),
+    8: (np.int64, torch.int64),
+}
 _READ_ONLY = stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH
 
 
@@ -67,6 +108,23 @@ class RecoveryReport:
     removed_orphans: list[str] = field(default_factory=list)
     corrupted_checkpoints: list[str] = field(default_factory=list)
     corrupted_patches: list[str] = field(default_factory=list)
+    removed_blobs: list[str] = field(default_factory=list)
+
+
+class TensorEntry(NamedTuple):
+    """One row of a blob manifest: a canonical tensor name and its stored blob."""
+
+    name: str
+    blob_id: str
+    dtype: str
+    shape: tuple[int, ...]
+
+    @property
+    def size_bytes(self) -> int:
+        count = 1
+        for size in self.shape:
+            count *= size
+        return count * torch.empty((), dtype=dtype_from_name(self.dtype)).element_size()
 
 
 OnCommit = Callable[[sqlite3.Connection, ModelManifest], None]
@@ -97,6 +155,22 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _blob_relpath(blob: str) -> str:
+    return f"{BLOBS_DIR}/{blob}"
+
+
+def _tensor_entries(tensors: Mapping[str, torch.Tensor]) -> list[TensorEntry]:
+    return [
+        TensorEntry(name, blob_id(t), dtype_name(t), tuple(int(size) for size in t.shape))
+        for name, t in sorted(tensors.items())
+    ]
+
+
+def _write_array(path: Path, data: np.ndarray) -> None:
+    with open(path, "wb") as handle:
+        handle.write(memoryview(data))
+
+
 def _fsync_path(path: Path) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:
@@ -108,23 +182,36 @@ def _fsync_path(path: Path) -> None:
 class ArtifactStore:
     """Immutable artifacts under ``<workspace>/artifacts`` plus SQLite metadata."""
 
-    def __init__(self, workspace: Path | str) -> None:
+    def __init__(self, workspace: Path | str, *, single_file_max_bytes: int = DEFAULT_SINGLE_FILE_MAX_BYTES) -> None:
         self.workspace = Path(workspace)
         self.artifacts_dir = self.workspace / "artifacts"
         self.tmp_dir = self.artifacts_dir / TMP_DIR
+        self.single_file_max_bytes = int(single_file_max_bytes)
         for directory in (
             self.tmp_dir,
             self.artifacts_dir / WEIGHTS_DIR,
             self.artifacts_dir / MANIFESTS_DIR,
             self.artifacts_dir / ANALYSES_DIR,
             self.artifacts_dir / PATCHES_DIR,
+            self.artifacts_dir / BLOBS_DIR,
         ):
             directory.mkdir(parents=True, exist_ok=True)
         self.db = Database(self.workspace / "metadata.sqlite")
         self._verified: dict[str, tuple[int, int, int]] = {}
+        try:
+            self._index_unindexed_weights()
+        except BaseException:
+            self.db.close()
+            raise
 
     def close(self) -> None:
         self.db.close()
+
+    def __enter__(self) -> ArtifactStore:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
 
     # -- identifiers and paths ------------------------------------------------
 
@@ -139,14 +226,17 @@ class ArtifactStore:
 
     # -- publishing -----------------------------------------------------------
 
-    def _publish(self, relpath: str, write: Callable[[Path], None]) -> tuple[str, int]:
+    def _publish(
+        self, relpath: str, write: Callable[[Path], None], *, expected_sha256: str | None = None
+    ) -> tuple[str, int]:
         """Write a file through ``tmp/`` and publish it at ``relpath``.
 
-        Returns the file's SHA-256 hex digest and size. The fresh file always
-        replaces any existing file at ``relpath`` (same content, by
-        construction), so a published file is never older than the recovery
-        grace period when its database commit runs, even if an earlier crashed
-        operation left an identical orphan behind.
+        Returns the file's SHA-256 hex digest and size. When ``expected_sha256``
+        is given, a written file with another digest is never published. The
+        fresh file always replaces any existing file at ``relpath`` (same
+        content, by construction), so a published file is never older than the
+        recovery grace period when its database commit runs, even if an earlier
+        crashed operation left an identical orphan behind.
         """
         final = self._artifact_path(relpath)
         temp = self.tmp_dir / f"{uuid.uuid4().hex}.part"
@@ -155,6 +245,12 @@ class ArtifactStore:
             _fsync_path(temp)
             os.chmod(temp, _READ_ONLY)
             digest, size = _file_sha256(temp), temp.stat().st_size
+            if expected_sha256 is not None and digest != expected_sha256:
+                raise WSEError(
+                    ErrorCode.ARTIFACT_CORRUPT,
+                    f"written artifact {relpath} did not read back with its expected SHA-256",
+                    retryable=True,
+                )
             os.replace(temp, final)
             _fsync_path(final.parent)
         except BaseException:
@@ -176,6 +272,62 @@ class ArtifactStore:
 
     def _publish_bytes(self, relpath: str, data: bytes) -> tuple[str, int]:
         return self._publish(relpath, lambda path: path.write_bytes(data))
+
+    def _publish_missing_blobs(self, entries: Iterable[TensorEntry], tensors: Mapping[str, torch.Tensor]) -> None:
+        """Publish the blob of every entry whose blob is not registered yet.
+
+        A registered blob commits together with the blob manifest that
+        references it, and recovery never removes a referenced blob, so it is
+        reused after a (cached) hash check instead of being rewritten; a failed
+        check marks its checkpoints CORRUPT and refuses the commit, as for an
+        M1 weights file. An unregistered file (an orphan of a crashed commit)
+        is always rewritten, which refreshes it so a concurrent recovery scan
+        cannot delete it before this commit.
+        """
+        published: set[str] = set()
+        for entry in entries:
+            if entry.blob_id in published:
+                continue
+            published.add(entry.blob_id)
+            if self.db.conn.execute("SELECT 1 FROM blobs WHERE blob_id = ?", (entry.blob_id,)).fetchone():
+                self._verified_blob_path(entry.blob_id)
+                continue
+            data = raw_bytes_view(tensors[entry.name])
+            self._publish(_blob_relpath(entry.blob_id), lambda path, data=data: _write_array(path, data),
+                          expected_sha256=entry.blob_id)
+
+    def _insert_weight_tensors(
+        self, conn: sqlite3.Connection, weights_artifact_id: str, entries: list[TensorEntry], now: str
+    ) -> None:
+        """Inside a write transaction: register blobs and the blob manifest of a weights artifact."""
+        sizes: dict[str, int] = {}
+        for entry in entries:
+            sizes.setdefault(entry.blob_id, entry.size_bytes)
+        for blob, size in sorted(sizes.items()):
+            # Recovery deletes unreferenced blob files inside its own write
+            # transaction, so a file that exists here survives until this commit.
+            self.require_published(_blob_relpath(blob))
+            conn.execute(
+                "INSERT OR IGNORE INTO blobs (blob_id, relpath, size_bytes, created_at) VALUES (?, ?, ?, ?)",
+                (blob, _blob_relpath(blob), size, now),
+            )
+        conn.executemany(
+            "INSERT OR IGNORE INTO weight_tensors (weights_artifact_id, name, blob_id, dtype, shape) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [(weights_artifact_id, e.name, e.blob_id, e.dtype, canonical_json(list(e.shape))) for e in entries],
+        )
+
+    def _publish_weights_index(self, relpath: str, weights: str, entries: list[TensorEntry]) -> tuple[str, int]:
+        data = canonical_json({
+            "format": WEIGHTS_INDEX_FORMAT,
+            "schema_version": SCHEMA_VERSION,
+            "weights_hash": weights,
+            "tensors": [
+                {"name": e.name, "blob_id": e.blob_id, "dtype": e.dtype, "shape": list(e.shape)} for e in entries
+            ],
+        }).encode("utf-8")
+        return self._publish(relpath, lambda path: path.write_bytes(data),
+                             expected_sha256=hashlib.sha256(data).hexdigest())
 
     def commit_checkpoint(
         self,
@@ -200,16 +352,25 @@ class ArtifactStore:
             if existing is not None:
                 return self.load_manifest(existing)
 
-        weights_rel = f"{WEIGHTS_DIR}/{_hex(manifest.weights_hash)}.safetensors"
+        entries = _tensor_entries(tensors)
+        self._publish_missing_blobs(entries, tensors)
         row = self.db.conn.execute(
             "SELECT * FROM artifacts WHERE kind = 'weights' AND content_hash = ?",
             (manifest.weights_hash,),
         ).fetchone()
         if row is not None:
             self._verified_path(row)
-            weights_sha, weights_size = row["file_sha256"], row["size_bytes"]
-        else:
+            weights_rel, weights_sha, weights_size = row["relpath"], row["file_sha256"], row["size_bytes"]
+        elif sum(entry.size_bytes for entry in entries) <= self.single_file_max_bytes:
+            weights_rel = f"{WEIGHTS_DIR}/{_hex(manifest.weights_hash)}.safetensors"
             weights_sha, weights_size = self._publish_weights(weights_rel, tensors, manifest.weights_hash)
+        else:
+            # The single-file path checks this on read-back; an index must not
+            # register tensors under another weights hash either.
+            if weights_hash(tensors) != manifest.weights_hash:
+                raise WSEError(ErrorCode.ARTIFACT_CORRUPT, "tensors do not match the manifest's weights hash")
+            weights_rel = f"{WEIGHTS_DIR}/{_hex(manifest.weights_hash)}.json"
+            weights_sha, weights_size = self._publish_weights_index(weights_rel, manifest.weights_hash, entries)
 
         manifest_bytes = manifest.canonical_json().encode("utf-8")
         manifest_hash = content_hash(manifest_bytes)
@@ -241,6 +402,7 @@ class ArtifactStore:
                     "relpath, size_bytes, created_at) VALUES (?, 'weights', ?, ?, ?, ?, ?)",
                     (weights_artifact_id, manifest.weights_hash, weights_sha, weights_rel, weights_size, now),
                 )
+                self._insert_weight_tensors(conn, weights_artifact_id, entries, now)
                 conn.execute(
                     "INSERT INTO artifacts (artifact_id, kind, content_hash, file_sha256, relpath, "
                     "size_bytes, created_at) VALUES (?, 'manifest', ?, ?, ?, ?, ?)",
@@ -284,6 +446,50 @@ class ArtifactStore:
             # A concurrent identical import won; this call's manifest file is an orphan.
             return self.load_manifest(winner)
         return manifest
+
+    # -- migration 8: blob manifests for M1 weights ---------------------------
+
+    def _index_unindexed_weights(self) -> None:
+        """Give every weights artifact without a blob manifest its blobs, in place.
+
+        This is the data step of migration 8: M1 stored each checkpoint's
+        weights as one safetensors file. Each such file is hash-checked, its
+        tensors are published as blobs, and its blob manifest is committed in
+        one transaction. The weights artifact, the manifests, and the
+        checkpoints are not modified, so every M1 identity is unchanged. The
+        step is idempotent and safe to run in concurrent processes; a crash
+        leaves only orphan blobs, which recovery removes.
+        """
+        rows = self.db.conn.execute(
+            "SELECT * FROM artifacts a WHERE a.kind = 'weights' AND NOT EXISTS "
+            "(SELECT 1 FROM weight_tensors w WHERE w.weights_artifact_id = a.artifact_id) ORDER BY a.artifact_id"
+        ).fetchall()
+        for row in rows:
+            if not row["relpath"].endswith(".safetensors"):  # pragma: no cover - index artifacts commit their rows
+                continue
+            try:
+                path = self._verified_path(row)
+            except WSEError:
+                continue  # every checkpoint that uses it is now CORRUPT
+            tensors = load_file(str(path))
+            if weights_hash(tensors) != row["content_hash"]:
+                self._mark_corrupt_for_artifact(row["artifact_id"], "weights content hash mismatch")
+                continue
+            entries = _tensor_entries(tensors)
+            try:
+                self._publish_missing_blobs(entries, tensors)
+            except WSEError:
+                continue  # a shared blob failed its check; its checkpoints are now CORRUPT
+            with self.db.transaction() as conn:
+                if conn.execute("SELECT 1 FROM weight_tensors WHERE weights_artifact_id = ? LIMIT 1",
+                                (row["artifact_id"],)).fetchone():
+                    continue  # a concurrent process indexed it first
+                self._insert_weight_tensors(conn, row["artifact_id"], entries, utc_now())
+                insert_audit_event(conn, "weights.blobs_indexed", row["artifact_id"], {
+                    "weights_hash": row["content_hash"],
+                    "tensor_count": len(entries),
+                    "blob_ids": sorted({entry.blob_id for entry in entries}),
+                })
 
     # -- large analysis results -----------------------------------------------
 
@@ -454,20 +660,145 @@ class ArtifactStore:
         row = self._checkpoint_row(checkpoint_id)
         return self._verified_path(self._artifact_row(row["weights_artifact_id"]))
 
+    def _weight_entries(self, checkpoint_id: str, name: str | None = None) -> list[TensorEntry]:
+        """The blob manifest of a READY checkpoint's verified weights artifact, in name order.
+
+        With ``name``, only that tensor's entry (an empty list when it does not exist).
+        """
+        row = self._checkpoint_row(checkpoint_id)
+        artifact_id = row["weights_artifact_id"]
+        self._verified_path(self._artifact_row(artifact_id))
+        if not self.db.conn.execute(
+            "SELECT 1 FROM weight_tensors WHERE weights_artifact_id = ? LIMIT 1", (artifact_id,)
+        ).fetchone():
+            raise WSEError(
+                ErrorCode.ARTIFACT_CORRUPT,
+                f"weights of {checkpoint_id} have no blob manifest; reopen the workspace to finish migration 8",
+                retryable=True,
+            )
+        query = "SELECT name, blob_id, dtype, shape FROM weight_tensors WHERE weights_artifact_id = ?"
+        if name is None:
+            rows = self.db.conn.execute(query + " ORDER BY name", (artifact_id,)).fetchall()
+        else:
+            rows = self.db.conn.execute(query + " AND name = ?", (artifact_id, name)).fetchall()
+        return [TensorEntry(r["name"], r["blob_id"], r["dtype"], tuple(json.loads(r["shape"]))) for r in rows]
+
+    def tensor_blob_ids(self, checkpoint_id: str) -> dict[str, str]:
+        """Canonical tensor name to blob ID for a READY checkpoint."""
+        return {entry.name: entry.blob_id for entry in self._weight_entries(checkpoint_id)}
+
+    def blob_reference_counts(self) -> dict[str, int]:
+        """Every registered blob's reference count: the blob-manifest rows that use it."""
+        rows = self.db.conn.execute(
+            "SELECT b.blob_id, COUNT(w.blob_id) AS refs FROM blobs b "
+            "LEFT JOIN weight_tensors w ON w.blob_id = b.blob_id GROUP BY b.blob_id ORDER BY b.blob_id"
+        ).fetchall()
+        return {row["blob_id"]: row["refs"] for row in rows}
+
+    def _blob_failed(self, blob: str, reason: str) -> WSEError:
+        self._mark_corrupt_for_blob(blob, reason)
+        return WSEError(
+            ErrorCode.ARTIFACT_CORRUPT,
+            f"blob {blob}: {reason}; every checkpoint that uses it is now CORRUPT",
+            details={"blob_id": blob},
+        )
+
+    def _blob_path(self, blob: str) -> tuple[Path, int]:
+        row = self.db.conn.execute("SELECT relpath, size_bytes FROM blobs WHERE blob_id = ?", (blob,)).fetchone()
+        if row is None:  # pragma: no cover - prevented by foreign keys
+            raise self._blob_failed(blob, "blob has no metadata")
+        return self._artifact_path(row["relpath"]), row["size_bytes"]
+
+    def _verified_blob_path(self, blob: str) -> Path:
+        """Return a blob's path after checking that its SHA-256 equals its ID."""
+        path, size = self._blob_path(blob)
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            raise self._blob_failed(blob, "blob file is missing") from None
+        signature = (info.st_ino, info.st_size, info.st_mtime_ns)
+        if self._verified.get("blob:" + blob) == signature:
+            return path
+        if info.st_size != size or _file_sha256(path) != blob:
+            raise self._blob_failed(blob, "blob hash mismatch")
+        self._verified["blob:" + blob] = signature
+        return path
+
+    def _read_blob(self, blob: str) -> bytearray:
+        """Read a blob's bytes in one pass and check them against its ID."""
+        path, size = self._blob_path(blob)
+        try:
+            with open(path, "rb") as handle:
+                info = os.fstat(handle.fileno())
+                buffer = bytearray(info.st_size)
+                read = handle.readinto(buffer)
+        except FileNotFoundError:
+            raise self._blob_failed(blob, "blob file is missing") from None
+        signature = (info.st_ino, info.st_size, info.st_mtime_ns)
+        if self._verified.get("blob:" + blob) != signature:
+            if read != size or info.st_size != size or hashlib.sha256(buffer).hexdigest() != blob:
+                raise self._blob_failed(blob, "blob hash mismatch")
+            self._verified["blob:" + blob] = signature
+        return buffer
+
     def load_tensors(self, checkpoint_id: str) -> dict[str, torch.Tensor]:
+        """Load every tensor of a READY checkpoint from its blobs.
+
+        Each blob is hash-checked and loaded through ``torch.frombuffer`` on its
+        raw bytes in the stored dtype. Names that share a blob get separate
+        tensors.
+        """
         manifest = self.load_manifest(checkpoint_id)
-        tensors = load_file(str(self.weights_path(checkpoint_id)))
+        tensors: dict[str, torch.Tensor] = {}
+        buffers: dict[str, bytearray] = {}
+        for entry in self._weight_entries(checkpoint_id):
+            buffer = buffers.get(entry.blob_id)
+            if buffer is None:
+                buffer = buffers[entry.blob_id] = self._read_blob(entry.blob_id)
+            else:
+                buffer = bytearray(buffer)
+            tensors[entry.name] = tensor_from_buffer(buffer, dtype_from_name(entry.dtype), entry.shape)
         if weights_hash(tensors) != manifest.weights_hash:
             self._mark_corrupt([checkpoint_id], "weights content hash mismatch")
             raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"weights of {checkpoint_id} failed their content hash")
         return tensors
 
     def read_slice(self, checkpoint_id: str, tensor: str, slices: tuple[slice, ...]) -> torch.Tensor:
-        """Read one region of a stored tensor without loading the whole file."""
+        """Read one region of a stored tensor from its memory-mapped blob."""
+        entry = next(iter(self._weight_entries(checkpoint_id, tensor)), None)
+        if entry is None:
+            raise WSEError(
+                ErrorCode.NOT_FOUND,
+                f"tensor {tensor!r} does not exist in checkpoint {checkpoint_id}",
+                details={"tensor": tensor},
+            )
+        dtype = dtype_from_name(entry.dtype)
+        path = self._verified_blob_path(entry.blob_id)
+        bits = _BIT_DTYPES.get(torch.empty((), dtype=dtype).element_size())
+        if entry.size_bytes == 0 or bits is None:
+            whole = tensor_from_buffer(bytearray(path.read_bytes()), dtype, entry.shape)
+            return (whole[slices] if slices else whole).clone(memory_format=torch.contiguous_format)
+        # Map the blob's bit patterns with an integer dtype of the same width
+        # (NumPy has no BF16), copy the region, and view it as the stored dtype.
+        mapped = np.memmap(path, dtype=bits[0], mode="r").reshape(entry.shape)
+        region = np.array(mapped[slices] if slices else mapped, copy=True)
+        del mapped
+        return torch.from_numpy(region).view(dtype)
+
+    def export_safetensors(self, checkpoint_id: str, destination: Path | str) -> Path:
+        """Write a READY checkpoint's tensors under their canonical names to one safetensors file.
+
+        A checkpoint whose weights artifact is already a single safetensors file
+        is copied byte for byte; one stored as a blob index is materialized.
+        """
+        destination = Path(destination)
         path = self.weights_path(checkpoint_id)
-        with safe_open(str(path), framework="pt") as handle:
-            region = handle.get_slice(tensor)[slices] if slices else handle.get_tensor(tensor)
-        return region.clone(memory_format=torch.contiguous_format)
+        if path.suffix == ".safetensors":
+            shutil.copyfile(path, destination)
+        else:
+            tensors = self.load_tensors(checkpoint_id)
+            save_file({name: tensors[name] for name in sorted(tensors)}, str(destination))
+        return destination
 
     def list_ready(self) -> list[str]:
         rows = self.db.conn.execute(
@@ -496,6 +827,15 @@ class ArtifactStore:
                     marked.append(checkpoint_id)
                     insert_audit_event(conn, "checkpoint.corrupt", checkpoint_id, {"reason": reason})
         return marked
+
+    def _mark_corrupt_for_blob(self, blob: str, reason: str) -> list[str]:
+        rows = self.db.conn.execute(
+            "SELECT DISTINCT c.checkpoint_id FROM checkpoints c JOIN weight_tensors w "
+            "ON w.weights_artifact_id = c.weights_artifact_id WHERE w.blob_id = ? ORDER BY c.checkpoint_id",
+            (blob,),
+        ).fetchall()
+        self._verified.pop("blob:" + blob, None)
+        return self._mark_corrupt([row["checkpoint_id"] for row in rows], reason)
 
     def _mark_corrupt_for_artifact(self, artifact_id: str, reason: str) -> list[str]:
         rows = self.db.conn.execute(
@@ -530,6 +870,21 @@ class ArtifactStore:
                         continue
                     path.unlink(missing_ok=True)
                     report.removed_orphans.append(relpath)
+            # Blobs are reference counted: a file without a registered blob, or a
+            # registered blob that no blob manifest references, is removed.
+            # A blob row whose count is zero is deleted with its file at once; an
+            # unregistered file only after the grace period, because a commit
+            # may be between publishing it and registering it.
+            counts = self.blob_reference_counts()
+            unreferenced = {blob for blob, refs in counts.items() if refs == 0}
+            conn.executemany("DELETE FROM blobs WHERE blob_id = ?", [(blob,) for blob in sorted(unreferenced)])
+            for path in sorted((self.artifacts_dir / BLOBS_DIR).iterdir()):
+                if not path.is_file() or (path.name in counts and path.name not in unreferenced):
+                    continue
+                if path.name not in unreferenced and path.stat().st_mtime > cutoff:
+                    continue
+                path.unlink(missing_ok=True)
+                report.removed_blobs.append(path.name)
         rows = self.db.conn.execute(
             "SELECT DISTINCT a.* FROM artifacts a JOIN checkpoints c "
             "ON a.artifact_id IN (c.weights_artifact_id, c.manifest_artifact_id) WHERE c.state = 'READY'"
@@ -544,6 +899,24 @@ class ArtifactStore:
             else:
                 continue
             report.corrupted_checkpoints.extend(self._mark_corrupt_for_artifact(artifact["artifact_id"], reason))
+        blobs = self.db.conn.execute(
+            "SELECT DISTINCT b.blob_id, b.relpath, b.size_bytes FROM blobs b "
+            "JOIN weight_tensors w ON w.blob_id = b.blob_id "
+            "JOIN checkpoints c ON c.weights_artifact_id = w.weights_artifact_id "
+            "WHERE c.state = 'READY' ORDER BY b.blob_id"
+        ).fetchall()
+        for blob in blobs:
+            self._verified.pop("blob:" + blob["blob_id"], None)
+            path = self._artifact_path(blob["relpath"])
+            if not path.is_file():
+                reason = "blob file is missing"
+            elif path.stat().st_size != blob["size_bytes"] or _file_sha256(path) != blob["blob_id"]:
+                reason = "blob hash mismatch"
+            else:
+                continue
+            for checkpoint_id in self._mark_corrupt_for_blob(blob["blob_id"], reason):
+                if checkpoint_id not in report.corrupted_checkpoints:
+                    report.corrupted_checkpoints.append(checkpoint_id)
         patches = self.db.conn.execute(
             "SELECT DISTINCT relpath, file_sha256, size_bytes FROM patches WHERE state = 'READY'"
         ).fetchall()

@@ -335,6 +335,39 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             """,
         ],
     ),
+    (
+        8,
+        [
+            # Per-tensor content-addressed blobs. blob_id is the SHA-256 hex of
+            # the tensor's raw little-endian row-major bytes in its stored dtype,
+            # which is also the blob file's SHA-256. Shape and dtype live in
+            # weight_tensors, so tensors with identical bytes share one blob.
+            """
+            CREATE TABLE blobs (
+                blob_id     TEXT PRIMARY KEY,
+                relpath     TEXT NOT NULL UNIQUE,
+                size_bytes  INTEGER NOT NULL CHECK (size_bytes >= 0),
+                created_at  TEXT NOT NULL
+            )
+            """,
+            # The blob manifest of each weights artifact: canonical tensor name to
+            # blob, dtype, and shape (canonical JSON list). A blob's reference count
+            # is its number of rows here. Existing M1 weights artifacts are indexed
+            # in place by ArtifactStore when it opens (the data step of this
+            # migration); their artifacts, manifests, and checkpoints are unchanged.
+            """
+            CREATE TABLE weight_tensors (
+                weights_artifact_id  TEXT NOT NULL REFERENCES artifacts (artifact_id),
+                name                 TEXT NOT NULL,
+                blob_id              TEXT NOT NULL REFERENCES blobs (blob_id),
+                dtype                TEXT NOT NULL,
+                shape                TEXT NOT NULL,
+                PRIMARY KEY (weights_artifact_id, name)
+            )
+            """,
+            "CREATE INDEX weight_tensors_blob ON weight_tensors (blob_id)",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]
