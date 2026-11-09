@@ -849,8 +849,8 @@ class Engine:
         *,
         base_checkpoint_id: str,
         format: str = "lm-understand-v1",
-        repo: str | None = None,
-        revision: str | None = None,
+        repo: str,
+        revision: str,
     ) -> ImportedPatch:
         """Import a published edit as an exact patch and commit its candidate (operator only; M2 plan Section 3.4).
 
@@ -858,8 +858,8 @@ class Engine:
         rebuilt tensor must equal its published hash; otherwise nothing is
         stored. The binary patch file, the candidate checkpoint (whose parent
         is the base), and the record are committed together. ``repo`` and
-        ``revision`` label the source the operator downloaded; the record also
-        names the run and the SHA-256 of every file read. Importing the same
+        ``revision`` (both required) name the source the operator downloaded;
+        the record also names the run and the SHA-256 of every file read. Importing the same
         files onto the same base again returns the existing record.
         """
         from wse.database import insert_audit_event, utc_now
@@ -871,6 +871,10 @@ class Engine:
         self._require_operator("importing a patch")
         if format not in FORMATS:
             raise WSEError(ErrorCode.INVALID_ARGUMENT, f"unknown patch format {format!r}; supported: {list(FORMATS)}")
+        for label, value in (("repo", repo), ("revision", revision)):
+            if not isinstance(value, str) or not value.strip():
+                raise WSEError(ErrorCode.INVALID_ARGUMENT, f"{label} must name the edit's source repository and "
+                               "revision, for the patch's provenance")
         edit = read_lm_understand(edit_dir)
         source = ExternalPatchSource(format=format, repository=repo, revision=revision, run=edit.run,
                                      files=edit.files)

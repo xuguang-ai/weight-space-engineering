@@ -18,9 +18,11 @@ record the patch and its candidate (``Engine.import_patch``). The published
 hash decides exactness: if the low-rank path rounded differently from the
 article, the edited hash would not match and the patch would be refused.
 
-The edit files are untrusted input: ``edit.npz`` is loaded with
-``allow_pickle=False``, and every array is checked for its expected name,
-dtype, shape, and index range before use.
+The edit files are untrusted input: every member of ``edit.npz`` is checked
+for its expected name, then for its dtype and shape from its ``.npy`` header,
+before any array data is decompressed (so a small compressed archive cannot
+force a large allocation); arrays load with ``allow_pickle=False``, and
+indices are range-checked before use.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ import io
 import json
 import math
 import re
+import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -118,31 +121,104 @@ def _entry(index: int, raw: Any) -> dict[str, Any]:
     return raw
 
 
-def _check_arrays(entries: list[dict[str, Any]], arrays: Mapping[str, np.ndarray]) -> None:
-    expected: set[str] = set()
-    for i, entry in enumerate(entries):
-        name, shape = entry["name"], tuple(entry["shape"])
-        keys = [f"t{i}_idx", f"t{i}_val"] + ([f"t{i}_a", f"t{i}_b"] if entry["form"] == "lowrank" else [])
-        missing = [key for key in keys if key not in arrays]
-        if missing:
-            raise _invalid(f"tensor {name!r}: {ARRAYS_FILE} has no {missing}", tensor=name)
-        expected.update(keys)
-        idx, val = arrays[f"t{i}_idx"], arrays[f"t{i}_val"]
-        if idx.ndim != 1 or idx.dtype.kind not in "iu" or val.ndim != 1 or val.dtype != np.uint16 \
-                or idx.shape != val.shape:
-            raise _invalid(f"tensor {name!r}: t{i}_idx must be integer and t{i}_val uint16 bit patterns, "
-                           "one-dimensional and of one length", tensor=name)
-        if idx.size and (int(idx.min()) < 0 or int(idx.max()) >= math.prod(shape)):
-            raise _invalid(f"tensor {name!r}: t{i}_idx holds indices outside the tensor", tensor=name)
-        if entry["form"] == "lowrank":
-            a, b = arrays[f"t{i}_a"], arrays[f"t{i}_b"]
-            if a.dtype.kind != "f" or b.dtype.kind != "f" or a.ndim != 2 or b.ndim != 2 or a.shape[1] < 1 \
-                    or a.shape != (shape[0], a.shape[1]) or b.shape != (a.shape[1], shape[1]):
-                raise _invalid(f"tensor {name!r}: t{i}_a must be (rows, rank) and t{i}_b (rank, columns), floating "
-                               f"point, for shape {list(shape)}", tensor=name)
-    unexpected = sorted(set(arrays) - expected)
+def _expected_keys(i: int, entry: Mapping[str, Any]) -> list[str]:
+    return [f"t{i}_idx", f"t{i}_val"] + ([f"t{i}_a", f"t{i}_b"] if entry["form"] == "lowrank" else [])
+
+
+def _read_header(archive: zipfile.ZipFile, member: str) -> tuple[tuple[int, ...], np.dtype]:
+    """The shape and dtype of an archive member, read from its .npy header without decompressing the data."""
+    try:
+        with archive.open(member) as f:
+            version = np.lib.format.read_magic(f)
+            if version == (1, 0):
+                shape, _, dtype = np.lib.format.read_array_header_1_0(f)
+            elif version == (2, 0):
+                shape, _, dtype = np.lib.format.read_array_header_2_0(f)
+            else:
+                raise ValueError(f"unsupported .npy format version {version}")
+    except (ValueError, OSError, EOFError, zipfile.BadZipFile) as exc:
+        raise _invalid(f"{ARRAYS_FILE} member {member!r} is not a plain .npy array: {exc}") from exc
+    if dtype.hasobject or dtype.fields is not None:
+        raise _invalid(f"{ARRAYS_FILE} member {member!r} holds Python objects or records, which are not accepted")
+    return tuple(int(n) for n in shape), dtype
+
+
+def _read_member(archive: zipfile.ZipFile, member: str) -> np.ndarray:
+    """Decompress one member whose header has already been checked."""
+    try:
+        with archive.open(member) as f:
+            return np.asarray(np.lib.format.read_array(f, allow_pickle=False))
+    except (ValueError, OSError, EOFError, zipfile.BadZipFile) as exc:
+        raise _invalid(f"{ARRAYS_FILE} member {member!r} cannot be read: {exc}") from exc
+
+
+def _check_headers(entries: list[dict[str, Any]], headers: Mapping[str, tuple[tuple[int, ...], np.dtype]]) -> None:
+    """Names, dtypes, and shapes of every array, from the headers alone.
+
+    Every size is bounded by the manifest's tensor shapes (indices by the
+    tensor's element count, low-rank factors by the smaller side), so the
+    arrays loaded afterwards cannot be larger than a few copies of the tensors
+    the edit names.
+    """
+    expected = {key for i, entry in enumerate(entries) for key in _expected_keys(i, entry)}
+    unexpected = sorted(set(headers) - expected)
     if unexpected:
         raise _invalid(f"{ARRAYS_FILE} holds arrays no manifest tensor uses: {unexpected[:20]}")
+    for i, entry in enumerate(entries):
+        name, shape = entry["name"], tuple(entry["shape"])
+        missing = [key for key in _expected_keys(i, entry) if key not in headers]
+        if missing:
+            raise _invalid(f"tensor {name!r}: {ARRAYS_FILE} has no {missing}", tensor=name)
+        (idx_shape, idx_dtype), (val_shape, val_dtype) = headers[f"t{i}_idx"], headers[f"t{i}_val"]
+        if len(idx_shape) != 1 or idx_dtype.kind not in "iu" or val_shape != idx_shape or val_dtype != np.uint16 \
+                or idx_shape[0] > math.prod(shape):
+            raise _invalid(f"tensor {name!r}: t{i}_idx must be integer and t{i}_val uint16 bit patterns, "
+                           f"one-dimensional, of one length, and at most {math.prod(shape)} long", tensor=name)
+        if entry["form"] == "lowrank":
+            (a_shape, a_dtype), (b_shape, b_dtype) = headers[f"t{i}_a"], headers[f"t{i}_b"]
+            rank = a_shape[1] if len(a_shape) == 2 else 0
+            if a_dtype.kind != "f" or b_dtype.kind != "f" or len(a_shape) != 2 or not 1 <= rank <= min(shape) \
+                    or a_shape != (shape[0], rank) or b_shape != (rank, shape[1]):
+                raise _invalid(f"tensor {name!r}: t{i}_a must be (rows, rank) and t{i}_b (rank, columns), floating "
+                               f"point, with 1 <= rank <= {min(shape)}, for shape {list(shape)}", tensor=name)
+
+
+def _check_values(entries: list[dict[str, Any]], arrays: Mapping[str, np.ndarray]) -> None:
+    for i, entry in enumerate(entries):
+        idx = arrays[f"t{i}_idx"]
+        if idx.size and (int(idx.min()) < 0 or int(idx.max()) >= math.prod(entry["shape"])):
+            raise _invalid(f"tensor {entry['name']!r}: t{i}_idx holds indices outside the tensor",
+                           tensor=entry["name"])
+
+
+def _load_arrays(arrays_bytes: bytes, entries: list[dict[str, Any]]) -> dict[str, np.ndarray]:
+    """Check every member's name, dtype, and shape from its header, then decompress the members."""
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(arrays_bytes))
+    except (zipfile.BadZipFile, ValueError, OSError) as exc:
+        raise _invalid(f"{ARRAYS_FILE} is not a NumPy archive: {exc}") from exc
+    with archive:
+        members = archive.namelist()
+        if len(set(members)) != len(members):
+            raise _invalid(f"{ARRAYS_FILE} names a member more than once")
+        not_npy = [m for m in members if not m.endswith(".npy")]
+        if not_npy:
+            raise _invalid(f"{ARRAYS_FILE} holds members that are not .npy arrays: {sorted(not_npy)[:20]}")
+        keys = {m.removesuffix(".npy"): m for m in members}
+        expected = {key for i, entry in enumerate(entries) for key in _expected_keys(i, entry)}
+        unexpected = sorted(set(keys) - expected)
+        if unexpected:  # refused by name before any header is read
+            raise _invalid(f"{ARRAYS_FILE} holds arrays no manifest tensor uses: {unexpected[:20]}")
+        headers = {key: _read_header(archive, member) for key, member in keys.items()}
+        _check_headers(entries, headers)
+        arrays = {}
+        for key, member in keys.items():
+            array = _read_member(archive, member)
+            if array.shape != headers[key][0] or array.dtype != headers[key][1]:
+                raise _invalid(f"{ARRAYS_FILE} member {member!r} does not match its header")
+            arrays[key] = array
+    _check_values(entries, arrays)
+    return arrays
 
 
 def read_lm_understand(edit_dir: str | Path) -> LMUnderstandEdit:
@@ -163,12 +239,7 @@ def read_lm_understand(edit_dir: str | Path) -> LMUnderstandEdit:
     names = [entry["name"] for entry in entries]
     if len(set(names)) != len(names):
         raise _invalid(f"{MANIFEST_FILE} lists a tensor more than once")
-    try:
-        with np.load(io.BytesIO(arrays_bytes), allow_pickle=False) as archive:
-            arrays = {key: np.asarray(archive[key]) for key in archive.files}
-    except (ValueError, OSError, EOFError) as exc:  # object arrays need pickle, which stays disabled
-        raise _invalid(f"{ARRAYS_FILE} is not a NumPy archive of plain arrays: {exc}") from exc
-    _check_arrays(entries, arrays)
+    arrays = _load_arrays(arrays_bytes, entries)
     run = directory.parent.name if directory.name == "edit" else directory.name
     files = {MANIFEST_FILE: hashlib.sha256(manifest_bytes).hexdigest(),
              ARRAYS_FILE: hashlib.sha256(arrays_bytes).hexdigest()}

@@ -321,3 +321,27 @@ def test_m1_patches_keep_inline_values(signed_sum):
     step = result.patch.steps[0]
     assert step.block is None and len(step.values) == 4 and result.blocks == {}
     assert "block" not in step.model_dump(mode="json")
+
+
+def test_only_inline_values_count_toward_the_patch_element_limit(bf16_model):
+    """Operator results stored as blocks are not limited; inline ``set_slice`` values are (Section 3.3)."""
+    from wse.patches import materialize_patch
+    from wse.policy import default_operation_policy
+
+    policy = default_operation_policy().with_limits(max_patch_elements=6)
+    result = materialize_patch(bf16_model, [
+        {"op": "scale_slice", "tensor": DOWN, "selection": _sel((0, 16), (0, 32)), "factor": 1.5},
+    ], policy=policy)
+    assert result.patch.steps[0].block is not None and result.patch.steps[0].changed_elements > 6
+    inline = [[0.5] * 4, [0.25] * 4]
+    error = _expect(ErrorCode.INVALID_PATCH, materialize_patch, bf16_model, [
+        {"op": "set_slice", "tensor": DOWN, "selection": _sel((0, 2), (0, 4)), "values": inline},
+    ], policy=policy)
+    assert error.details["max_patch_elements"] == 6 and "inline" in error.message
+    # Inline values add up across steps, and operator results add nothing.
+    error = _expect(ErrorCode.INVALID_PATCH, materialize_patch, bf16_model, [
+        {"op": "set_slice", "tensor": DOWN, "selection": _sel((0, 1), (0, 4)), "values": [[0.5] * 4]},
+        {"op": "scale_slice", "tensor": DOWN, "selection": _sel((0, 16), (0, 32)), "factor": 1.5},
+        {"op": "set_slice", "tensor": DOWN, "selection": _sel((1, 2), (0, 3)), "values": [[0.5] * 3]},
+    ], policy=policy)
+    assert error.details["operation_index"] == 2

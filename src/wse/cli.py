@@ -57,8 +57,9 @@ def _parser() -> argparse.ArgumentParser:
     import_patch.add_argument("edit_dir", help="the edit directory (manifest.json and edit.npz)")
     import_patch.add_argument("--format", required=True, choices=["lm-understand-v1"], help="the edit format")
     import_patch.add_argument("--base", required=True, help="the checkpoint ID of the base model")
-    import_patch.add_argument("--repo", default=None, help="the source repository of the edit, for provenance")
-    import_patch.add_argument("--revision", default=None, help="the source revision of the edit, for provenance")
+    import_patch.add_argument("--repo", required=True,
+                              help="the source repository of the edit, for provenance (e.g. RikiyaT/lm_understand-logs)")
+    import_patch.add_argument("--revision", required=True, help="the source revision (commit SHA) of the edit")
     grant = commands.add_parser("grant-run", help="issue a run grant (one experiment) and print it")
     grant.add_argument("task_id")
     grant.add_argument("policy_id")

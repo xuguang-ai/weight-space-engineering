@@ -27,6 +27,8 @@ from wse.tensors import blob_id
 
 REPO = "example-org/tiny-model"
 REVISION = "0123456789abcdef0123456789abcdef01234567"
+# The provenance every import must name (Section 3.4).
+EDIT_SOURCE = {"repo": "example-org/edits", "revision": "abc123"}
 SPARSE = "model.layers.0.mlp.down_proj.weight"  # [16, 32]
 LOWRANK = "model.layers.1.self_attn.o_proj.weight"  # [16, 16]
 
@@ -167,15 +169,22 @@ def test_wse_import_patch_cli(base, workspace, tmp_path, capsys):
     checkpoint_id, handle = base
     edit_dir = tmp_path / "edit"
     expected = _write_edit(edit_dir, handle)
-    code = main(["--workspace", str(workspace), "import-patch", "--format", "lm-understand-v1", str(edit_dir),
-                 "--base", checkpoint_id])
+    command = ["--workspace", str(workspace), "import-patch", "--format", "lm-understand-v1", str(edit_dir),
+               "--base", checkpoint_id]
+    for missing in (["--repo", "example-org/edits"], ["--revision", "abc123"]):  # provenance is required
+        with pytest.raises(SystemExit) as excinfo:
+            main(command + missing)
+        assert excinfo.value.code == 2
+    capsys.readouterr()
+    code = main(command + ["--repo", "example-org/edits", "--revision", "abc123"])
     assert code == 0
     printed = json.loads(capsys.readouterr().out)
     assert printed["base_checkpoint_id"] == checkpoint_id
     assert [t["edited_sha256"] for t in printed["tensors"]] == [_sha(expected[SPARSE]), _sha(expected[LOWRANK])]
+    assert printed["source"]["repository"] == "example-org/edits" and printed["source"]["revision"] == "abc123"
     with pytest.raises(SystemExit) as excinfo:  # an unknown format is a usage error
         main(["--workspace", str(workspace), "import-patch", "--format", "other-v1", str(edit_dir),
-              "--base", checkpoint_id])
+              "--base", checkpoint_id, "--repo", "example-org/edits", "--revision", "abc123"])
     assert excinfo.value.code == 2
 
 
@@ -191,7 +200,7 @@ def test_a_wrong_base_hash_is_refused_before_any_write(base, workspace, tmp_path
     with Engine(workspace) as engine:
         before = _state(workspace)
         error = _expect(ErrorCode.VERSION_CONFLICT, engine.import_patch, edit_dir,
-                        base_checkpoint_id=checkpoint_id)
+                        base_checkpoint_id=checkpoint_id, **EDIT_SOURCE)
         assert LOWRANK in error.message and "base" in error.message
         assert _state(workspace) == before
     # Every base hash is checked before any tensor is rebuilt.
@@ -204,7 +213,7 @@ def test_a_wrong_edited_hash_leaves_no_patch_and_no_candidate(base, workspace, t
     _write_edit(edit_dir, handle, break_edited=LOWRANK)
     with Engine(workspace) as engine:
         before = _state(workspace)
-        error = _expect(ErrorCode.INVALID_PATCH, engine.import_patch, edit_dir, base_checkpoint_id=checkpoint_id)
+        error = _expect(ErrorCode.INVALID_PATCH, engine.import_patch, edit_dir, base_checkpoint_id=checkpoint_id, **EDIT_SOURCE)
         assert LOWRANK in error.message and "edited" in error.message
         assert _state(workspace) == before
 
@@ -219,7 +228,7 @@ def test_malformed_edits_are_refused(base, workspace, tmp_path):
         for label, kwargs in cases.items():
             edit_dir = tmp_path / label
             _write_edit(edit_dir, handle, **kwargs)
-            _expect(ErrorCode.INVALID_PATCH, engine.import_patch, edit_dir, base_checkpoint_id=checkpoint_id)
+            _expect(ErrorCode.INVALID_PATCH, engine.import_patch, edit_dir, base_checkpoint_id=checkpoint_id, **EDIT_SOURCE)
         # An unknown tensor, an index out of range, and a missing array.
         edit_dir = tmp_path / "edit"
         _write_edit(edit_dir, handle)
@@ -230,16 +239,16 @@ def test_malformed_edits_are_refused(base, workspace, tmp_path):
             broken = json.loads(json.dumps(manifest))
             change(broken)
             (edit_dir / "manifest.json").write_text(json.dumps(broken))
-            _expect(code, engine.import_patch, edit_dir, base_checkpoint_id=checkpoint_id)
+            _expect(code, engine.import_patch, edit_dir, base_checkpoint_id=checkpoint_id, **EDIT_SOURCE)
         (edit_dir / "manifest.json").write_text(json.dumps(manifest))
         arrays = dict(np.load(edit_dir / "edit.npz"))
         arrays["t0_idx"] = arrays["t0_idx"].copy()
         arrays["t0_idx"][0] = 16 * 32
         np.savez(edit_dir / "edit.npz", **arrays)
-        _expect(ErrorCode.INVALID_PATCH, engine.import_patch, edit_dir, base_checkpoint_id=checkpoint_id)
+        _expect(ErrorCode.INVALID_PATCH, engine.import_patch, edit_dir, base_checkpoint_id=checkpoint_id, **EDIT_SOURCE)
         del arrays["t1_b"]
         np.savez(edit_dir / "edit.npz", **arrays)
-        _expect(ErrorCode.INVALID_PATCH, engine.import_patch, edit_dir, base_checkpoint_id=checkpoint_id)
+        _expect(ErrorCode.INVALID_PATCH, engine.import_patch, edit_dir, base_checkpoint_id=checkpoint_id, **EDIT_SOURCE)
         assert _state(workspace) == before
 
 
@@ -252,4 +261,103 @@ def test_a_run_bound_engine_cannot_import_patches(base, workspace, tmp_path):
     with Engine(workspace) as operator:
         grant = operator.grant_run("import_patch_v1", SMALL_MODEL_POLICY_ID, checkpoint_id)
     with Engine(workspace, run_id=grant.run_id) as bound:
-        _expect(ErrorCode.POLICY_DENIED, bound.import_patch, edit_dir, base_checkpoint_id=checkpoint_id)
+        _expect(ErrorCode.POLICY_DENIED, bound.import_patch, edit_dir, base_checkpoint_id=checkpoint_id, **EDIT_SOURCE)
+
+
+def test_import_requires_the_source_repository_and_revision(base, workspace, tmp_path):
+    checkpoint_id, handle = base
+    edit_dir = tmp_path / "edit"
+    _write_edit(edit_dir, handle)
+    with Engine(workspace) as engine:
+        before = _state(workspace)
+        for source in ({"repo": "", "revision": "abc123"}, {"repo": "example-org/edits", "revision": " "}):
+            _expect(ErrorCode.INVALID_ARGUMENT, engine.import_patch, edit_dir, base_checkpoint_id=checkpoint_id,
+                    **source)
+        with pytest.raises(TypeError):
+            engine.import_patch(edit_dir, base_checkpoint_id=checkpoint_id)
+        assert _state(workspace) == before
+
+
+def test_a_changed_entries_mismatch_is_refused(base, workspace, tmp_path):
+    checkpoint_id, handle = base
+    edit_dir = tmp_path / "edit"
+    _write_edit(edit_dir, handle)
+    manifest = json.loads((edit_dir / "manifest.json").read_text())
+    manifest["tensors"][1]["changed_entries"] += 1
+    (edit_dir / "manifest.json").write_text(json.dumps(manifest))
+    with Engine(workspace) as engine:
+        before = _state(workspace)
+        error = _expect(ErrorCode.INVALID_PATCH, engine.import_patch, edit_dir, base_checkpoint_id=checkpoint_id,
+                        **EDIT_SOURCE)
+        assert LOWRANK in error.message and "changes" in error.message
+        assert _state(workspace) == before
+
+
+def test_archive_members_are_checked_from_their_headers_before_decompression(base, workspace, tmp_path,
+                                                                              monkeypatch):
+    """A small compressed archive cannot force a large allocation before it is refused."""
+    import wse.external_patches as external
+
+    checkpoint_id, handle = base
+    loaded = []
+    real = external._read_member
+    monkeypatch.setattr(external, "_read_member", lambda archive, name: loaded.append(name) or real(archive, name))
+
+    def refused(edit_dir):
+        loaded.clear()
+        with Engine(workspace) as engine:
+            _expect(ErrorCode.INVALID_PATCH, engine.import_patch, edit_dir, base_checkpoint_id=checkpoint_id,
+                    **EDIT_SOURCE)
+        assert loaded == []
+
+    # An unused member: 256 MiB of zeros compresses to a few hundred KiB.
+    edit_dir = tmp_path / "bomb"
+    _write_edit(edit_dir, handle)
+    arrays = dict(np.load(edit_dir / "edit.npz"))
+    np.savez_compressed(edit_dir / "edit.npz", zz=np.zeros(256 * 1024 * 1024, dtype=np.uint8), **arrays)
+    assert (edit_dir / "edit.npz").stat().st_size < 2 * 1024 * 1024
+    refused(edit_dir)
+    # A used member whose header claims more entries than the tensor has.
+    big = dict(arrays, t0_idx=np.zeros(16 * 32 + 1, dtype=np.int32), t0_val=np.zeros(16 * 32 + 1, dtype=np.uint16))
+    np.savez_compressed(edit_dir / "edit.npz", **big)
+    refused(edit_dir)
+    # Low-rank factors whose rank exceeds the tensor's smaller side.
+    wide = dict(arrays, t1_a=np.zeros((16, 17)), t1_b=np.zeros((17, 16)))
+    np.savez_compressed(edit_dir / "edit.npz", **wide)
+    refused(edit_dir)
+    # A member that is not a .npy array.
+    import zipfile
+    np.savez(edit_dir / "edit.npz", **arrays)
+    with zipfile.ZipFile(edit_dir / "edit.npz", "a") as archive:
+        archive.writestr("notes.txt", b"hello")
+    refused(edit_dir)
+    # The well-formed archive still loads every member once.
+    np.savez_compressed(edit_dir / "edit.npz", **arrays)
+    with Engine(workspace) as engine:
+        engine.import_patch(edit_dir, base_checkpoint_id=checkpoint_id, **EDIT_SOURCE)
+    assert sorted(loaded) == sorted(f"{key}.npy" for key in arrays)
+
+
+def test_recovery_reports_a_missing_or_altered_imported_patch_file(base, workspace, tmp_path):
+    checkpoint_id, handle = base
+    edit_dir = tmp_path / "edit"
+    _write_edit(edit_dir, handle)
+    with Engine(workspace) as engine:
+        record = engine.import_patch(edit_dir, base_checkpoint_id=checkpoint_id, **EDIT_SOURCE)
+    with sqlite3.connect(workspace / "metadata.sqlite") as conn:
+        (relpath,) = conn.execute("SELECT relpath FROM imported_patches").fetchone()
+    path = workspace / "artifacts" / relpath
+    data = path.read_bytes()
+    path.chmod(0o644)  # published artifacts are read-only
+    path.write_bytes(data[:-1] + bytes([data[-1] ^ 1]))
+    with Engine(workspace) as engine:
+        assert engine.last_recovery.corrupted_patches == [record.patch_id]
+        _expect(ErrorCode.ARTIFACT_CORRUPT, engine.read_imported_patch, record.patch_id)
+        engine.open_checkpoint(record.checkpoint_id)  # the candidate's blobs are intact
+    path.unlink()
+    with Engine(workspace) as engine:
+        assert engine.last_recovery.corrupted_patches == [record.patch_id]
+    path.write_bytes(data)
+    with Engine(workspace) as engine:
+        assert engine.last_recovery.corrupted_patches == []
+        engine.read_imported_patch(record.patch_id)

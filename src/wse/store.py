@@ -952,4 +952,16 @@ class ArtifactStore:
             else:
                 continue
             report.corrupted_patches.extend(self._mark_patches_corrupt(patch["relpath"], reason))
+        # Imported patch files are verified too. Their table has no state column, so a missing or altered
+        # file is reported here and refused (ARTIFACT_CORRUPT) whenever it is read; the candidate checkpoint
+        # stays protected by its own blob verification.
+        imported = self.db.conn.execute(
+            "SELECT patch_id, relpath, file_sha256, size_bytes FROM imported_patches ORDER BY patch_id"
+        ).fetchall()
+        for patch in imported:
+            path = self._artifact_path(patch["relpath"])
+            if path.is_file() and path.stat().st_size == patch["size_bytes"] \
+                    and _file_sha256(path) == patch["file_sha256"]:
+                continue
+            report.corrupted_patches.append(patch["patch_id"])
         return report
