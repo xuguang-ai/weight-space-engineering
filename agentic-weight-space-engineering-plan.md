@@ -1,6 +1,6 @@
 # Weight-Space Engineering Framework — Initial Implementation Plan
 
-> **For agentic workers:** Use the `subagent-driven-development` skill during implementation, delivering and reviewing one task at a time. Track execution with the checkboxes below. This document is a construction plan; no service has been created and no model experiments have been run.
+> **For agentic workers:** Use the `subagent-driven-development` skill during implementation, delivering and reviewing one task at a time. Track execution with the checkboxes below. M1 (Tasks 1–7) is complete, as the status paragraph below records.
 
 **Goal:** Establish a reusable foundation for weight-space engineering, allowing humans, algorithms, and AI agents to inspect, transform, and evaluate model weights through shared contracts. Deliver the first complete workflow on a small model through Python, CLI, and MCP interfaces.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11+, official MCP Python SDK 2.3.0, PyTorch, NumPy, Pydantic, safetensors, SQLite, and pytest. The M1 reference agent uses OpenAI Agents SDK for Python as an optional dependency; Claude Agent SDK follows in M2. Start with local stdio, then add remote GPU Workers and Streamable HTTP.
 
-**Date and status:** Created 2026-11-03; direction and agent selection revised 2026-11-04, followed the same day by corrections to tool naming, response limits, task ordering, trial isolation, and interval reporting, and by decisions on the final-evaluation control, the Task 6 MCP host, and adapter aliases; after Tasks 4–6, previews became a metered quantity and run-facing views stopped exposing unmetered weight access. The user selected an end-to-end loop on small models as the first phase, a general weight-engineering framework as the long-term objective, and OpenAI Agents SDK for Python as the first reference agent, followed by Claude Agent SDK. Read the [framework vision](./weight-space-engineering-vision.md) alongside this plan and the [article summary](./weight-space-programming-summary.md). Target-model hardware remains unspecified, so M1 uses CPU execution. The concrete agent model, credentials, and agent SDK versions remain implementation configuration. Recheck compatibility and lock dependencies during implementation. Development uses uv and a local Git repository with no remote.
+**Date and status:** Created 2026-11-03; direction and agent selection revised 2026-11-04, followed the same day by corrections to tool naming, response limits, task ordering, trial isolation, and interval reporting, and by decisions on the final-evaluation control, the Task 6 MCP host, and adapter aliases; after Tasks 4–6, previews became a metered quantity and run-facing views stopped exposing unmetered weight access. The user selected an end-to-end loop on small models as the first phase, a general weight-engineering framework as the long-term objective, and OpenAI Agents SDK for Python as the first reference agent, followed by Claude Agent SDK. Read the [framework vision](./weight-space-engineering-vision.md) alongside this plan and the [article summary](./weight-space-programming-summary.md). Target-model hardware remains unspecified, so M1 uses CPU execution. The concrete agent model, credentials, and agent SDK versions remain implementation configuration. Recheck compatibility and lock dependencies during implementation. Development uses uv and a local Git repository with no remote. M1 closed on 2026-11-09. Tasks 1–7 are implemented and checked off below, and the four advancing conditions in Section 10 hold. The [M1 agent-trial report](./docs/m1-agent-trials.md) covers the acceptance set, in which all 5 trials met the target. The open items listed in that report carry over to the M2 plan.
 
 ## Global Constraints
 
@@ -140,7 +140,7 @@ The MCP interface below is one front end to the Python library. The SDK exposes 
 
 ### 4.1 Tool Set
 
-The following tool names are planned and have not yet been registered. Tool names use only letters, digits, `_`, and `-`, with at most 64 characters: OpenAI Agents SDK forwards MCP tool names verbatim as model function names, and the Chat Completions function-name rule excludes `.`. Every tool within an experiment checks object ownership. Every mutation tool requires an `idempotency_key`: the same key and input return the same result without creating another version or charging the budget again; the same key with different input returns a conflict.
+The M1 server registers the following tools. Tool names use only letters, digits, `_`, and `-`, with at most 64 characters: OpenAI Agents SDK forwards MCP tool names verbatim as model function names, and the Chat Completions function-name rule excludes `.`. Every tool within an experiment checks object ownership. Every mutation tool requires an `idempotency_key`: the same key and input return the same result without creating another version or charging the budget again; the same key with different input returns a conflict.
 
 | Tool | Main inputs | Output and constraints |
 | --- | --- | --- |
@@ -316,7 +316,7 @@ For classification, report accuracy and paired differences with cluster-bootstra
 
 ## 8. Planned Files and Modules
 
-The following files are **planned**, not implemented:
+Every file below exists as of M1. The repository also contains supporting modules and tests that this list omits.
 
 ```text
 pyproject.toml                  # Dependencies, wse CLI, pytest configuration
@@ -372,7 +372,7 @@ Runtime outputs go to the configured `workspace/artifacts/`, `workspace/metadata
 
 ## 9. Implementation Tasks and Dependencies
 
-Tasks run in order 1→2→3→4→5→6→7. Tasks 1–3 establish the core contracts. Task 5 depends on Task 4: freezing checks Task 4's jobs and reservations, parity with managed evaluation runs through Task 4's worker, and both tasks extend `schemas.py`. Task 6 integrates the system; Task 7 completes agent trials and delivery. Commands below are future implementation acceptance checks and have not been run for this planning deliverable.
+Tasks run in order 1→2→3→4→5→6→7. Tasks 1–3 establish the core contracts. Task 5 depends on Task 4: freezing checks Task 4's jobs and reservations, parity with managed evaluation runs through Task 4's worker, and both tasks extend `schemas.py`. Task 6 integrates the system; Task 7 completes agent trials and delivery. The commands below are each task's acceptance checks; all of them passed when M1 closed.
 
 ### Task 1: Model Registration and Immutable Storage
 
@@ -380,12 +380,12 @@ Tasks run in order 1→2→3→4→5→6→7. Tasks 1–3 establish the core con
 
 **Interfaces:** Core `load_model(source, adapter, config) -> ModelHandle`; managed `import_model(manifest, tensors) -> ModelManifest`, `load_manifest(checkpoint_id) -> ModelManifest`, and `read_tensor(checkpoint_id, tensor, selection) -> Tensor`. `ModelAdapter` provides `capabilities()`, `validate(manifest, tensors)`, and `forward(tensors, inputs) -> logits`; in managed experiments, only the worker may invoke forward. The registry provides `register(kind, extension_id, version, implementation)` and `resolve(kind, extension_id, version)` for explicit operator-controlled setup.
 
-- [ ] Lock dependencies and the CLI entry point; create the shared schemas and SQLite migration 1.
-- [ ] Define core handles/results, `ObjectiveSpec`, and the extension registry; verify an in-memory model load requires neither SQLite nor MCP and rejects unknown adapter versions.
-- [ ] First write fixture roundtrip tests: imported parameters are bitwise identical; invalid architectures/shapes, path escapes, and nonfinite values are rejected.
-- [ ] Implement content-addressed safetensors + manifest storage, READY visibility, and the minimal MLP adapter.
-- [ ] Verify that `uv run pytest tests/test_store.py tests/test_api.py tests/test_registry.py -q` passes; importing the same bundle again must not duplicate weights.
-- [ ] Review and save the deliverable; make a separate commit if Git is available.
+- [x] Lock dependencies and the CLI entry point; create the shared schemas and SQLite migration 1.
+- [x] Define core handles/results, `ObjectiveSpec`, and the extension registry; verify an in-memory model load requires neither SQLite nor MCP and rejects unknown adapter versions.
+- [x] First write fixture roundtrip tests: imported parameters are bitwise identical; invalid architectures/shapes, path escapes, and nonfinite values are rejected.
+- [x] Implement content-addressed safetensors + manifest storage, READY visibility, and the minimal MLP adapter.
+- [x] Verify that `uv run pytest tests/test_store.py tests/test_api.py tests/test_registry.py -q` passes; importing the same bundle again must not duplicate weights.
+- [x] Review and save the deliverable; make a separate commit if Git is available.
 
 ### Task 2: Bounded Weight Reading and Analysis
 
@@ -393,11 +393,11 @@ Tasks run in order 1→2→3→4→5→6→7. Tasks 1–3 establish the core con
 
 **Interfaces:** `inspect(checkpoint_id) -> ModelManifest`; `analyze(checkpoint_id, kind, tensor, selection, k=None) -> AnalysisResult`, where an omitted `k` resolves as described in Section 4.1. `AnalysisResult` includes the operation, input hash, numerical results, and elapsed time; large results are referenced by artifact URI.
 
-- [ ] Write tests for slice boundaries, the 2,048-element limit, and the 32 KiB canonical-JSON limit; reject expressions and oversized top-k requests; confirm that default top-k succeeds on tensors with fewer than 16 elements.
-- [ ] Implement stats, norm, top-k, and a large-object response policy without implicit copying.
-- [ ] Register built-in analyses through `OperatorSpec`; test a separately supplied analysis implementation and a missing-capability rejection without changes to dispatch code.
-- [ ] Verify means, norms, and top-k indices using known matrices; confirm that none of these paths calls adapter.forward.
-- [ ] Verify that `uv run pytest tests/test_analysis.py -q` passes and review the deliverable.
+- [x] Write tests for slice boundaries, the 2,048-element limit, and the 32 KiB canonical-JSON limit; reject expressions and oversized top-k requests; confirm that default top-k succeeds on tensors with fewer than 16 elements.
+- [x] Implement stats, norm, top-k, and a large-object response policy without implicit copying.
+- [x] Register built-in analyses through `OperatorSpec`; test a separately supplied analysis implementation and a missing-capability rejection without changes to dispatch code.
+- [x] Verify means, norms, and top-k indices using known matrices; confirm that none of these paths calls adapter.forward.
+- [x] Verify that `uv run pytest tests/test_analysis.py -q` passes and review the deliverable.
 
 ### Task 3: Patches, Experiment State, and Rollback
 
@@ -407,12 +407,12 @@ Tasks run in order 1→2→3→4→5→6→7. Tasks 1–3 establish the core con
 
 The managed patch path uses core `apply_operator(model, operator_id, parameters) -> EditResult`. Both built-in and registered edit operators materialize changes in the standard patch representation, preserving operator versions as provenance.
 
-- [ ] Write known-value tests for set/scale, including a multi-operation patch whose later failure must produce no READY candidate.
-- [ ] Implement set/scale as registered edit operators; verify a direct in-memory edit and a managed edit yield the same changed tensor bytes, and replay of the materialized patch does not execute the editing plugin.
-- [ ] Implement frozen previews, immutable candidates, idempotency records, the single-experiment run-grant limit, object ownership, and CAS selection; test that recreating an experiment cannot reset its budget, that policy/mode changes are rejected, and that `apply_patch` enforces the policy's candidate-commit limit (1 under `small_model_weights_only_v1`).
-- [ ] Inject failures before and after file rename and database commit; verify restart recovery and unchanged original weights.
-- [ ] Verify that `uv run pytest tests/test_patches.py tests/test_experiments.py tests/test_recovery.py -q` passes; failures must remain traceable without affecting the selected checkpoint.
-- [ ] Review and save the deliverable.
+- [x] Write known-value tests for set/scale, including a multi-operation patch whose later failure must produce no READY candidate.
+- [x] Implement set/scale as registered edit operators; verify a direct in-memory edit and a managed edit yield the same changed tensor bytes, and replay of the materialized patch does not execute the editing plugin.
+- [x] Implement frozen previews, immutable candidates, idempotency records, the single-experiment run-grant limit, object ownership, and CAS selection; test that recreating an experiment cannot reset its budget, that policy/mode changes are rejected, and that `apply_patch` enforces the policy's candidate-commit limit (1 under `small_model_weights_only_v1`).
+- [x] Inject failures before and after file rename and database commit; verify restart recovery and unchanged original weights.
+- [x] Verify that `uv run pytest tests/test_patches.py tests/test_experiments.py tests/test_recovery.py -q` passes; failures must remain traceable without affecting the selected checkpoint.
+- [x] Review and save the deliverable.
 
 ### Task 4: Budgets, Asynchronous Workers, and Cancellation
 
@@ -420,10 +420,10 @@ The managed patch path uses core `apply_operator(model, operator_id, parameters)
 
 **Interfaces:** `reserve(experiment_id, job_id, requested_usage) -> Reservation`; `settle(reservation_id, actual_usage, terminal_state)`; `submit_evaluation(experiment_id, checkpoint_id, suite_id, config, key) -> Job`; `get_job(experiment_id, job_id, wait_seconds=0) -> Job`; `cancel_job(experiment_id, job_id, key) -> Job`.
 
-- [ ] First write concurrency tests: with one unit of budget remaining, only one of two requests on independent database connections can reserve it; repeated idempotent requests create only one job.
-- [ ] Implement atomic SQLite reservations, a single-worker queue, process time limits, heartbeats, cancellation, and settlement after crashes.
-- [ ] Cover cancellation while queued, while running, and after success, plus jobs lost during restart; confirm that cancellation does not refund consumed budget.
-- [ ] Verify that `uv run pytest tests/test_budget_jobs.py -q` passes and review the deliverable.
+- [x] First write concurrency tests: with one unit of budget remaining, only one of two requests on independent database connections can reserve it; repeated idempotent requests create only one job.
+- [x] Implement atomic SQLite reservations, a single-worker queue, process time limits, heartbeats, cancellation, and settlement after crashes.
+- [x] Cover cancellation while queued, while running, and after success, plus jobs lost during restart; confirm that cancellation does not refund consumed budget.
+- [x] Verify that `uv run pytest tests/test_budget_jobs.py -q` passes and review the deliverable.
 
 ### Task 5: Development Evaluation, Freezing, and Final Evaluation
 
@@ -433,12 +433,12 @@ The managed patch path uses core `apply_operator(model, operator_id, parameters)
 
 The worker invokes core `evaluate_candidate(model, evaluator, config) -> EvaluationResult`, then persists its bindings and usage as an `EvaluationReport`. Direct-library evaluations use the same evaluator without claiming managed enforcement.
 
-- [ ] Write exact tests for clean/broken/repaired models: 100%/50%/100% accuracy on the balanced fixture.
-- [ ] Complete the no-service Python acceptance path in `tests/test_api.py`; check metric and model/configuration identity parity with managed evaluation.
-- [ ] Implement development/final dataset manifests, task hashes, evaluation configurations, and paired comparisons; reject comparisons with mismatched configurations.
-- [ ] Test that no agent-facing service operation can read the final set (Task 6 repeats this through MCP tools and resources), that active jobs prevent freezing, frozen experiments cannot be edited or accept checkpoint selection or new jobs, failed final evaluations can be retried on the same frozen model, and the final report pairs the frozen candidate with the base-checkpoint control and accepts no other checkpoint.
-- [ ] Verify that `uv run pytest tests/test_evaluation.py -q` passes; produce machine-readable reports and concise Markdown reports.
-- [ ] Review and save the deliverable.
+- [x] Write exact tests for clean/broken/repaired models: 100%/50%/100% accuracy on the balanced fixture.
+- [x] Complete the no-service Python acceptance path in `tests/test_api.py`; check metric and model/configuration identity parity with managed evaluation.
+- [x] Implement development/final dataset manifests, task hashes, evaluation configurations, and paired comparisons; reject comparisons with mismatched configurations.
+- [x] Test that no agent-facing service operation can read the final set (Task 6 repeats this through MCP tools and resources), that active jobs prevent freezing, frozen experiments cannot be edited or accept checkpoint selection or new jobs, failed final evaluations can be retried on the same frozen model, and the final report pairs the frozen candidate with the base-checkpoint control and accepts no other checkpoint.
+- [x] Verify that `uv run pytest tests/test_evaluation.py -q` passes; produce machine-readable reports and concise Markdown reports.
+- [x] Review and save the deliverable.
 
 ### Task 6: MCP Integration and Protocol-Level End-to-End Tests
 
@@ -446,13 +446,13 @@ The worker invokes core `evaluate_candidate(model, evaluator, config) -> Evaluat
 
 **Interfaces:** All tools and resources in Section 4; handlers only pass Pydantic requests to services and map their results/errors.
 
-- [ ] Launch a stdio subprocess using the official SDK client; write tests for tools/resources discovery and schema validation.
-- [ ] Register service capabilities as tools, send logs to stderr, and verify identical object-access boundaries for tools and resources.
-- [ ] Repeat the final-set isolation test through MCP tools and resources; verify that the largest permitted `wse_read_tensor` response, including its text mirror, stays within 64 KiB; run the Section 7.1 leak test against the registered tool names, descriptions, and schemas.
-- [ ] Compare managed SDK, CLI, and MCP calls for identical patch content, policy decisions, and usage accounting; handlers must not implement separate editing algorithms.
-- [ ] Run the complete oracle repair sequence through a scripted client, covering budget exhaustion, duplicate requests, cancellation, state after reconnect, and rollback.
-- [ ] Verify that `uv run pytest tests/test_mcp_e2e.py -q` passes. Test a connection with one actual MCP host, the OpenAI Agents SDK stdio client (`agents.mcp.MCPServerStdio` from the optional `agents-openai` extra): start `wse serve`, list the tools and confirm that every name arrives verbatim, and call one read-only tool and confirm that its text content carries the same result as its structured content. Make no model calls, set no API key, and disable SDK tracing; skip with a stated reason when the extra is not installed. Record the host and protocol versions and any compatibility behavior.
-- [ ] Review and save the deliverable.
+- [x] Launch a stdio subprocess using the official SDK client; write tests for tools/resources discovery and schema validation.
+- [x] Register service capabilities as tools, send logs to stderr, and verify identical object-access boundaries for tools and resources.
+- [x] Repeat the final-set isolation test through MCP tools and resources; verify that the largest permitted `wse_read_tensor` response, including its text mirror, stays within 64 KiB; run the Section 7.1 leak test against the registered tool names, descriptions, and schemas.
+- [x] Compare managed SDK, CLI, and MCP calls for identical patch content, policy decisions, and usage accounting; handlers must not implement separate editing algorithms.
+- [x] Run the complete oracle repair sequence through a scripted client, covering budget exhaustion, duplicate requests, cancellation, state after reconnect, and rollback.
+- [x] Verify that `uv run pytest tests/test_mcp_e2e.py -q` passes. Test a connection with one actual MCP host, the OpenAI Agents SDK stdio client (`agents.mcp.MCPServerStdio` from the optional `agents-openai` extra): start `wse serve`, list the tools and confirm that every name arrives verbatim, and call one read-only tool and confirm that its text content carries the same result as its structured content. Make no model calls, set no API key, and disable SDK tracing; skip with a stated reason when the extra is not installed. Record the host and protocol versions and any compatibility behavior.
+- [x] Review and save the deliverable.
 
 ### Task 7: Reference Agent Trials and Replayable Delivery
 
@@ -460,15 +460,15 @@ The worker invokes core `evaluate_candidate(model, evaluator, config) -> Evaluat
 
 **Interfaces:** `run_experiment(run_id, task_id, policy_id, agent_config) -> experiment_id`; `export_experiment(experiment_id, output_dir) -> export_manifest`; `AgentAdapter.run(experiment_id, agent_config, event_sink) -> AgentRunResult`; `AgentAdapter.cancel(experiment_id)`. The runner selects the OpenAI Agents SDK adapter in M1, with model names and credentials supplied by the operator. Exports exclude final-set inputs, labels, and generation seeds by default.
 
-- [ ] Implement the loop: read task and budget → gather information → submit a patch with a brief rationale → evaluate on development data → compare → select/rollback → stop and freeze.
-- [ ] Define `Strategy.next_action(objective, observations, remaining_budget)` for stepwise controllers and the separate `AgentAdapter` run/cancel contract for complete SDK loops. Run a scripted strategy and the SDK-backed reference agent through the same experiment service; record their IDs, versions, and configurations without nesting two tool loops.
-- [ ] Add the optional `agents-openai` dependency and implement the Python OpenAI Agents SDK adapter with local stdio MCP. Persist the experiment first, pass its workspace and run grant to the server, and keep that server as the sole scheduler owner.
-- [ ] Test adapter behavior with an SDK test double: normalized events/usage, 100-turn (passed explicitly as `max_turns`) and 900-second limits, tracing disabled in the benchmark configuration, stop-condition cancellation, connection failure, and unfinished jobs at SDK exit. Verify that the base package still imports without the optional SDK and that SDK completion alone does not close an experiment.
-- [ ] Document a direct Python example and an external extension example, including required capabilities, unsupported operations, and the distinction between exact patch replay and recipe re-execution.
-- [ ] Fix bounded_eval stopping conditions: insufficient budget for the next operation, the full development evaluation meets its target, 3 consecutive evaluated candidates show no improvement, or the agent voluntarily stops. The weights_only control freezes after its single permitted candidate commit or a voluntary stop and does not use a development-score stopping threshold. Do not request or store private chain-of-thought; record brief hypotheses and observable evidence only.
-- [ ] Export base/patch/report hashes, tool traces, policies, and costs; replay in a clean workspace to recover identical weights.
-- [ ] Run 5 live OpenAI Agents SDK demos with isolated run grants and contexts using a fixed operator-configured model; record the exact SDK/model settings. Evaluate all final candidates after every trial has frozen. Report success rates and failures separately as specified in Section 7; one success is not complete acceptance.
-- [ ] Run `uv run pytest -q` and record versions and the CPU environment; deliver documentation, demo commands, and representative success and failure reports.
+- [x] Implement the loop: read task and budget → gather information → submit a patch with a brief rationale → evaluate on development data → compare → select/rollback → stop and freeze.
+- [x] Define `Strategy.next_action(objective, observations, remaining_budget)` for stepwise controllers and the separate `AgentAdapter` run/cancel contract for complete SDK loops. Run a scripted strategy and the SDK-backed reference agent through the same experiment service; record their IDs, versions, and configurations without nesting two tool loops.
+- [x] Add the optional `agents-openai` dependency and implement the Python OpenAI Agents SDK adapter with local stdio MCP. Persist the experiment first, pass its workspace and run grant to the server, and keep that server as the sole scheduler owner.
+- [x] Test adapter behavior with an SDK test double: normalized events/usage, 100-turn (passed explicitly as `max_turns`) and 900-second limits, tracing disabled in the benchmark configuration, stop-condition cancellation, connection failure, and unfinished jobs at SDK exit. Verify that the base package still imports without the optional SDK and that SDK completion alone does not close an experiment.
+- [x] Document a direct Python example and an external extension example, including required capabilities, unsupported operations, and the distinction between exact patch replay and recipe re-execution.
+- [x] Fix bounded_eval stopping conditions: insufficient budget for the next operation, the full development evaluation meets its target, 3 consecutive evaluated candidates show no improvement, or the agent voluntarily stops. The weights_only control freezes after its single permitted candidate commit or a voluntary stop and does not use a development-score stopping threshold. Do not request or store private chain-of-thought; record brief hypotheses and observable evidence only.
+- [x] Export base/patch/report hashes, tool traces, policies, and costs; replay in a clean workspace to recover identical weights.
+- [x] Run 5 live OpenAI Agents SDK demos with isolated run grants and contexts using a fixed operator-configured model; record the exact SDK/model settings. Evaluate all final candidates after every trial has frozen. Report success rates and failures separately as specified in Section 7; one success is not complete acceptance.
+- [x] Run `uv run pytest -q` and record versions and the CPU environment; deliver documentation, demo commands, and representative success and failure reports.
 
 ## 10. Subsequent Milestones
 

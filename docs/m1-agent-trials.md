@@ -168,12 +168,21 @@ None of these changed an outcome.
   The scans covered 40 files for `pilot`, 125 for `main`, and 141 for
   `main2`, with 160 sampled values for `main` and `main2`.
 - **Tests.** 365 engineering tests pass at 7ea498b and 366 at 8f6be85.
+  At M1's close on 2026-11-09, all 366 passed again at a043638, and so did
+  each task's acceptance command in the plan. The run used only the CPU, on
+  an Apple M4 Pro under macOS 26.7.1 (arm64). The software was Python
+  3.14.8 with torch 2.15.0, numpy 2.5.4, safetensors 0.8.0, pydantic
+  2.14.2, mcp 2.3.0, openai-agents 0.24.0 and openai 3.46.0, the versions
+  recorded in the trial exports.
 
 Raw outputs stay with the operator, outside this repository. They comprise
 the exports with tool traces and patches, the reports, server logs, replays
 and workspaces.
 
 ## Open items
+
+M1 closed on 2026-11-09 with these items open. None of them affects the
+results above, and they carry over to the M2 plan.
 
 - **Agent-facing changes for later configurations.** Each of these changes
   what the agent sees, so it starts a new configuration:
