@@ -508,32 +508,32 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
 - [x] Before freezing `PresencePenalty`, compare its semantics with vLLM's sampler source and record the comparison in a code comment.
 - [x] **(real model)** Render one MATH-500 prompt with Qwen3.5-0.8B's template and `qwen35think@1`, and confirm that thinking is enabled.
 - [x] Run the new tests and the full suite.
-- [ ] Review and commit.
+- [x] Review and commit.
 
 ### Task 7: Q1 runs, report, and the decision gate
 
 **Files:** create `docs/m2-q1-report.md`.
 
-- [ ] **(real model)** Measure generation throughput on MPS and on CPU for both models at batch sizes 1, 8, and 32. For Qwen3.5-0.8B, also measure at contexts of up to 4,096 and up to 32,768 tokens. Record tokens per second and peak memory.
-- [ ] **(real model)** Compare base and p50c on Qwen3.5-0.8B:
+- [x] **(real model)** Measure generation throughput on MPS and on CPU for both models at batch sizes 1, 8, and 32. For Qwen3.5-0.8B, also measure at contexts of up to 4,096 and up to 32,768 tokens. Record tokens per second and peak memory.
+- [x] **(real model)** Compare base and p50c on Qwen3.5-0.8B:
   - 25 MATH-500 problems, chosen by a recorded seed;
   - 1 sample per problem, with `qwen35think@1`;
   - report accuracy, limit-hit rate, and mean generated tokens, with intervals.
 
   The expected direction comes from the article: the base reached the limit on 93.0% of answers and the edit on 33.1%, with MATH-500 accuracy of 7.9% and 48.1%. The size of the change is not expected to match, because the sample is small and the engine differs.
-- [ ] **(real model)** Run Llama-3.2-1B-Instruct through Level 0 with no new code:
+- [x] **(real model)** Run Llama-3.2-1B-Instruct through Level 0 with no new code:
   - import it and check logits parity (Tasks 3–4);
   - preview, apply, and replay a `scale_slice` on one MLP projection, byte-identical;
   - evaluate 25 GSM8K test problems with `llama_3_2_1b_instruct_default@1`.
 
   Then confirm that `src/wse` has no Llama-specific code: `grep -rn -i llama src/wse` finds nothing at this point, because the `llama@1` descriptor arrives only in Task 8.
-- [ ] Write `docs/m2-q1-report.md` with:
+- [x] Write `docs/m2-q1-report.md` with:
   - versions, device, and throughput;
   - the replay hashes;
   - both comparisons;
   - cost estimates for the three protocols of Section 4.4.
 - [ ] **Decision gate (user):** choose local subset or GPU worker for Q3's final evaluation. If a GPU worker is chosen, insert its task before Task 13.
-- [ ] Review and commit. **Q1 exit:** the Section 1 conditions for Q1 hold.
+- [ ] Review and commit. **Q1 exit:** the Section 1 conditions for Q1 hold. Reviewed and committed; the exit waits for the plan author's reading of the Llama patch round trip and the strictly scored GSM8K evaluation (`docs/m2-q1-report.md`, Section 9).
 
 ### Task 8: Family descriptors with roles, heads, and protections
 

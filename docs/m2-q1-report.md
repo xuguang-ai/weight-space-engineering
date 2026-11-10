@@ -10,7 +10,7 @@ This report covers Task 7 of the [M2 plan](../agentic-weight-space-engineering-m
 
 The 25-problem base-versus-p50c comparison ran from 19:31 EST on 2026-11-09 to 01:36 EST on 2026-11-10. It moved in the article's direction (Section 6). The decision gate (Section 8) is the user's.
 
-Status on 2026-11-10: every Task 7 run is done. The decision gate and Task 7's review are open.
+Status on 2026-11-10: every Task 7 run is done, and Task 7's review is complete (Section 9). The decision gate is open.
 
 ## 1. Environment
 
@@ -300,7 +300,7 @@ An exact two-sided sign test on the 12 discordant problems (11 against 1) gives 
 | base | 10,995 s (3.05 h) | 770,598 | 3,214; 3,224; 3,462; 1,094 |
 | p50c | 10,912 s (3.03 h) | 538,857 | 3,108; 3,552; 3,249; 1,003 |
 
-- The whole run took 6 h 5 min (21,918 s of wall-clock time), against the estimate of 5.5 h (range 4.5–6.5 h).
+- The whole run took 6 h 5 min (21,910 s from the creation of `run.json` to the completion of `summary.json`), against the estimate of 5.5 h (range 4.5–6.5 h).
 - All six chunks of 8 ran the full 32,768 steps, as expected. They took 94.9–108.4 ms per step, 100.8 ms on average, instead of the extrapolated 90 ms. Chunks of identical length differed by up to 14% in step time; the cause was not measured.
 - The single-row chunks took 33.4 ms per step (base, 32,768 steps) and 33.1 ms (p50c, 30,311 steps), as assumed.
 
@@ -347,7 +347,7 @@ Locally, the full protocol (Section 7) is out of reach. The choice is the user's
   - the comparison condition now holds (Section 6);
   - Section 4 reports the Llama condition as met: import, logits parity, a byte-identical patch round trip, and a completed GSM8K evaluation, with no Llama-specific code.
 
-  Task 7's review confirms the exit.
+  Task 7's review confirmed the replay and comparison conditions, and Llama's import and logits parity. Whether the patch-level round trip and the strictly scored GSM8K evaluation satisfy the Llama condition is the plan author's reading (next items).
 - **Needs the plan author's decision:** for Llama-3.2-1B-Instruct, `gsm8k_numeric@1` scores 0 of 25 because the model never writes `\boxed{}`. One option is a numeric fallback (the last number) in a new grader version, with the profile unchanged. The other is to keep the strict grader and report the format failure.
 - **Not yet supported:** M1's experiment export and `wse replay` do not carry open-weight base models (bundle size limit and format). Patch-level replay works and is byte-identical (Section 4).
 - **Measured since Section 2:** decode at batch 8 over full-length generations took 94.9–108.4 ms per step (Section 6). Section 7 uses these times.

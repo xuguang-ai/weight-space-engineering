@@ -386,7 +386,8 @@ def _grade(grader: Any, output: SampleOutput, reference: str, max_new_tokens: in
                         output_sha256=token_hash(output.tokens))
 
 
-def _library_versions() -> dict[str, str]:
+def library_versions() -> dict[str, str]:
+    """The versions of the grading libraries, which the results report next to the runtime's torch and transformers."""
     from importlib.metadata import PackageNotFoundError, version
 
     versions = {}
@@ -500,7 +501,7 @@ def generation_result(model: ModelHandle, plan: GenerationPlan, problems: Mappin
             raise _invalid(f"the result of problem {problem.index} does not match the plan")
     metrics, intervals, clusters = generation_metrics(ordered)
     samples, cluster_ids = _flatten(ordered)
-    runtime = {**runtime, **_library_versions()}
+    runtime = {**runtime, **library_versions()}
     execution = ExecutionConfig(evaluator=plan.suite.evaluator,
                                 parameters={**plan.parameters, "profile_hash": plan.profile.profile_hash,
                                             "prompts_hash": prompts_hash([p.prompt_sha256 for p in ordered])},
@@ -609,5 +610,6 @@ def compare_generation(base: Any, candidate: Any) -> GenerationComparison:
 
 __all__ = ["GenerationEvaluator", "GenerationPlan", "SampleOutput", "TextModel", "compare_generation",
            "encode_prompts", "evaluate_generation", "generate_samples", "generation_metrics", "generation_result",
-           "generation_usage", "load_text_model", "mean_interval", "model_stop_tokens", "paired_mean_difference",
-           "plan_generation", "prompts_hash", "run_problems", "suite_parameters", "token_hash"]
+           "generation_usage", "library_versions", "load_text_model", "mean_interval", "model_stop_tokens",
+           "paired_mean_difference", "plan_generation", "prompts_hash", "run_problems", "suite_parameters",
+           "token_hash"]

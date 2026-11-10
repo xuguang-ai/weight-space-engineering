@@ -194,3 +194,130 @@ def test_wse_compare_generation_cli(pair, tmp_path, capsys):
     assert capsys.readouterr().err == ""
     assert main([a if a != "4" else "5" for a in argv]) == 2  # another configuration in the same directory
     assert '"INVALID_ARGUMENT"' in capsys.readouterr().err
+
+
+def test_read_log_keeps_and_terminates_an_unterminated_last_record(tmp_path):
+    import wse.evaluators.generation_runs as runs
+
+    path = tmp_path / "log.jsonl"
+    path.write_bytes(b'{"a": 1}\n{"a": 2}')  # a complete last record whose newline was not written
+    assert runs.read_log(path) == [{"a": 1}, {"a": 2}]
+    assert path.read_bytes() == b'{"a": 1}\n{"a": 2}\n'
+    runs._append(path, {"a": 3})
+    assert runs.read_log(path) == [{"a": 1}, {"a": 2}, {"a": 3}]
+    # A last line that is not valid JSON is dropped and truncated away.
+    path.write_bytes(b'{"a": 1}\n{"a": ')
+    assert runs.read_log(path) == [{"a": 1}]
+    assert path.read_bytes() == b'{"a": 1}\n'
+    # Invalid JSON before the last record is corruption, and the file is left as it is.
+    path.write_bytes(b'{"a": 1}\n{"a": \n{"a": 3}')
+    _expect(ErrorCode.ARTIFACT_CORRUPT, runs.read_log, path)
+    assert path.read_bytes() == b'{"a": 1}\n{"a": \n{"a": 3}'
+
+
+def _snapshot(directory: Path) -> dict[str, bytes]:
+    return {str(path.relative_to(directory)): path.read_bytes() for path in sorted(directory.rglob("*"))
+            if path.is_file()}
+
+
+def _forbid(monkeypatch, name: str) -> None:
+    import wse.evaluators.generation_runs as runs
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(f"{name} was called")
+
+    monkeypatch.setattr(runs, name, forbidden)
+
+
+def test_a_restart_under_other_library_versions_is_refused(pair, tmp_path, monkeypatch):
+    import wse.evaluators.generation_runs as runs
+
+    root = pair[0]
+    out = tmp_path / "out"
+    with Engine(root / "workspace") as engine:
+        summary = _run(engine, pair, out, count=2)
+        recorded = json.loads((out / runs.RUN_FILE).read_text())["configuration"]["libraries"]
+        # The recorded versions are those the results report.
+        assert {"torch", "transformers"} <= set(recorded)
+        assert recorded == {name: summary["results"]["base"]["runtime"][name] for name in recorded}
+        current = dict(recorded)
+        monkeypatch.setattr(runs, "_run_libraries", lambda: {**current, "transformers": "0.0.1"})
+        _forbid(monkeypatch, "load_text_model")
+        before = _snapshot(out)
+        error = _expect(ErrorCode.INVALID_ARGUMENT, _run, engine, pair, out, count=2)
+    assert f"transformers {recorded['transformers']} recorded, 0.0.1 now" in error.message
+    assert error.details["libraries"] == {"transformers": {"recorded": recorded["transformers"], "current": "0.0.1"}}
+    assert _snapshot(out) == before
+
+
+def test_a_run_recorded_without_library_versions_is_not_continued(pair, tmp_path, monkeypatch):
+    import wse.evaluators.generation_runs as runs
+
+    root = pair[0]
+    out = tmp_path / "out"
+    with Engine(root / "workspace") as engine:
+        _run(engine, pair, out, count=2)
+        run_file = out / runs.RUN_FILE
+        run = json.loads(run_file.read_text())
+        del run["configuration"]["libraries"]
+        run_file.write_text(json.dumps(run), encoding="utf-8")
+        with (out / runs.PROBLEMS_FILE).open("a", encoding="utf-8") as handle:
+            handle.write('{"checkpoint": "ba')  # a torn line, which a continued run would truncate
+        _forbid(monkeypatch, "load_text_model")
+        before = _snapshot(out)
+        error = _expect(ErrorCode.INVALID_ARGUMENT, _run, engine, pair, out, count=2)
+    assert "recorded without library versions" in error.message
+    assert "stay valid as recorded" in error.message and "new output directory" in error.message
+    assert _snapshot(out) == before
+
+
+def test_sides_that_render_different_prompts_are_refused_before_generation(pair, tmp_path, monkeypatch):
+    import wse.evaluators.generation_runs as runs
+
+    root = pair[0]
+    out = tmp_path / "out"
+    original = runs.encode_prompts
+    sides: list[object] = []
+
+    def encode(text_model, profile, items, indices):
+        prompts = original(text_model, profile, items, indices)
+        sides.append(text_model)
+        if len(sides) == 2:  # the candidate renders problem 1 with one more token
+            prompts[1] = [*prompts[1], prompts[1][-1]]
+        return prompts
+
+    monkeypatch.setattr(runs, "encode_prompts", encode)
+    _forbid(monkeypatch, "run_problems")
+    with Engine(root / "workspace") as engine:
+        error = _expect(ErrorCode.INVALID_ARGUMENT, _run, engine, pair, out)
+    assert len(sides) == 2 and "problem 1 " in error.message
+    assert error.details["index"] == 1
+    assert not out.exists()  # nothing generated, nothing recorded
+
+
+@pytest.mark.parametrize("samples", [1, 2])
+def test_an_uninterrupted_run_reports_the_usage_of_a_single_evaluation(pair, tmp_path, samples):
+    import wse.evaluators.generation_runs as runs
+    from wse.evaluators.generation import evaluate_generation
+    from wse.evaluators.text_suites import read_jsonl
+
+    root, dataset, base, candidate = pair
+    out = tmp_path / "out"
+    with Engine(root / "workspace") as engine:
+        summary = _run(engine, pair, out, count=3, samples_per_problem=samples)
+        data, _ = read_jsonl(dataset, format="math500")
+        suite, _ = runs.subset_suite(data, count=3, seed=7, parameters={
+            "profile": "qwen35think@1", "grader": "math_boxed@1", "samples_per_problem": samples, "max_new_tokens": 6})
+        for label, checkpoint in (("base", base), ("candidate", candidate)):
+            direct = evaluate_generation(engine.open_checkpoint(checkpoint), suite, {"sample_count": 3, "seed": 0},
+                                         files=engine.model_files(checkpoint), registry=engine.registry,
+                                         batch_size=2, device="cpu")
+            result = summary["results"][label]
+            assert result["problems"] == [p.model_dump(mode="json") for p in direct.problems]
+            usage = result["usage"]
+            # 3 problems x samples rows in batches of 2: one batch per sample of a full chunk, then the rest.
+            assert usage["evaluation_batches"] == direct.usage.evaluation_batches == -(-3 * samples // 2)
+            assert usage["evaluated_examples"] == direct.usage.evaluated_examples == 3 * samples
+            assert usage["model_forward_calls"] == direct.usage.model_forward_calls
+            assert result["split"] == direct.split == "final"
+            assert result["errors"] == list(direct.errors)

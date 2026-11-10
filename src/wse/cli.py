@@ -149,7 +149,9 @@ def _parser() -> argparse.ArgumentParser:
     compare.add_argument("--eval-seed", type=int, default=0, help="the evaluation seed (default 0)")
     compare.add_argument("--device", choices=["mps", "cpu"], default=None,
                          help="the device (default: mps when available)")
-    compare.add_argument("--batch-size", type=int, default=1, help="problems per batch (default 1)")
+    compare.add_argument("--batch-size", type=int, default=1,
+                         help="rows (problem samples) per generation batch; the runner also works through problems "
+                         "in chunks of this many (default 1)")
     compare.add_argument("--out", required=True,
                          help="the output directory (run.json, problems.jsonl, summary.json); outside the "
                               "repository; an existing one resumes")
