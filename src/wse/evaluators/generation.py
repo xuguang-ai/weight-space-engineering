@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import hashlib
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -197,25 +197,37 @@ def _encode(text_model: TextModel, profile: GenerationProfile, prompt: str) -> l
     return [int(token) for token in ids]
 
 
+def encode_prompts(text_model: TextModel, profile: GenerationProfile, items: Sequence[TextItem],
+                   indices: Iterable[int]) -> dict[int, list[int]]:
+    """The prompt token IDs of the problems at ``indices``: rendered with the profile, then tokenized."""
+    return {index: _encode(text_model, profile, render_prompt(text_model.tokenizer, profile, items[index].problem))
+            for index in sorted(set(indices))}
+
+
 def generate_samples(text_model: TextModel, profile: GenerationProfile, items: Sequence[TextItem],
                      rows: Sequence[tuple[int, int]], *, eval_seed: int, batch_size: int = DEFAULT_BATCH_SIZE,
-                     check: Callable[[], None] | None = None) -> list[SampleOutput]:
+                     check: Callable[[], None] | None = None, prompts: Mapping[int, list[int]] | None = None,
+                     on_batch: Callable[[list[SampleOutput], float], None] | None = None) -> list[SampleOutput]:
     """Generate the ``(problem index, sample index)`` rows in batches of ``batch_size``, in the order given.
 
     Prompts are left-padded and masked; each row draws from its own seed, so
     its tokens do not depend on its batch or position. The presence penalty
     of a batch counts output tokens only (the padded prompt length is shared).
+    ``prompts`` supplies already encoded prompts (``encode_prompts``);
+    ``on_batch`` receives each finished batch's outputs and its seconds.
     """
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         raise _invalid("batch_size must be a positive integer")
     sampling = profile_sampling(profile)
-    prompts = {index: _encode(text_model, profile, render_prompt(text_model.tokenizer, profile, items[index].problem))
-               for index in sorted({index for index, _ in rows})}
-    prompt_hashes = {index: token_hash(ids) for index, ids in prompts.items()}
+    needed = {index for index, _ in rows}
+    if prompts is None or not needed <= set(prompts):
+        prompts = encode_prompts(text_model, profile, items, needed)
+    prompt_hashes = {index: token_hash(prompts[index]) for index in needed}
     outputs: list[SampleOutput] = []
     for start in range(0, len(rows), batch_size):
         if check is not None:
             check()
+        began = time.perf_counter()
         chunk = list(rows[start : start + batch_size])
         encoded = [prompts[index] for index, _ in chunk]
         width = max(len(ids) for ids in encoded)
@@ -230,12 +242,16 @@ def generate_samples(text_model: TextModel, profile: GenerationProfile, items: S
             input_ids, mask, max_new_tokens=profile.max_new_tokens, stop_token_ids=stops,
             pad_token_id=text_model.pad_token_id, sampling=sampling, seeds=seeds if sampling is not None else None,
             logits_processors=logits_processors(profile, width))
+        batch_outputs = []
         for (index, sample), seed, tokens, finished in zip(chunk, seeds, result.tokens, result.finished, strict=True):
             body = tokens[:-1] if finished and tokens else tokens  # the text excludes the stop token
             text = text_model.tokenizer.decode(body, skip_special_tokens=True)
-            outputs.append(SampleOutput(index=index, sample=sample, item_id=items[index].item_id, seed=seed,
-                                        tokens=list(tokens), finished=bool(finished), text=text,
-                                        prompt_sha256=prompt_hashes[index]))
+            batch_outputs.append(SampleOutput(index=index, sample=sample, item_id=items[index].item_id, seed=seed,
+                                              tokens=list(tokens), finished=bool(finished), text=text,
+                                              prompt_sha256=prompt_hashes[index]))
+        outputs.extend(batch_outputs)
+        if on_batch is not None:
+            on_batch(batch_outputs, time.perf_counter() - began)
     return outputs
 
 
@@ -382,6 +398,145 @@ def _library_versions() -> dict[str, str]:
     return versions
 
 
+@dataclass(frozen=True)
+class GenerationPlan:
+    """A generation suite resolved for one evaluation: its parameters, effective profile, grader, problems, and rows.
+
+    ``items`` are the evaluated problems (the suite's first ``sample_count``)
+    and ``rows`` every ``(problem index, sample index)`` pair, in order.
+    """
+
+    suite: EvaluationSuite
+    eval_config: EvalConfig
+    parameters: Mapping[str, Any]
+    profile: GenerationProfile
+    grader: Any
+    items: tuple[TextItem, ...]
+    rows: tuple[tuple[int, int], ...]
+
+    @property
+    def samples_per_problem(self) -> int:
+        return int(self.parameters["samples_per_problem"])
+
+
+def plan_generation(model: ModelHandle, suite: EvaluationSuite, config: EvalConfig | Mapping[str, Any], *,
+                    registry: Registry | None = None,
+                    profile_overrides: Mapping[str, Any] | None = None) -> GenerationPlan:
+    """Check a generation suite with its problems attached and resolve the profile and grader for ``model``."""
+    from wse.api import _as_eval_config
+    from wse.registry import builtin_registry
+
+    registry = registry or builtin_registry()
+    eval_config = _as_eval_config(config)
+    if ExtensionRef.parse(suite.evaluator) != ExtensionRef(extension_id=EVALUATOR_ID, version=EVALUATOR_VERSION):
+        raise _invalid(f"suite {suite.suite_id} is evaluated by {suite.evaluator}, not {EVALUATOR_ID}@{EVALUATOR_VERSION}")
+    if not isinstance(suite.data, TextSuiteData):
+        raise _invalid(f"suite {suite.suite_id} has no text problems attached; resolve it from evaluator storage first")
+    parameters = suite_parameters(suite)
+    count = eval_config.sample_count
+    if not 1 <= count <= suite.data.example_count:
+        raise _invalid(f"sample_count must lie between 1 and the {suite.data.example_count} problems of the suite")
+    overrides = dict(profile_overrides or {})
+    if parameters.get("max_new_tokens") is not None:
+        overrides.setdefault("max_new_tokens", parameters["max_new_tokens"])
+    profile = with_overrides(resolve_profile(registry, parameters["profile"], model.source), overrides)
+    grader = registry.resolve_ref("grader", parameters["grader"])
+    rows = tuple((index, sample) for index in range(count) for sample in range(parameters["samples_per_problem"]))
+    return GenerationPlan(suite=suite, eval_config=eval_config, parameters=MappingProxyType(parameters),
+                          profile=profile, grader=grader, items=tuple(suite.data.items[:count]), rows=rows)
+
+
+def run_problems(plan: GenerationPlan, text_model: TextModel, indices: Iterable[int], *,
+                 batch_size: int = DEFAULT_BATCH_SIZE, check: Callable[[], None] | None = None,
+                 prompts: Mapping[int, list[int]] | None = None,
+                 on_problem: Callable[[ProblemResult, list[SampleOutput]], None] | None = None,
+                 ) -> tuple[dict[int, ProblemResult], list[SampleOutput]]:
+    """Generate and grade every sample of the problems at ``indices``, in plan order and batches of ``batch_size``.
+
+    ``on_problem`` receives each problem's result and outputs as soon as its
+    last sample is graded, so a caller can record finished problems while
+    later batches still run.
+    """
+    wanted = set(indices)
+    unknown = sorted(wanted - set(range(len(plan.items))))
+    if unknown:
+        raise _invalid(f"problem indices {unknown[:10]} are outside the plan's {len(plan.items)} problems")
+    rows = [row for row in plan.rows if row[0] in wanted]
+    graded: dict[int, list[SampleResult]] = {}
+    pending: dict[int, list[SampleOutput]] = {}
+    problems: dict[int, ProblemResult] = {}
+
+    def finish_batch(outputs: list[SampleOutput], seconds: float) -> None:
+        for output in outputs:
+            graded.setdefault(output.index, []).append(
+                _grade(plan.grader, output, plan.items[output.index].reference, plan.profile.max_new_tokens))
+            pending.setdefault(output.index, []).append(output)
+        for index in dict.fromkeys(output.index for output in outputs):
+            if len(graded[index]) == plan.samples_per_problem:
+                done = sorted(pending.pop(index), key=lambda o: o.sample)
+                problems[index] = ProblemResult(index=index, item_id=plan.items[index].item_id,
+                                                prompt_sha256=done[0].prompt_sha256,
+                                                samples=sorted(graded.pop(index), key=lambda s: s.sample))
+                if on_problem is not None:
+                    on_problem(problems[index], done)
+
+    outputs = generate_samples(text_model, plan.profile, plan.items, rows, eval_seed=plan.eval_config.seed,
+                               batch_size=batch_size, check=check, prompts=prompts, on_batch=finish_batch)
+    return problems, outputs
+
+
+def generation_result(model: ModelHandle, plan: GenerationPlan, problems: Mapping[int, ProblemResult], *,
+                      runtime: Mapping[str, Any], batch_size: int, elapsed: float, usage: Usage) -> EvaluationResult:
+    """The evaluation result of a plan from the results of all its problems: metrics, intervals, and identities."""
+    from wse.api import EvaluationResult
+
+    count = len(plan.items)
+    missing = [index for index in range(count) if index not in problems]
+    if missing:
+        raise _invalid(f"results are missing for problems {missing[:10]}")
+    ordered = tuple(problems[index] for index in range(count))
+    for problem in ordered:
+        if problem.item_id != plan.items[problem.index].item_id or len(problem.samples) != plan.samples_per_problem:
+            raise _invalid(f"the result of problem {problem.index} does not match the plan")
+    metrics, intervals, clusters = generation_metrics(ordered)
+    samples, cluster_ids = _flatten(ordered)
+    runtime = {**runtime, **_library_versions()}
+    execution = ExecutionConfig(evaluator=plan.suite.evaluator,
+                                parameters={**plan.parameters, "profile_hash": plan.profile.profile_hash,
+                                            "prompts_hash": prompts_hash([p.prompt_sha256 for p in ordered])},
+                                eval_config=plan.eval_config, batch_size=batch_size,
+                                device=runtime.get("device", "cpu"))
+    return EvaluationResult(
+        metrics=MappingProxyType(metrics),
+        sample_count=count,
+        model=model.identity,
+        evaluator=plan.suite.evaluator,
+        evaluator_config_hash=execution.config_hash,
+        data_hash=plan.suite.data_hash,
+        usage=usage,
+        split=plan.suite.split,
+        suite_id=plan.suite.suite_id,
+        execution=execution,
+        clusters=clusters,
+        intervals=MappingProxyType(intervals),
+        scores=tuple(int(s.correct) for s in samples),
+        cluster_ids=tuple(cluster_ids),
+        errors=(),
+        truncation_count=sum(int(s.limit_hit) for s in samples),
+        elapsed_seconds=round(elapsed, 6),
+        problems=ordered,
+        runtime=MappingProxyType(runtime),
+    )
+
+
+def generation_usage(rows: int, batches: int, steps: int, seconds: float) -> Usage:
+    """The usage of a generation evaluation: rows, batches, decoding steps (forward calls), and seconds."""
+    return Usage(evaluation_batches=batches, evaluated_examples=rows, model_forward_calls=steps,
+                 compute_seconds=round(seconds, 6), analysis_calls=0, tensor_read_calls=0, candidate_commits=0,
+                 patch_previews=0, artifact_bytes=0, peak_memory_bytes=None,
+                 unavailable={"peak_memory_bytes": "measured only for whole evaluation processes"})
+
+
 def evaluate_generation(
     model: ModelHandle,
     suite: EvaluationSuite,
@@ -401,79 +556,22 @@ def evaluate_generation(
     (``Engine.model_files``); ``text_model`` replaces the runtime and tokenizer
     built from them (for stand-ins). ``profile_overrides`` adjusts the
     resolved profile for direct use; the effective profile's hash is bound into
-    the configuration either way.
+    the configuration either way. The steps are ``plan_generation``,
+    ``run_problems``, and ``generation_result``, which resumable runners
+    (``wse.evaluators.generation_runs``) call in parts.
     """
-    from wse.api import EvaluationResult, _as_eval_config
-    from wse.registry import builtin_registry
-
-    registry = registry or builtin_registry()
-    eval_config = _as_eval_config(config)
-    if ExtensionRef.parse(suite.evaluator) != ExtensionRef(extension_id=EVALUATOR_ID, version=EVALUATOR_VERSION):
-        raise _invalid(f"suite {suite.suite_id} is evaluated by {suite.evaluator}, not {EVALUATOR_ID}@{EVALUATOR_VERSION}")
-    if not isinstance(suite.data, TextSuiteData):
-        raise _invalid(f"suite {suite.suite_id} has no text problems attached; resolve it from evaluator storage first")
-    parameters = suite_parameters(suite)
-    count = eval_config.sample_count
-    if not 1 <= count <= suite.data.example_count:
-        raise _invalid(f"sample_count must lie between 1 and the {suite.data.example_count} problems of the suite")
-    overrides = dict(profile_overrides or {})
-    if parameters.get("max_new_tokens") is not None:
-        overrides.setdefault("max_new_tokens", parameters["max_new_tokens"])
-    profile = with_overrides(resolve_profile(registry, parameters["profile"], model.source), overrides)
-    grader = registry.resolve_ref("grader", parameters["grader"])
+    plan = plan_generation(model, suite, config, registry=registry, profile_overrides=profile_overrides)
     if text_model is None:
         if files is None:
             raise _invalid("generation needs the model's stored tokenizer files (Engine.model_files)")
         text_model = load_text_model(model, files, device=device)
-    items = suite.data.items[:count]
-    rows = [(index, sample) for index in range(count) for sample in range(parameters["samples_per_problem"])]
     start = time.perf_counter()
-    outputs = generate_samples(text_model, profile, items, rows, eval_seed=eval_config.seed, batch_size=batch_size,
-                               check=check)
-    by_problem: dict[int, list[SampleResult]] = {}
-    prompt_hashes: dict[int, str] = {}
-    for output in outputs:
-        by_problem.setdefault(output.index, []).append(_grade(grader, output, items[output.index].reference,
-                                                              profile.max_new_tokens))
-        prompt_hashes[output.index] = output.prompt_sha256
+    problems, outputs = run_problems(plan, text_model, range(len(plan.items)), batch_size=batch_size, check=check)
     elapsed = time.perf_counter() - start
-    problems = tuple(ProblemResult(index=index, item_id=items[index].item_id, prompt_sha256=prompt_hashes[index],
-                                   samples=sorted(by_problem[index], key=lambda s: s.sample))
-                     for index in range(count))
-    metrics, intervals, clusters = generation_metrics(problems)
-    samples, cluster_ids = _flatten(problems)
-    runtime = {**text_model.runtime.info(), **_library_versions()}
-    execution = ExecutionConfig(evaluator=suite.evaluator,
-                                parameters={**parameters, "profile_hash": profile.profile_hash,
-                                            "prompts_hash": prompts_hash([p.prompt_sha256 for p in problems])},
-                                eval_config=eval_config, batch_size=batch_size, device=runtime.get("device", "cpu"))
-    batches = -(-len(rows) // batch_size)
+    batches = -(-len(plan.rows) // batch_size)
     steps = sum(max(len(o.tokens) for o in outputs[b * batch_size : (b + 1) * batch_size]) for b in range(batches))
-    usage = Usage(evaluation_batches=batches, evaluated_examples=len(rows), model_forward_calls=steps,
-                  compute_seconds=round(elapsed, 6), analysis_calls=0, tensor_read_calls=0, candidate_commits=0,
-                  patch_previews=0, artifact_bytes=0, peak_memory_bytes=None,
-                  unavailable={"peak_memory_bytes": "measured only for whole evaluation processes"})
-    return EvaluationResult(
-        metrics=MappingProxyType(metrics),
-        sample_count=count,
-        model=model.identity,
-        evaluator=suite.evaluator,
-        evaluator_config_hash=execution.config_hash,
-        data_hash=suite.data_hash,
-        usage=usage,
-        split=suite.split,
-        suite_id=suite.suite_id,
-        execution=execution,
-        clusters=clusters,
-        intervals=MappingProxyType(intervals),
-        scores=tuple(int(s.correct) for s in samples),
-        cluster_ids=tuple(cluster_ids),
-        errors=(),
-        truncation_count=sum(int(s.limit_hit) for s in samples),
-        elapsed_seconds=round(elapsed, 6),
-        problems=problems,
-        runtime=MappingProxyType(runtime),
-    )
+    return generation_result(model, plan, problems, runtime=text_model.runtime.info(), batch_size=batch_size,
+                             elapsed=elapsed, usage=generation_usage(len(plan.rows), batches, steps, elapsed))
 
 
 def compare_generation(base: Any, candidate: Any) -> GenerationComparison:
@@ -509,6 +607,7 @@ def compare_generation(base: Any, candidate: Any) -> GenerationComparison:
         candidate={name: float(candidate.metrics[name]) for name in names}, differences=differences)
 
 
-__all__ = ["GenerationEvaluator", "SampleOutput", "TextModel", "compare_generation", "evaluate_generation",
-           "generate_samples", "generation_metrics", "load_text_model", "mean_interval", "model_stop_tokens",
-           "paired_mean_difference", "prompts_hash", "suite_parameters", "token_hash"]
+__all__ = ["GenerationEvaluator", "GenerationPlan", "SampleOutput", "TextModel", "compare_generation",
+           "encode_prompts", "evaluate_generation", "generate_samples", "generation_metrics", "generation_result",
+           "generation_usage", "load_text_model", "mean_interval", "model_stop_tokens", "paired_mean_difference",
+           "plan_generation", "prompts_hash", "run_problems", "suite_parameters", "token_hash"]

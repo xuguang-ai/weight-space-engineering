@@ -330,7 +330,7 @@ CORE_MODULES = (
     "wse.adapters.mlp, wse.adapters.families, wse.adapters.hf_causal_lm, wse.operators.base, "
     "wse.operators.tensor, wse.strategies.scripted, wse.engines, wse.engines.hf_torch, wse.patch_blocks, "
     "wse.external_patches, wse.evaluators.sampling, wse.evaluators.graders, wse.evaluators.text_suites, "
-    "wse.evaluators.generation"
+    "wse.evaluators.generation, wse.evaluators.generation_runs"
 )
 
 

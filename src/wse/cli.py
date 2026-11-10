@@ -10,7 +10,9 @@ stdio MCP server for one run grant; see ``wse.mcp_server``), ``wse worker``
 controller per run grant, then settlement and freezing; see ``wse.runner``),
 ``wse export`` (an experiment export; final-set data excluded by default),
 ``wse replay`` (replays an export's exact patches into the workspace and
-verifies byte-identical weights), and ``wse trials`` (per-trial summaries for
+verifies byte-identical weights), ``wse compare-generation`` (a resumable
+base-versus-candidate generation comparison on a seeded problem subset; see
+``wse.evaluators.generation_runs``), and ``wse trials`` (per-trial summaries for
 agent-acceptance reports). Every command calls the same Engine operations as
 the Python API and MCP.
 Reports print as JSON (machine-readable) or, with ``--format markdown``, as
@@ -25,6 +27,7 @@ import json
 import os
 import sys
 from collections.abc import Sequence
+from typing import Any
 
 from wse.schemas import ErrorCode, WSEError
 
@@ -126,7 +129,46 @@ def _parser() -> argparse.ArgumentParser:
     for command in (final, report):
         command.add_argument("--format", choices=("json", "markdown"), default="json")
         command.add_argument("--output", default=None, help="also write the rendering to this file")
+    compare = commands.add_parser(
+        "compare-generation",
+        help="evaluate a base and a candidate checkpoint on a seeded subset of a text dataset, resumably "
+             "(operator only; see wse.evaluators.generation_runs)")
+    compare.add_argument("--base", required=True, help="the base checkpoint ID")
+    compare.add_argument("--candidate", required=True, help="the candidate checkpoint ID")
+    compare.add_argument("--dataset", required=True, help="a JSON Lines file of problems")
+    compare.add_argument("--dataset-format", required=True, choices=["math500", "gsm8k", "math"],
+                         help="the file's format (wse.evaluators.text_suites)")
+    compare.add_argument("--id-prefix", default=None, help="the item-ID prefix for formats that number lines")
+    compare.add_argument("--problems", type=int, required=True, help="how many problems the subset holds")
+    compare.add_argument("--subset-seed", type=int, required=True, help="the seed that chooses the subset")
+    compare.add_argument("--profile", required=True, help="an exact generation profile, e.g. qwen35think@1")
+    compare.add_argument("--grader", required=True, help="an exact grader, e.g. math_boxed@1")
+    compare.add_argument("--samples", type=int, default=1, help="samples per problem (default 1)")
+    compare.add_argument("--max-new-tokens", type=int, default=None,
+                         help="override the profile's token limit (default: the profile's)")
+    compare.add_argument("--eval-seed", type=int, default=0, help="the evaluation seed (default 0)")
+    compare.add_argument("--device", choices=["mps", "cpu"], default=None,
+                         help="the device (default: mps when available)")
+    compare.add_argument("--batch-size", type=int, default=1, help="problems per batch (default 1)")
+    compare.add_argument("--out", required=True,
+                         help="the output directory (run.json, problems.jsonl, summary.json); outside the "
+                              "repository; an existing one resumes")
     return parser
+
+
+def _compare_generation(engine: Any, args: argparse.Namespace) -> None:
+    from wse.evaluators.generation_runs import run_comparison
+
+    def progress(line: str) -> None:
+        print(line, file=sys.stderr, flush=True)
+
+    summary = run_comparison(
+        engine, base=args.base, candidate=args.candidate, dataset=args.dataset, format=args.dataset_format,
+        id_prefix=args.id_prefix, count=args.problems, subset_seed=args.subset_seed, profile=args.profile,
+        grader=args.grader, samples_per_problem=args.samples, max_new_tokens=args.max_new_tokens,
+        eval_seed=args.eval_seed, device=args.device, batch_size=args.batch_size, out_dir=args.out, log=progress)
+    print(json.dumps({"comparison": summary["comparison"], "seconds": summary["seconds"],
+                      "generated_tokens": summary["generated_tokens"]}, indent=2, sort_keys=True))
 
 
 def _emit(value, fmt: str, output: str | None) -> None:
@@ -266,6 +308,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     with open(args.output, "w", encoding="utf-8") as handle:
                         handle.write(text)
                 sys.stdout.write(text)
+            elif args.command == "compare-generation":
+                _compare_generation(engine, args)
             elif args.command == "replay":
                 print(json.dumps(engine.replay_export(args.export_dir).model_dump(mode="json"), indent=2,
                                  sort_keys=True))
