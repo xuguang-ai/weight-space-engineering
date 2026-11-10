@@ -12,6 +12,11 @@ formats, and encoder-decoder models are rejected.
   must equal the parameter names of the ``transformers`` module; a registered
   family descriptor (``wse.adapters.families``) may map them and drop tensors
   the language model does not use. Each manifest entry records its module name.
+* **Roles (Level 1).** A family descriptor also names the semantic roles of
+  tensors and their head groupings, which read attributes of the
+  ``transformers`` configuration (``family_roles``). Import refuses a
+  descriptor whose roles do not fit the checkpoint; ``roles`` and ``family``
+  serve ``wse.adapters.families.model_roles`` and the edit protections.
 * **Axes come from module types, never from tensor names.** The module is
   instantiated on the meta device: an ``nn.Linear`` weight is ``[out_features,
   in_features]`` and its bias ``[out_features]``, an ``nn.Embedding`` weight is
@@ -38,7 +43,7 @@ wse`` and the registry work without the ``models-hf`` extra.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -54,7 +59,7 @@ from wse.adapters.base import (
     AdapterCapabilities,
     Architecture,
 )
-from wse.adapters.families import FamilyDescriptor, map_names, select_family
+from wse.adapters.families import FamilyDescriptor, TensorRole, map_names, select_family
 from wse.evaluators.sampling import profile_from_generation_config
 from wse.hf_snapshot import CONFIG_FILE, GENERATION_CONFIG_FILE, STORED_DTYPES, SnapshotReader, TensorHeader
 from wse.schemas import (
@@ -263,6 +268,21 @@ def module_layout(model_config: dict[str, Any], descriptor: FamilyDescriptor | N
     return ModuleLayout(type(module).__name__, parameters, unique, nominal)
 
 
+def family_roles(model_config: dict[str, Any], descriptor: FamilyDescriptor,
+                 tensors: Sequence[TensorInfo]) -> tuple[TensorRole, ...]:
+    """The roles of ``tensors`` under ``descriptor`` (``FamilyDescriptor.resolve_roles``).
+
+    Head groupings read their attributes from the ``transformers``
+    configuration that the module is built from (the text configuration of a
+    multimodal wrapper), so defaults the configuration class fills in, such as
+    Llama's ``head_dim``, apply as they do to the module's shapes.
+    """
+    if not descriptor.roles:
+        return ()
+    _, config = causal_lm_class(model_config, descriptor)
+    return descriptor.resolve_roles(tensors, {key: getattr(config, key, None) for key in descriptor.config_keys})
+
+
 # ---------------------------------------------------------------------------
 # Snapshot import
 # ---------------------------------------------------------------------------
@@ -354,6 +374,13 @@ def read_snapshot(
     if size > max_bytes:
         raise _invalid(f"the language-model tensors total {size} bytes; the limit is {max_bytes} bytes",
                        size_bytes=size, max_bytes=max_bytes)
+
+    if descriptor is not None:  # a descriptor whose roles do not fit the checkpoint is refused (INVALID_MODEL)
+        family_roles(model_config, descriptor, [
+            TensorInfo(name=by_module.get(module) or _canonical(descriptor, module), shape=list(parameter.shape),
+                       dtype=layout.nominal_dtype, axes=list(parameter.axes), element_count=_count(parameter.shape),
+                       module_name=module)
+            for module, parameter in layout.parameters.items()])
 
     loaded: dict[str, torch.Tensor] = {}
     for file in sorted({table[canonical].file for canonical in by_module.values()}):
@@ -474,6 +501,15 @@ class HFCausalLMAdapter:
     def canonical_config(self, config: Mapping[str, Any]) -> dict[str, Any]:
         self._parse(config)
         return dict(config)
+
+    def family(self, config: Mapping[str, Any]) -> FamilyDescriptor | None:
+        """The family descriptor that ``config`` records, resolved exactly; ``None`` at Level 0."""
+        return self._parse(config)[1]
+
+    def roles(self, config: Mapping[str, Any], tensors: Sequence[TensorInfo]) -> tuple[TensorRole, ...]:
+        """The roles of ``tensors`` (a manifest's or an architecture's) under the family ``config`` records."""
+        model_config, descriptor = self._parse(config)
+        return () if descriptor is None else family_roles(model_config, descriptor, tensors)
 
     def describe(self, config: Mapping[str, Any]) -> Architecture:
         model_config, descriptor = self._parse(config)

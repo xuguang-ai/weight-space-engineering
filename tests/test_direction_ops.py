@@ -301,7 +301,9 @@ def test_invalid_project_out_requests_are_refused(task_model, tensor, selection,
 
 def test_project_out_requires_an_output_by_input_layout(bf16_model):
     embed = "model.embed_tokens.weight"  # [64, 16] with axes (num_embeddings, embedding_dim)
-    error = _expect(ErrorCode.INVALID_ARGUMENT, _project, bf16_model, embed, _sel((0, 64), (0, 16)),
+    # llama@1 protects the embedding (Task 8); the same weights at Level 0 have no protected role.
+    level0 = load_model(bf16_model.tensors(), "hf_causal_lm@1", {**bf16_model.config, "family": None})
+    error = _expect(ErrorCode.INVALID_ARGUMENT, _project, level0, embed, _sel((0, 64), (0, 16)),
                     direction=[1.0] * 64, columns=[0])
     assert "out_features" in error.message
 

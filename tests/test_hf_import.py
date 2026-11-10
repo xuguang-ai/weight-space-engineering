@@ -414,7 +414,10 @@ def test_llama_style_checkpoints_import_without_a_descriptor(snapshots, engine, 
 
     snapshot = snapshots[name]
     manifest = _import(engine, snapshot)
-    assert manifest.source.family is None and manifest.config["family"] is None
+    # Llama checkpoints select llama@1 (Task 8), which adds roles and protections but no name map.
+    family = "llama@1" if name.startswith("llama") else None
+    assert manifest.config["family"] == family
+    assert manifest.source.family == (None if family is None else ExtensionRef.parse(family))
     assert manifest.source.dropped_tensor_count == 0
     config_json = json.loads((snapshot / "config.json").read_text())
     config = transformers.AutoConfig.for_model(**config_json)
@@ -437,14 +440,15 @@ def test_llama_style_checkpoints_import_without_a_descriptor(snapshots, engine, 
 
 
 def test_family_descriptors_register_by_exact_version():
-    from wse.adapters.families import QWEN3_5, FamilyDescriptor, PrefixRule, select_family
+    from wse.adapters.families import LLAMA, QWEN3_5, FamilyDescriptor, PrefixRule, select_family
     from wse.registry import Registry, builtin_registry
 
     registry = builtin_registry()
-    assert registry.list("family") == [ExtensionRef.parse("qwen3_5@1")]
+    assert registry.list("family") == [ExtensionRef.parse("llama@1"), ExtensionRef.parse("qwen3_5@1")]
     assert registry.resolve("family", "qwen3_5", "1") is QWEN3_5
     assert select_family(registry, "qwen3_5") == (ExtensionRef.parse("qwen3_5@1"), QWEN3_5)
-    assert select_family(registry, "llama") is None
+    assert select_family(registry, "llama") == (ExtensionRef.parse("llama@1"), LLAMA)
+    assert select_family(registry, "qwen3") is None
     _expect_error(ErrorCode.INVALID_ARGUMENT, Registry().register, "family", "qwen3_5", "1", object())
     _expect_error(ErrorCode.INVALID_ARGUMENT, Registry().register, "family", "other", "1", QWEN3_5)
     second = FamilyDescriptor(family_id="qwen3_5", version="2", model_types=["qwen3_5"], text_config_key="text_config",

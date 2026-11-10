@@ -26,6 +26,11 @@ record a binary block (``wse.patch_blocks``, M2 plan Section 3.3), whose bytes
 travel next to the patch in ``EditResult.blocks`` and in binary patch files.
 M1's limit on elements per patch counts inline values and inline
 ``set_slice`` values, not operator results recorded as blocks.
+
+Every edit refuses members of an alias group (``UNSUPPORTED_CAPABILITY``) and,
+first, tensors whose role the model's family descriptor protects
+(``POLICY_DENIED``, ``wse.policy.require_unprotected``). Replay writes a
+recorded patch as recorded and checks no protection.
 """
 
 from __future__ import annotations
@@ -40,10 +45,11 @@ import torch
 from pydantic import BaseModel
 
 from wse.adapters.base import CAP_WEIGHTS_READ, CAP_WEIGHTS_SLICE_EDIT
+from wse.adapters.families import model_family
 from wse.operators.base import TensorRegion
 from wse.patch_blocks import apply_block, make_block
 from wse.operators.tensor import shortest_floats
-from wse.policy import OperationPolicy, default_operation_policy, require_capabilities
+from wse.policy import OperationPolicy, default_operation_policy, require_capabilities, require_unprotected
 from wse.schemas import (
     AxisSlice,
     ErrorCode,
@@ -251,6 +257,9 @@ def _edit_step(
     capabilities = model.adapter.capabilities()
     require_capabilities(capabilities, operator.spec, adapter=str(model.adapter_ref), always=_EDIT_CAPABILITIES)
     info = _info(model, tensor)
+    # Protected roles of the model's family descriptor are refused by every policy, before the
+    # operator sees its parameters (M2 plan Section 5.1).
+    require_unprotected(info.name, model_family(model))
     # Adapters with shared parameters list every alias group in their architecture
     # (AdapterCapabilities.shared_parameters); only members of a group are refused.
     if any(info.name in group for group in model.architecture.alias_groups):

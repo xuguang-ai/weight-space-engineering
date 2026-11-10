@@ -21,13 +21,19 @@ framing, so a result may use at most ``max_inline_json_bytes`` less
 keeps the largest permitted response within 64 KiB. Explicit top-k values satisfy
 ``1 <= k <= min(64, element_count)``; an omitted ``k`` resolves to
 ``min(16, element_count)``.
+
+Protections (M2 plan Sections 2.2, 5.1, and 5.5): every policy refuses edits
+of a tensor whose role the model's family descriptor protects
+(``require_unprotected``, ``POLICY_DENIED``), and edits of alias-group members
+(``wse.patches``). Protections are the descriptor's data, not policy fields,
+so the built-in policies and their hashes are unchanged.
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import Field, model_validator
 
@@ -42,6 +48,9 @@ from wse.schemas import (
     canonical_json,
     json_hash,
 )
+
+if TYPE_CHECKING:
+    from wse.adapters.families import FamilyDescriptor
 
 MAX_READ_ELEMENTS = 2048
 MAX_INLINE_JSON_BYTES = 32 * 1024
@@ -159,6 +168,36 @@ def require_capabilities(
             f"operator {spec.ref} requires capabilities {missing} that adapter {adapter} does not support",
             details={"operator": str(spec.ref), "adapter": adapter, "missing_capabilities": missing},
         )
+
+
+def require_unprotected(tensor: str, family: FamilyDescriptor | None) -> None:
+    """Refuse an edit of ``tensor`` when its role is one that ``family`` protects (``POLICY_DENIED``).
+
+    Every policy applies the protections of the model's family descriptor,
+    whatever operator, policy, or entry point runs the edit. A model without a
+    descriptor (Level 0 or M1) has no roles and so no protected tensors. An
+    operator who needs to edit a protected role registers a descriptor version
+    without that protection and imports the snapshot with it; the new version
+    is recorded in the model's identity.
+    """
+    if family is None:
+        return
+    found = family.protected_role(tensor)
+    if found is None:
+        return
+    role, layer = found
+    protected = sorted(family.protected_roles)
+    editable = sorted({rule.role for rule in family.roles} - set(protected))
+    where = "" if layer is None else f" (layer {layer})"
+    advice = (f"Edit a tensor of an unprotected role instead: {', '.join(editable)}" if editable
+              else "Every role of this family is protected")
+    raise WSEError(
+        ErrorCode.POLICY_DENIED,
+        f"edits of tensor {tensor!r} are refused: its role {role}{where} is protected by family {family.ref}, "
+        f"which protects {', '.join(protected)}. {advice}.",
+        details={"tensor": tensor, "role": role, "layer": layer, "family": str(family.ref),
+                 "protected_roles": protected, "editable_roles": editable},
+    )
 
 
 def json_size(payload: Mapping[str, Any]) -> int:
