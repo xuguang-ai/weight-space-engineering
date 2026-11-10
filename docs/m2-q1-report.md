@@ -5,12 +5,12 @@ This report covers Task 7 of the [M2 plan](../agentic-weight-space-engineering-m
 - the measurements from the operator's Mac;
 - the exact replay of the article's published edits;
 - Llama-3.2-1B-Instruct through Level 0 with no new code;
-- the pilot of the base-versus-p50c comparison;
+- the pilot of the base-versus-p50c comparison, and the 25-problem comparison itself;
 - cost estimates for the three protocols of Section 4.4.
 
-The 25-problem base-versus-p50c comparison is prepared but has not run yet. Section 6 gives its exact command and expected duration and leaves space for its results. The decision gate (Section 8) is the user's.
+The 25-problem base-versus-p50c comparison ran from 19:31 EST on 2026-11-09 to 01:36 EST on 2026-11-10. It moved in the article's direction (Section 6). The decision gate (Section 8) is the user's.
 
-Status on 2026-11-09: preparation done. The comparison and the decision gate are open.
+Status on 2026-11-10: every Task 7 run is done. The decision gate and Task 7's review are open.
 
 ## 1. Environment
 
@@ -97,7 +97,8 @@ Findings:
 - **Not measured: decode at batch 8 with a 32,768-token context.** Prefilling 8 rows of 30,000 tokens would need far more attention memory than a real run, whose prompts are about 250 tokens. The estimates below therefore extrapolate:
   - the batch-1 slope from 4,096 to 30,000 tokens is +0.23 ms per 1,000 tokens;
   - for 8 rows, assumed to grow eight times, it is +1.8 ms per 1,000 tokens;
-  - this gives about 118 ms per step at 32,768 tokens, and a mean of about 90 ms per step over a full-length generation (from 61 ms).
+  - this gives about 118 ms per step at 32,768 tokens, and a mean of about 90 ms per step over a full-length generation (from 61 ms);
+  - measured afterwards (Section 6): full-length chunks of 8 took 94.9–108.4 ms per step, 100.8 ms on average, about 12% above this extrapolation.
 
 ## 3. Replay of the Published Edits (Task 5)
 
@@ -203,9 +204,9 @@ Pilot settings:
 - **Prompts and configuration:** both checkpoints used the same prompt hashes, seeds, and evaluator configuration (`sha256:17f47446b122e9ff4ea5b8f4b7ce52686efda2069576a24e86039ba74cc2e259`).
 - **Restart:** rerunning the command found everything recorded and finished in 9.8 s without generating.
 
-## 6. Base Versus p50c on 25 MATH-500 Problems (to be run)
+## 6. Base Versus p50c on 25 MATH-500 Problems
 
-The orchestrator runs this comparison after this batch, with these settings:
+The comparison ran with these settings:
 
 - 25 problems chosen by subset seed 0 (`sha256_rank@1`);
 - 1 sample each, `qwen35think@1` at its full 32,768-token limit;
@@ -238,6 +239,8 @@ uv run --no-sync wse --workspace "$W" compare-generation --base "$BASE" --candid
 
 Progress goes to `$OUT.log`, one line per finished (checkpoint, problem). Results are written to `$OUT/summary.json`.
 
+The run used `W=/Users/xai/Desktop/wse-models/workspaces/q1` and `OUT=/Users/xai/Desktop/wse-models/runs/q1-math500-25-seed0`, under `caffeinate -is` so that the Mac did not sleep. It ran as one process, from 2026-11-10T00:31:07Z to 06:36:17Z, with no interruption or restart.
+
 **Expected duration: about 5.5 hours (range 4.5–6.5 hours).** The estimate:
 
 - The 25 problems form chunks of 8, 8, 8, and 1 per checkpoint.
@@ -259,53 +262,95 @@ With 25 single samples and a different engine, the size of the change is not exp
 
 ### Results
 
-To be filled in from `$OUT/summary.json` after the run:
+The numbers come from `$OUT/summary.json`. They were also recomputed from `$OUT/problems.jsonl`: re-grading the 50 stored outputs with `math_boxed@1` reproduced every recorded grade, and every limit hit is an unfinished output of 32,768 tokens.
 
-| Metric | Base | p50c | Paired difference (95% cluster bootstrap) | Exact intervals |
-| --- | --- | --- | --- | --- |
-| Accuracy | | | | |
-| Limit-hit rate | | | | |
-| Mean generated tokens | | | | – |
+| Metric | Base | p50c | Paired difference, p50c − base (95% cluster bootstrap) | Exact 95% intervals (Clopper-Pearson) |
+| --- | ---: | ---: | --- | --- |
+| Accuracy | 12% (3/25) | 52% (13/25) | +0.40 [+0.16, +0.60] | base [0.025, 0.312]; p50c [0.313, 0.722] |
+| Limit-hit rate | 92% (23/25) | 36% (9/25) | −0.56 [−0.76, −0.32] | base [0.740, 0.990]; p50c [0.180, 0.575] |
+| Mean generated tokens | 30,824 | 21,554 | −9,270 [−13,854, −4,753] | – |
 
-Also to be filled in:
+The bootstrap resamples problems 10,000 times with seed 0.
 
-- elapsed time per checkpoint;
-- generated tokens per checkpoint;
-- the evaluator configuration hash;
-- whether the change has the article's direction.
+**Direction.** The change has the article's direction on both measures, and both paired intervals exclude zero. Per problem:
+
+| | p50c correct | p50c wrong |
+| --- | ---: | ---: |
+| **Base correct** | 2 | 1 |
+| **Base wrong** | 11 | 11 |
+
+An exact two-sided sign test on the 12 discordant problems (11 against 1) gives p = 0.0063. Each of the article's four values (7.9%, 48.1%, 93.0%, 33.1%; `exp8_math/README.md`) lies inside the matching exact interval above. With 25 problems, the run cannot tell whether the size of the change matches.
+
+**Outcomes**, in the categories of the article's `mathqa.diagnostics`:
+
+| Outcome | Base | p50c |
+| --- | ---: | ---: |
+| Correct | 3 | 13 |
+| Finished with a wrong boxed answer | 0 | 1 |
+| Finished without a boxed answer | 0 | 2 |
+| Cut at the limit, not correct | 22 | 9 |
+
+- One base answer, `test/algebra/1960.json`, reached the limit and still counts as correct: its last `\boxed{9}` sits inside a thinking block that never closed. The article's `evaluate.py` grades cut answers the same way, calling `Q.extract` on every output whatever its finish reason.
+- The base closed its thinking block (`</think>`) in 3 of 25 outputs, and 22 of its 23 cut answers never left thinking. p50c closed it in 19 of 25, and 6 of its 9 cut answers never left thinking.
+
+**Time and tokens.**
+
+| Checkpoint | Generation time | Generated tokens | Chunk times (s) |
+| --- | ---: | ---: | --- |
+| base | 10,995 s (3.05 h) | 770,598 | 3,214; 3,224; 3,462; 1,094 |
+| p50c | 10,912 s (3.03 h) | 538,857 | 3,108; 3,552; 3,249; 1,003 |
+
+- The whole run took 6 h 5 min (21,918 s of wall-clock time), against the estimate of 5.5 h (range 4.5–6.5 h).
+- All six chunks of 8 ran the full 32,768 steps, as expected. They took 94.9–108.4 ms per step, 100.8 ms on average, instead of the extrapolated 90 ms. Chunks of identical length differed by up to 14% in step time; the cause was not measured.
+- The single-row chunks took 33.4 ms per step (base, 32,768 steps) and 33.1 ms (p50c, 30,311 steps), as assumed.
+
+**Identities.** Both checkpoints were evaluated under the same:
+
+- evaluator configuration, `sha256:f3ef721d9cef4326aff898c7cd73128a30579e15baffa4a55da9e3b1c9355cda`;
+- prompts, `sha256:f200d94d0234e1432cba00d199d3c11928ea9c0bed5d6d25896a632bd9b69301`;
+- profile, `sha256:c4bf7159c15ef0c9de4a5a096f1e81478381023b0095d9a3ec6b439e693ce85b`;
+- subset (`subset_25_seed_0`), data hash `sha256:6a6eb9708748677ece795bede12812cb9c62fffa432333d4fb4030ff3c8940df`.
+
+The candidate's `weights_hash`, `sha256:b8dccf8ca463a97d9f6a783651f17b02fecdd740b154bb5ca53983e39852259f`, is the p50c hash of Section 3. `summary.json` lists the 25 item IDs and their positions in `test.jsonl`.
 
 ## 7. Cost Estimates for the Protocols of Section 4.4
 
 All figures are for this Mac on MPS at batch size 8, under these assumptions:
 
 - per-row seeds keep results independent of the batch;
-- a chunk of 8 runs about 49 min, because nearly every chunk contains a row that reaches the limit;
+- a chunk of 8 runs about 55 min, the mean of the six chunks measured in Section 6 (51.8–59.2 min), because nearly every chunk contains a row that reaches the limit;
 - the CPU is not an option for Qwen3.5 (Section 2).
 
 | Protocol | Samples per checkpoint | Time per checkpoint | Base + p50c | Q3 final suite (12 checkpoints: base, p50c, 5 random controls, 5 trials) |
 | --- | ---: | ---: | ---: | ---: |
-| 25 problems × 1 sample (Section 6) | 25 | ≈ 2.7 h | ≈ 5.5 h | ≈ 33 h |
-| 100 problems × 1 sample | 100 | ≈ 10.6 h (13 chunks) | ≈ 21 h | ≈ 5.3 days |
-| Full MATH-500 × 4 samples, 32,768 tokens | 2,000 | ≈ 8.5 days (250 chunks; ≈ 62 M tokens for the base at ≈ 89 tokens/s) | ≈ 17 days | ≈ 100 days |
+| 25 problems × 1 sample (Section 6) | 25 | 3.0 h (measured) | 6.1 h (measured) | ≈ 36 h |
+| 100 problems × 1 sample | 100 | ≈ 11.5 h (13 chunks) | ≈ 23 h | ≈ 6 days |
+| Full MATH-500 × 4 samples, 32,768 tokens | 2,000 | ≈ 9.6 days (250 chunks; ≈ 62 M tokens for the base at ≈ 75 tokens/s) | ≈ 19 days | ≈ 115 days |
 
-For reference, the article's re-run of the edited model under the full protocol took about 51 minutes on one H200 with vLLM, for 43.4 million generated tokens. That is about 14,000 tokens/s, roughly 160 times this Mac's measured aggregate.
+For reference, the article's re-run of the edited model under the full protocol took about 51 minutes on one H200 with vLLM, for 43.4 million generated tokens. That is about 14,000 tokens/s, roughly 190 times the 74.5 tokens/s that the base's full chunks reached in Section 6.
 
-The Q2 generation passes of policy `qwen_loop_v1` allow at most 32 practice problems at 8,192 new tokens each, so each pass needs at most 4 chunks of 8 × 8,192 steps. Starting from 61 ms per step, it takes about 4 × 8,192 × 70 ms ≈ 38 min. Ten such passes per run would take about 6.4 hours, more than the policy's 6-hour computation limit, which Task 13 may need to reconcile.
+The Q2 generation passes of policy `qwen_loop_v1` allow at most 32 practice problems at 8,192 new tokens each, so each pass needs at most 4 chunks of 8 × 8,192 steps. Starting from 61 ms per step, it takes about 4 × 8,192 × 70 ms ≈ 38 min. Ten such passes per run would take about 6.4 hours, more than the policy's 6-hour computation limit, which Task 13 may need to reconcile. The 70 ms is not measured, and Section 6 found the full-length extrapolation 12% low.
 
 ## 8. Decision Gate (user)
 
 Q3's final evaluation can run in one of two ways:
 
-- **Locally on a subset:** about 33 hours on this Mac for 12 checkpoints × 25 problems × 1 sample. About 5.3 days at 100 problems.
+- **Locally on a subset:** about 36 hours on this Mac for 12 checkpoints × 25 problems × 1 sample, from the times measured in Section 6. About 6 days at 100 problems.
 - **On a GPU worker:** a vLLM worker, inserted as its own task before Task 13. Section 10 of the plan defers GPU workers to M3 unless this gate brings one forward.
 
 Locally, the full protocol (Section 7) is out of reach. The choice is the user's and is not made here.
 
 ## 9. Open Items From Q1
 
-- **Pending:** the 25-problem comparison (Section 6) and its results, then the Q1 exit check of Section 1.
+- **Q1 exit (plan Section 1):**
+  - the replay condition holds (Section 3);
+  - the comparison condition now holds (Section 6);
+  - Section 4 reports the Llama condition as met: import, logits parity, a byte-identical patch round trip, and a completed GSM8K evaluation, with no Llama-specific code.
+
+  Task 7's review confirms the exit.
 - **Needs the plan author's decision:** for Llama-3.2-1B-Instruct, `gsm8k_numeric@1` scores 0 of 25 because the model never writes `\boxed{}`. One option is a numeric fallback (the last number) in a new grader version, with the profile unchanged. The other is to keep the strict grader and report the format failure.
 - **Not yet supported:** M1's experiment export and `wse replay` do not carry open-weight base models (bundle size limit and format). Patch-level replay works and is byte-identical (Section 4).
+- **Measured since Section 2:** decode at batch 8 over full-length generations took 94.9–108.4 ms per step (Section 6). Section 7 uses these times.
 - **Not measured:**
-  - decode at batch 8 with a long context. The duration estimates extrapolate it (Section 2) and should be checked against the elapsed times of Section 6.
-  - per-step time at batch sizes between 8 and 32.
+  - per-step time at batch sizes between 8 and 32;
+  - why step times differed by up to 14% between chunks of identical length (Section 6).
