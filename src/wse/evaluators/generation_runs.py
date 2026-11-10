@@ -232,7 +232,7 @@ def _check_configuration(out: Path, recorded: Any, configuration: Mapping[str, A
     raise _invalid(f"{message}; use a new output directory", differing=differing, **details)
 
 
-def _result_summary(result: EvaluationResult) -> dict[str, Any]:
+def result_summary(result: EvaluationResult) -> dict[str, Any]:
     """A checkpoint's result in ``summary.json``.
 
     It holds the metrics, intervals, identities, configuration hash, split,
@@ -420,7 +420,7 @@ def run_comparison(
     comparison = compare_generation(results["base"], results["candidate"])
     summary = {
         "configuration": configuration,
-        "results": {label: _result_summary(results[label]) for label in LABELS},
+        "results": {label: result_summary(results[label]) for label in LABELS},
         "comparison": comparison.model_dump(mode="json"),
         "generated_tokens": {label: sum(s.generated_tokens for p in results[label].problems or () for s in p.samples)
                              for label in LABELS},
@@ -431,5 +431,5 @@ def run_comparison(
     return summary
 
 
-__all__ = ["LABELS", "PROBLEMS_FILE", "RUN_FILE", "SUMMARY_FILE", "read_log", "run_comparison", "select_subset",
-           "subset_suite"]
+__all__ = ["LABELS", "PROBLEMS_FILE", "RUN_FILE", "SUMMARY_FILE", "read_log", "result_summary", "run_comparison",
+           "select_subset", "subset_suite"]

@@ -1,7 +1,9 @@
 """Weight-space engineering: inspect, edit, and evaluate neural network weights.
 
-The core works in memory through ``load_model``; ``Engine`` adds managed,
-persistent storage. Neither imports MCP or any agent SDK.
+``WSE`` is the high-level entry point for open-weight language models
+(``wse.highlevel``). Beneath it, the core works in memory through
+``load_model``, and ``Engine`` adds managed, persistent storage. None of them
+imports MCP or any agent SDK.
 """
 
 from wse.analysis import analyze_tensor, read_tensor_slice
@@ -15,6 +17,7 @@ from wse.api import (
     load_model,
     read_bundle,
 )
+from wse.highlevel import WSE, Comparison, Edit
 from wse.patches import materialize_patch, replay_patch
 from wse.policy import (
     BudgetLimits,
@@ -54,8 +57,10 @@ __version__ = "0.1.0"
 __all__ = [
     "AnalysisResult",
     "BudgetLimits",
+    "Comparison",
     "ComparisonReport",
     "DatasetManifest",
+    "Edit",
     "EditResult",
     "Engine",
     "ErrorCode",
@@ -81,6 +86,7 @@ __all__ = [
     "SuiteData",
     "TaskDefinition",
     "TensorSlice",
+    "WSE",
     "WSEError",
     "analyze_tensor",
     "apply_operator",

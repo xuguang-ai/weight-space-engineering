@@ -29,9 +29,9 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
+from wse.highlevel import default_workspace
 from wse.schemas import ErrorCode, WSEError
 
-DEFAULT_WORKSPACE = "workspace"
 TEST_DOUBLE = "wse-test-double:"
 
 
@@ -39,7 +39,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="wse", description="Weight-space engineering operator CLI")
     parser.add_argument(
         "--workspace",
-        default=os.environ.get("WSE_WORKSPACE", DEFAULT_WORKSPACE),
+        default=str(default_workspace()),
         help="workspace directory holding artifacts/ and metadata.sqlite "
         "(default: $WSE_WORKSPACE or ./workspace)",
     )
