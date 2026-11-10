@@ -229,7 +229,8 @@ def builtin_registry() -> Registry:
     M1's extensions, plus the generic Hugging Face causal-LM adapter
     ``hf_causal_lm@1``, the built-in family descriptors, the generation
     evaluator ``generation@1``, the profile ``qwen35think@1``, and the graders
-    ``math_boxed@1`` and ``gsm8k_numeric@1`` (M2). None of them imports
+    ``math_boxed@1`` and ``gsm8k_numeric@1``, and the edit operator
+    ``project_out@1`` (M2). None of them imports
     ``transformers`` or ``math_verify`` until it is used.
     """
     from wse.adapters.families import BUILTIN_FAMILIES
@@ -240,6 +241,7 @@ def builtin_registry() -> Registry:
     from wse.evaluators.generation import GenerationEvaluator
     from wse.evaluators.graders import BUILTIN_GRADERS
     from wse.evaluators.sampling import BUILTIN_PROFILES
+    from wse.operators.directions import BUILTIN_DIRECTION_EDITS
     from wse.operators.tensor import BUILTIN_ANALYSES, BUILTIN_EDITS
     from wse.strategies.scripted import ScriptedSearchStrategy
 
@@ -251,7 +253,7 @@ def builtin_registry() -> Registry:
     registry.register("adapter", hf_adapter.adapter_id, hf_adapter.version, hf_adapter)
     for descriptor in BUILTIN_FAMILIES:
         registry.register("family", descriptor.family_id, descriptor.version, descriptor)
-    for operator in [*BUILTIN_ANALYSES.values(), *BUILTIN_EDITS.values()]:
+    for operator in [*BUILTIN_ANALYSES.values(), *BUILTIN_EDITS.values(), *BUILTIN_DIRECTION_EDITS.values()]:
         registry.register("operator", operator.spec.operator_id, operator.spec.version, operator)
     for evaluator in (ForwardBatchEvaluator(), ClassificationEvaluator(), GenerationEvaluator()):
         registry.register("evaluator", evaluator.evaluator_id, evaluator.version, evaluator)
