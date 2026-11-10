@@ -14,7 +14,10 @@
   ``cpu``, or the device a caller names. Bitwise reproducibility holds within
   one device and library version, not across them (M1 plan Section 7.3).
 * **Forward.** ``logits`` returns float32 next-token logits for every
-  position of a batch of token IDs.
+  position of a batch of token IDs. ``next_token_logprobs`` is a
+  teacher-forced read of one sequence: the log-probability of each of its own
+  next tokens, reduced on the device in chunks of ``LOGPROB_CHUNK`` positions,
+  so that only one chunk of the float32 log-softmax exists at a time.
 * **Positions.** Position IDs come from the attention mask, as
   ``transformers``' ``generate`` derives them: the cumulative sum of the mask
   minus one, with masked positions set to 0, at prefill (and in ``logits``),
@@ -50,6 +53,9 @@ if TYPE_CHECKING:
     from wse.adapters.families import FamilyDescriptor
 
 DEVICES = ("mps", "cpu")
+# Positions per float32 log-softmax in next_token_logprobs: 256 rows of a 248,320-token vocabulary
+# (Qwen3.5) are 254 MB.
+LOGPROB_CHUNK = 256
 LogitsProcessor = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
@@ -261,6 +267,35 @@ class HFTorchModel:
         with torch.inference_mode():
             output = self._forward(input_ids, attention_mask, last_only=False, position_ids=positions)
             return output.logits.to(device="cpu", dtype=torch.float32, copy=True)
+
+    def next_token_logprobs(self, input_ids: torch.Tensor, *, start: int = 0) -> torch.Tensor:
+        """Teacher-forced log-probabilities of one sequence's own next tokens: float32 ``[n - 1 - start]`` on the CPU.
+
+        ``input_ids`` is one unpadded sequence ``[1, n]``. Element ``k`` is
+        ``log p(input_ids[0, t + 1] | input_ids[0, :t + 1])`` at ``t = start + k``,
+        for ``start <= t < n - 1``: the ``log_softmax`` of position ``t``'s
+        logits widened to float32, the values ``logits`` returns, so the two
+        agree bitwise on one device. The forward covers all ``n`` positions
+        once, without a cache, under inference mode; forward hooks registered
+        on ``module`` (activation probes, ``wse.probes``) see exactly this
+        forward. The logits stay on the device in the module's dtype and are
+        reduced in chunks of ``LOGPROB_CHUNK`` positions.
+        """
+        input_ids, _ = self._check(input_ids, None)
+        if input_ids.shape[0] != 1:
+            raise _invalid_argument("next_token_logprobs reads one sequence: input_ids must have shape [1, sequence]")
+        length = int(input_ids.shape[1])
+        if isinstance(start, bool) or not isinstance(start, int) or not 0 <= start < length:
+            raise _invalid_argument(f"start must be an integer in [0, {length})", start=str(start))
+        with torch.inference_mode():
+            logits = self._forward(input_ids, None, last_only=False).logits[0]
+            targets = input_ids[0, start + 1:].to(logits.device)
+            pieces = [torch.empty(0, dtype=torch.float32, device=logits.device)]
+            for low in range(start, length - 1, LOGPROB_CHUNK):
+                high = min(low + LOGPROB_CHUNK, length - 1)
+                rows = torch.log_softmax(logits[low:high].to(torch.float32), dim=-1)
+                pieces.append(rows.gather(1, targets[low - start:high - start, None])[:, 0])
+            return torch.cat(pieces).to(device="cpu", dtype=torch.float32, copy=True)
 
     # -- generation -----------------------------------------------------------
 
