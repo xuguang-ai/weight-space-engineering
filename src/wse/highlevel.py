@@ -52,9 +52,10 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+import numpy as np
 import torch
 
-from wse.api import Engine, ModelHandle, apply_operator
+from wse.api import Engine, EvaluationResult, ModelHandle, apply_operator
 from wse.schemas import (
     ErrorCode,
     EvalConfig,
@@ -66,7 +67,7 @@ from wse.schemas import (
     WSEError,
 )
 
-__all__ = ["OPERATORS", "WORKSPACE_ENV", "Comparison", "Edit", "WSE", "default_workspace"]
+__all__ = ["OPERATORS", "WORKSPACE_ENV", "Comparison", "Edit", "Evaluation", "Probe", "WSE", "default_workspace"]
 
 WORKSPACE_ENV = "WSE_WORKSPACE"
 DEFAULT_WORKSPACE = "workspace"
@@ -280,6 +281,92 @@ class Comparison:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True, eq=False)
+class Evaluation:
+    """A generation evaluation with every sample's output: the input of a probe of the model's own answers.
+
+    ``result`` is the ``EvaluationResult`` (metrics, intervals, per-problem
+    samples, identities). ``outputs`` holds each sample's ``SampleOutput``
+    (generated token IDs, text, whether it finished), in plan order, and
+    ``prompts`` the rendered prompt's token IDs of each problem index.
+    """
+
+    result: EvaluationResult
+    outputs: tuple[Any, ...]
+    prompts: Mapping[int, tuple[int, ...]]
+    max_new_tokens: int
+
+    @property
+    def metrics(self) -> Mapping[str, float]:
+        return self.result.metrics
+
+    def limit_hit(self) -> list[int]:
+        """Indices into ``outputs`` of the samples that reached the token limit without finishing."""
+        return [k for k, o in enumerate(self.outputs) if not o.finished and len(o.tokens) >= self.max_new_tokens]
+
+    def finished(self) -> list[int]:
+        """Indices into ``outputs`` of the samples that ended with a stop token."""
+        return [k for k, o in enumerate(self.outputs) if o.finished]
+
+    def probe_texts(self, *, last: int | None = None) -> list[Any]:
+        """One ``ProbeText`` per output: its prompt and output tokens, averaged over the output.
+
+        With ``last``, the window is the output's last ``last`` tokens (all of
+        them when it is shorter); the forward still reads the whole prompt and
+        output before them, so every position has its full context.
+        """
+        from wse.probes import ProbeText
+
+        if last is not None and (isinstance(last, bool) or not isinstance(last, int) or last < 1):
+            raise _invalid("last must be a positive integer")
+        texts = []
+        for output in self.outputs:
+            tokens = tuple(self.prompts[output.index]) + tuple(output.tokens)
+            size = len(output.tokens) if last is None else min(last, len(output.tokens))
+            texts.append(ProbeText(tokens, start=len(tokens) - size, stop=len(tokens)))
+        return texts
+
+    def table(self) -> str:
+        """Each metric with its 95% interval."""
+        lines = [f"{self.result.sample_count} problems, {len(self.outputs)} samples"]
+        for name in ("accuracy", "limit_hit_rate", "mean_generated_tokens"):
+            interval = self.result.intervals.get(name)
+            digits = 1 if name == "mean_generated_tokens" else 3
+            bounds = f" [{interval.lower:.{digits}f}, {interval.upper:.{digits}f}]" if interval is not None else ""
+            lines.append(f"{name:<24}{self.metrics[name]:>10.{digits}f}{bounds}")
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True, eq=False)
+class Probe:
+    """A probe's result (``wse.probes.ProbeResult``) that also answers to the site names it was asked with.
+
+    ``names`` maps each requested site name to its canonical site; the result
+    records canonical sites only.
+    """
+
+    result: Any
+    names: Mapping[str, str]
+
+    def _canonical(self, site: str) -> str:
+        return self.names.get(site, site)
+
+    def means(self, site: str) -> np.ndarray:
+        """Per-text window means of ``site``: float64 ``[texts, features]``."""
+        canonical = self._canonical(site)
+        if canonical not in self.result.means:
+            raise WSEError(ErrorCode.NOT_FOUND, f"this probe holds no site {site!r}",
+                           details={"site": site, "candidates": list(self.names)})
+        return self.result.means[canonical]
+
+    def group_mean(self, site: str, indices: Sequence[int]) -> np.ndarray:
+        return self.result.group_mean(self._canonical(site), indices)
+
+    def contrast(self, site: str, group_a: Sequence[int], group_b: Sequence[int]) -> Any:
+        """The contrast of ``site`` between two groups of texts (``wse.probes.ProbeResult.contrast``)."""
+        return self.result.contrast(self._canonical(site), group_a, group_b)
+
+
 # ---------------------------------------------------------------------------
 # The entry point
 # ---------------------------------------------------------------------------
@@ -427,6 +514,24 @@ class WSE:
         """A copy of the tensor named ``name`` (short names allowed, see ``name``)."""
         return self.handle.tensor(self.name(name))
 
+    def roles(self) -> tuple[Any, ...]:
+        """The semantic roles of this model's tensors (``wse.adapters.families.model_roles``); none at Level 0."""
+        from wse.adapters.families import model_roles
+
+        return model_roles(self.handle)
+
+    def role(self, role: str, layer: int | None = None) -> Any:
+        """The tensor that holds ``role`` in ``layer``, for example ``role("mlp.down", 15)``.
+
+        It is a ``TensorRole``: ``.tensor`` is an edit target, ``.site`` the
+        module for probe sites (``.site + ":input"``), and ``.protected`` tells
+        whether every edit of it is refused. Model-wide roles (``embed``,
+        ``lm_head``, ``final_norm``) take no layer.
+        """
+        from wse.adapters.families import role_tensor
+
+        return role_tensor(self.handle, role, layer)
+
     def target(self, target: str) -> tuple[str, list[dict[str, int]]]:
         """Resolve ``"<name>[<index>]"`` to the canonical tensor name and an explicit selection.
 
@@ -452,6 +557,73 @@ class WSE:
                            target=target, shape=shape)
         entries += [":"] * (len(shape) - len(entries))
         return tensor, [_index(entry, size, axis, target) for axis, (entry, size) in enumerate(zip(entries, shape))]
+
+    def site(self, site: str) -> str:
+        """The canonical probe site for ``site``: ``residual:<i>``, or ``<module>:input`` / ``<module>:output``.
+
+        ``<module>`` is a canonical module path (``wse.probes.module_paths``)
+        or a unique dotted suffix of one, as for tensor names.
+        """
+        from wse.probes import module_paths
+
+        if not isinstance(site, str) or not site.strip():
+            raise _invalid("a site must be a nonempty string such as 'layers.15.mlp.down_proj:input' or 'residual:15'")
+        if site.startswith("residual:"):
+            return site
+        path, colon, point = site.rpartition(":")
+        if not colon or point not in ("input", "output") or not path:
+            raise _invalid(f"site {site!r} must be 'residual:<i>' or '<module>:input' or '<module>:output'",
+                           site=site)
+        paths = list(module_paths(self.handle))
+        found = [p for p in paths if p == path or p.endswith("." + path)]
+        if len(found) == 1:
+            return f"{found[0]}:{point}"
+        if found:
+            raise _invalid(f"{path!r} matches {len(found)} modules; give more of the name", site=site,
+                           candidates=found[:20])
+        close = difflib.get_close_matches(path, paths, n=5, cutoff=0.0)
+        raise WSEError(ErrorCode.NOT_FOUND, f"no module path is {path!r} or ends with it; close paths: {close}",
+                       details={"site": site, "candidates": close})
+
+    # -- investigate ------------------------------------------------------------
+
+    def probe(self, texts: Any, *, sites: Sequence[str], device: str | None = None,
+              max_tokens: int | None = None) -> Probe:
+        """Teacher-force texts and average each site's activations over each text's window (``wse.probes``).
+
+        ``texts`` is an ``Evaluation`` (its outputs after their prompts,
+        averaged over each output: ``Evaluation.probe_texts``) or a sequence of
+        ``ProbeText``, token-ID sequences, or strings. A string is encoded as
+        plain text, without special tokens or a chat template. Site names may
+        be short (``site``). ``max_tokens`` bounds each text's forward; by
+        default it is the longest text, within ``wse.probes.MAX_PROBE_TOKENS``.
+        The cost grows with the forward length: on Qwen3.5-0.8B, about 4 GB of
+        device memory per 4,096 positions beyond the model's own 2 GB.
+        """
+        from wse.probes import MAX_PROBE_TOKENS, ProbeText, probe
+
+        text_model = self._text_model(device)
+        if isinstance(texts, Evaluation):
+            items = texts.probe_texts()
+        elif isinstance(texts, (str, bytes)) or not isinstance(texts, Sequence):
+            raise _invalid("texts must be an Evaluation or a sequence of texts")
+        else:
+            items = []
+            for text in texts:
+                if isinstance(text, ProbeText):
+                    items.append(text)
+                elif isinstance(text, str):
+                    items.append(ProbeText(tuple(text_model.tokenizer(text, add_special_tokens=False)["input_ids"])))
+                else:
+                    items.append(ProbeText(text))
+        names = {name: self.site(name) for name in sites}
+        if max_tokens is None:
+            lengths = [len(item.tokens) if item.stop is None else item.stop for item in items
+                       if isinstance(item.tokens, tuple)]
+            max_tokens = min(max(lengths, default=1), MAX_PROBE_TOKENS)
+        result = probe(self.handle, items, sites=list(names.values()), device=text_model.runtime.device.type,
+                       max_tokens=max_tokens)
+        return Probe(result=result, names=MappingProxyType(names))
 
     # -- intervene --------------------------------------------------------------
 
@@ -560,22 +732,27 @@ class WSE:
     def evaluate(self, dataset: str | Path, *, format: str = "math500", problems: int | None = None,
                  subset_seed: int = 0, profile: str | None = None, grader: str = "math_boxed@1", samples: int = 1,
                  max_new_tokens: int | None = None, eval_seed: int = 0, batch_size: int = 8,
-                 device: str | None = None, id_prefix: str | None = None) -> Any:
-        """Evaluate generation on ``problems`` problems of a JSON Lines dataset; return the ``EvaluationResult``.
+                 device: str | None = None, id_prefix: str | None = None) -> Evaluation:
+        """Evaluate generation on ``problems`` problems of a JSON Lines dataset, keeping every output.
 
         The problems are chosen by ``subset_seed`` (all of them when
         ``problems`` is ``None``); ``format`` is ``math500``, ``gsm8k``, or
-        ``math``. Metrics: accuracy, limit-hit rate, and mean generated
-        tokens, with intervals; ``problems`` holds every sample.
+        ``math``. The result's metrics are accuracy, limit-hit rate, and mean
+        generated tokens, with intervals; ``Evaluation.outputs`` holds every
+        sample's tokens and text, for probing.
         """
-        from wse.evaluators.generation import evaluate_generation
+        from wse.evaluators.generation import encode_prompts, run_generation
 
         suite, _, count = self._suite(dataset, format=format, problems=problems, subset_seed=subset_seed,
                                       profile=profile, grader=grader, samples=samples, max_new_tokens=max_new_tokens,
                                       eval_seed=eval_seed, id_prefix=id_prefix)
-        return evaluate_generation(self.handle, suite, EvalConfig(sample_count=count, seed=eval_seed),
-                                   text_model=self._text_model(device), registry=self.engine.registry,
-                                   batch_size=batch_size)
+        text_model = self._text_model(device)
+        run = run_generation(self.handle, suite, EvalConfig(sample_count=count, seed=eval_seed),
+                             text_model=text_model, registry=self.engine.registry, batch_size=batch_size)
+        prompts = encode_prompts(text_model, run.plan.profile, run.plan.items, range(len(run.plan.items)))
+        return Evaluation(result=run.result, outputs=run.outputs,
+                          prompts=MappingProxyType({index: tuple(ids) for index, ids in prompts.items()}),
+                          max_new_tokens=run.plan.profile.max_new_tokens)
 
     # -- evaluate ---------------------------------------------------------------
 
@@ -600,8 +777,8 @@ class WSE:
             options = dict(format=format, problems=problems, subset_seed=subset_seed, profile=profile, grader=grader,
                            samples=samples, max_new_tokens=max_new_tokens, eval_seed=eval_seed,
                            batch_size=batch_size, device=device, id_prefix=id_prefix)
-            base_result = self.evaluate(dataset, **options)
-            candidate_result = other.evaluate(dataset, **options)
+            base_result = self.evaluate(dataset, **options).result
+            candidate_result = other.evaluate(dataset, **options).result
             return Comparison(result=compare_generation(base_result, candidate_result),
                               base=result_summary(base_result), candidate=result_summary(candidate_result))
         if self.checkpoint_id is None or other.checkpoint_id is None:

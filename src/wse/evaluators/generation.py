@@ -538,6 +538,44 @@ def generation_usage(rows: int, batches: int, steps: int, seconds: float) -> Usa
                  unavailable={"peak_memory_bytes": "measured only for whole evaluation processes"})
 
 
+@dataclass(frozen=True)
+class GenerationRun:
+    """A direct generation evaluation: its plan, its result, and every sample's output, in plan order."""
+
+    plan: GenerationPlan
+    result: EvaluationResult
+    outputs: tuple[SampleOutput, ...]
+
+
+def run_generation(
+    model: ModelHandle,
+    suite: EvaluationSuite,
+    config: EvalConfig | Mapping[str, Any],
+    *,
+    files: Mapping[str, bytes] | None = None,
+    text_model: TextModel | None = None,
+    registry: Registry | None = None,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    device: str | None = None,
+    profile_overrides: Mapping[str, Any] | None = None,
+    check: Callable[[], None] | None = None,
+) -> GenerationRun:
+    """``evaluate_generation``, also returning the plan and every sample's output (token IDs and text)."""
+    plan = plan_generation(model, suite, config, registry=registry, profile_overrides=profile_overrides)
+    if text_model is None:
+        if files is None:
+            raise _invalid("generation needs the model's stored tokenizer files (Engine.model_files)")
+        text_model = load_text_model(model, files, device=device)
+    start = time.perf_counter()
+    problems, outputs = run_problems(plan, text_model, range(len(plan.items)), batch_size=batch_size, check=check)
+    elapsed = time.perf_counter() - start
+    batches = -(-len(plan.rows) // batch_size)
+    steps = sum(max(len(o.tokens) for o in outputs[b * batch_size : (b + 1) * batch_size]) for b in range(batches))
+    result = generation_result(model, plan, problems, runtime=text_model.runtime.info(), batch_size=batch_size,
+                               elapsed=elapsed, usage=generation_usage(len(plan.rows), batches, steps, elapsed))
+    return GenerationRun(plan=plan, result=result, outputs=tuple(outputs))
+
+
 def evaluate_generation(
     model: ModelHandle,
     suite: EvaluationSuite,
@@ -559,20 +597,12 @@ def evaluate_generation(
     resolved profile for direct use; the effective profile's hash is bound into
     the configuration either way. The steps are ``plan_generation``,
     ``run_problems``, and ``generation_result``, which resumable runners
-    (``wse.evaluators.generation_runs``) call in parts.
+    (``wse.evaluators.generation_runs``) call in parts; ``run_generation``
+    also returns the outputs.
     """
-    plan = plan_generation(model, suite, config, registry=registry, profile_overrides=profile_overrides)
-    if text_model is None:
-        if files is None:
-            raise _invalid("generation needs the model's stored tokenizer files (Engine.model_files)")
-        text_model = load_text_model(model, files, device=device)
-    start = time.perf_counter()
-    problems, outputs = run_problems(plan, text_model, range(len(plan.items)), batch_size=batch_size, check=check)
-    elapsed = time.perf_counter() - start
-    batches = -(-len(plan.rows) // batch_size)
-    steps = sum(max(len(o.tokens) for o in outputs[b * batch_size : (b + 1) * batch_size]) for b in range(batches))
-    return generation_result(model, plan, problems, runtime=text_model.runtime.info(), batch_size=batch_size,
-                             elapsed=elapsed, usage=generation_usage(len(plan.rows), batches, steps, elapsed))
+    return run_generation(model, suite, config, files=files, text_model=text_model, registry=registry,
+                          batch_size=batch_size, device=device, profile_overrides=profile_overrides,
+                          check=check).result
 
 
 def compare_generation(base: Any, candidate: Any) -> GenerationComparison:
@@ -608,8 +638,8 @@ def compare_generation(base: Any, candidate: Any) -> GenerationComparison:
         candidate={name: float(candidate.metrics[name]) for name in names}, differences=differences)
 
 
-__all__ = ["GenerationEvaluator", "GenerationPlan", "SampleOutput", "TextModel", "compare_generation",
-           "encode_prompts", "evaluate_generation", "generate_samples", "generation_metrics", "generation_result",
-           "generation_usage", "library_versions", "load_text_model", "mean_interval", "model_stop_tokens",
-           "paired_mean_difference", "plan_generation", "prompts_hash", "run_problems", "suite_parameters",
-           "token_hash"]
+__all__ = ["GenerationEvaluator", "GenerationPlan", "GenerationRun", "SampleOutput", "TextModel",
+           "compare_generation", "encode_prompts", "evaluate_generation", "generate_samples", "generation_metrics",
+           "generation_result", "generation_usage", "library_versions", "load_text_model", "mean_interval",
+           "model_stop_tokens", "paired_mean_difference", "plan_generation", "prompts_hash", "run_generation",
+           "run_problems", "suite_parameters", "token_hash"]

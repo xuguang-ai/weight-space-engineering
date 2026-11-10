@@ -183,6 +183,15 @@ def test_short_names_resolve_to_one_tensor(llama):
     assert DOWN0 in llama.tensor_names("down_proj") and all("down_proj" in n for n in llama.tensor_names("down_proj"))
 
 
+def test_roles_name_tensors_sites_and_protections(llama):
+    role = llama.role("mlp.down", 0)
+    assert (role.tensor, role.site, role.protected) == (DOWN0, "model.layers.0.mlp.down_proj", False)
+    assert llama.role("final_norm").protected and llama.role("final_norm").tensor == "model.norm.weight"
+    assert {r.role for r in llama.roles() if r.layer == 1} >= {"mlp.down", "attn.o"}
+    error = _expect(ErrorCode.POLICY_DENIED, llama.edit, "model.norm", "scale_slice", factor=2.0)
+    assert "final_norm" in str(error)
+
+
 @pytest.mark.parametrize(("index", "expected"), [
     ("", [(0, 16), (0, 32)]),
     ("[:, :8]", [(0, 16), (0, 8)]),
@@ -321,14 +330,36 @@ def test_evaluate_matches_a_direct_generation_evaluation(llama, dataset):
     from wse.evaluators.generation_runs import subset_suite
     from wse.evaluators.text_suites import read_jsonl
 
-    result = llama.evaluate(dataset, problems=4, subset_seed=7, **EVAL)
+    evaluation = llama.evaluate(dataset, problems=4, subset_seed=7, **EVAL)
     data, _ = read_jsonl(dataset, format="math500")
     suite, _ = subset_suite(data, count=4, seed=7, parameters={"profile": "qwen35think@1", "grader": "math_boxed@1",
                                                               "samples_per_problem": 1, "max_new_tokens": 6})
     direct = evaluate_generation(llama.handle, suite, {"sample_count": 4, "seed": 0}, files=llama.files,
                                  device="cpu", batch_size=2)
-    assert result.problems == direct.problems and dict(result.metrics) == dict(direct.metrics)
+    result = evaluation.result
+    assert result.problems == direct.problems and dict(evaluation.metrics) == dict(direct.metrics)
     assert result.evaluator_config_hash == direct.evaluator_config_hash
+    # Every sample's output is kept, in plan order, with the tokens its result hashed.
+    from wse.evaluators.generation import token_hash
+
+    assert len(evaluation.outputs) == 4
+    for output, problem in zip(evaluation.outputs, result.problems):
+        assert output.index == problem.index and token_hash(output.tokens) == problem.samples[0].output_sha256
+    hits, finished = evaluation.limit_hit(), evaluation.finished()
+    assert sorted(hits + finished) == [0, 1, 2, 3]
+    assert hits == [k for k, p in enumerate(result.problems) if p.samples[0].limit_hit]
+    assert "accuracy" in evaluation.table() and "limit_hit_rate" in evaluation.table()
+
+
+def test_probe_texts_of_an_evaluation_are_prompt_plus_output(llama, dataset):
+    evaluation = llama.evaluate(dataset, problems=4, subset_seed=7, **EVAL)
+    texts = evaluation.probe_texts()
+    for text, output in zip(texts, evaluation.outputs):
+        prompt = evaluation.prompts[output.index]
+        assert text.tokens == tuple(prompt) + tuple(output.tokens)
+        assert (text.start, text.stop) == (len(prompt), len(text.tokens))
+    tails = evaluation.probe_texts(last=3)
+    assert [t.start for t in tails] == [len(t.tokens) - min(3, len(o.tokens)) for t, o in zip(tails, evaluation.outputs)]
 
 
 def test_compare_an_in_memory_edit_with_its_base(llama, dataset):
@@ -338,7 +369,7 @@ def test_compare_an_in_memory_edit_with_its_base(llama, dataset):
     comparison = llama.compare(edit, dataset, problems=4, subset_seed=7, **EVAL)
     base = llama.evaluate(dataset, problems=4, subset_seed=7, **EVAL)
     candidate = edit.model.evaluate(dataset, problems=4, subset_seed=7, **EVAL)
-    assert comparison.result == compare_generation(base, candidate)
+    assert comparison.result == compare_generation(base.result, candidate.result)
     assert comparison.out_dir is None and comparison.base["metrics"] == dict(base.metrics)
     table = comparison.table()
     assert "accuracy" in table and "limit_hit_rate" in table and "mean_generated_tokens" in table
@@ -358,3 +389,52 @@ def test_compare_with_out_dir_records_a_resumable_run(llama, dataset, published,
     error = _expect(ErrorCode.INVALID_ARGUMENT, llama.compare, scaled, dataset, problems=4,
                     out_dir=tmp_path / "other", **EVAL)
     assert "stored" in str(error)
+
+
+# -- investigate -------------------------------------------------------------------
+
+
+def test_sites_take_short_module_names(llama):
+    assert llama.site("layers.0.mlp.down_proj:input") == "model.layers.0.mlp.down_proj:input"
+    assert llama.site("model.layers.1.mlp.down_proj:output") == "model.layers.1.mlp.down_proj:output"
+    assert llama.site("residual:2") == "residual:2"
+    error = _expect(ErrorCode.INVALID_ARGUMENT, llama.site, "mlp.down_proj:input")
+    assert "model.layers.1.mlp.down_proj" in error.details["candidates"]
+    _expect(ErrorCode.NOT_FOUND, llama.site, "layers.7.mlp.down_proj:input")
+    _expect(ErrorCode.INVALID_ARGUMENT, llama.site, "layers.0.mlp.down_proj")  # no capture point
+
+
+def test_probe_matches_the_core_and_resolves_short_names(llama):
+    from wse.probes import ProbeText, probe
+
+    texts = [[5, 6, 7, 8, 9, 10], [11, 12, 13, 14], [20, 21, 22, 23, 24]]
+    result = llama.probe(texts, sites=["layers.0.mlp.down_proj:input", "residual:1"], device="cpu")
+    core = probe(llama.handle, [ProbeText(tuple(t)) for t in texts],
+                 sites=["model.layers.0.mlp.down_proj:input", "residual:1"], device="cpu")
+    assert result.result.sites == core.sites
+    for short, canonical in (("layers.0.mlp.down_proj:input", "model.layers.0.mlp.down_proj:input"),
+                             ("residual:1", "residual:1")):
+        assert np.array_equal(result.means(short), core.means[canonical])
+    contrast = result.contrast("layers.0.mlp.down_proj:input", [0], [1, 2])
+    expected = core.contrast("model.layers.0.mlp.down_proj:input", [0], [1, 2])
+    assert np.array_equal(contrast.direction, expected.direction)
+    assert np.array_equal(contrast.standardized, expected.standardized)
+    assert np.array_equal(result.group_mean("residual:1", [1, 2]), core.group_mean("residual:1", [1, 2]))
+
+
+def test_probe_encodes_strings_without_special_tokens(llama):
+    text_model = llama._text_model("cpu")
+    ids = text_model.tokenizer("abc 12", add_special_tokens=False)["input_ids"]
+    by_text = llama.probe(["abc 12"], sites=["residual:2"], device="cpu")
+    by_ids = llama.probe([ids], sites=["residual:2"], device="cpu")
+    assert np.array_equal(by_text.means("residual:2"), by_ids.means("residual:2"))
+    assert by_text.result.token_counts == (len(ids),)
+
+
+def test_probe_reads_an_evaluation_and_its_groups(llama, dataset):
+    evaluation = llama.evaluate(dataset, problems=4, subset_seed=7, **EVAL)
+    result = llama.probe(evaluation, sites=["layers.1.mlp.down_proj:output"], device="cpu")
+    assert result.result.token_counts == tuple(len(o.tokens) for o in evaluation.outputs)
+    direct = llama.probe(evaluation.probe_texts(), sites=["layers.1.mlp.down_proj:output"], device="cpu")
+    assert np.array_equal(result.means("layers.1.mlp.down_proj:output"),
+                          direct.means("layers.1.mlp.down_proj:output"))
