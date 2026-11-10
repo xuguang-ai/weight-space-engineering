@@ -1110,7 +1110,9 @@ class Engine:
 
         ``kind`` is a public alias resolved by the operation policy (``stats``,
         ``norm``, ``top_k`` by default). An omitted ``k`` for top-k resolves to
-        ``min(16, element_count)``; other kinds do not accept ``k``.
+        ``min(16, element_count)``; other kinds do not accept ``k``. An
+        analysis with vector results (for example ``tensor_norms@1``) stores
+        them behind ``result_uri`` and returns its summary inline.
         """
         self._require_unbound("analyze")
         return self._analyze(checkpoint_id, kind, tensor, selection, k, parameters=parameters)
@@ -1144,6 +1146,8 @@ class Engine:
             checkpoint_id=checkpoint_id,
             management="managed",
             store_large=self.store.put_analysis_result,
+            # Vector references resolve like read_analysis_result: a run reads only its own results.
+            read_result=self.experiments.find_analysis_result,
         )
 
     def read_analysis_result(self, uri: str) -> dict[str, Any]:
@@ -1280,9 +1284,15 @@ class Engine:
         return self.experiments.read_tensor(experiment_id, checkpoint_id, tensor, selection)
 
     def analyze_model(self, experiment_id: str, checkpoint_id: str, kind: str, tensor: str, selection: Any,
-                      k: int | None = None) -> AnalysisResult:
-        """A permitted analysis of an owned checkpoint, charged under its operator's usage contract."""
-        return self.experiments.analyze(experiment_id, checkpoint_id, kind, tensor, selection, k)
+                      k: int | None = None, *, parameters: Mapping[str, Any] | None = None) -> AnalysisResult:
+        """A permitted analysis of an owned checkpoint, charged under its operator's usage contract.
+
+        ``parameters`` are the operator's own parameters (for example
+        ``{"axis": "rows"}`` of ``tensor_norms@1``). Vector results are stored
+        as artifacts that only this run can read or reference.
+        """
+        return self.experiments.analyze(experiment_id, checkpoint_id, kind, tensor, selection, k,
+                                        parameters=parameters)
 
     # -- budgets, suites, and jobs ----------------------------------------------------
 

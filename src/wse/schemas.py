@@ -825,7 +825,13 @@ class AnalysisResult(_Frozen):
     resolved parameters. ``result`` holds the numerical results inline; when
     they exceed the inline response limit of a managed call, ``result`` is
     ``None`` and ``result_uri`` references the stored content, whose hash is
-    ``result_hash``. ``checkpoint_id`` is ``None`` for direct use.
+    ``result_hash``. An operator with vector results (``artifact_fields``,
+    for example ``tensor_norms@1``) always stores its complete result in a
+    managed call: ``result`` then holds everything but the vectors (a summary
+    and the top entries), and ``result_uri``, ``result_hash``, and
+    ``result_bytes`` describe the complete result. A vector inside it can be
+    passed to another operation as ``<result_uri>#<JSON pointer>``.
+    ``checkpoint_id`` is ``None`` for direct use.
     """
 
     schema_version: Literal["1"] = SCHEMA_VERSION

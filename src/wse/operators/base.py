@@ -9,6 +9,22 @@ Analysis operators receive a read-only ``TensorRegion`` that the engine has
 already selected and bounded; they never read checkpoints, files, or other
 tensors themselves, and never run the target network.
 
+Two optional declarations serve analyses whose results hold vectors (M2):
+
+* ``artifact_fields`` names result fields that hold vectors. In managed use
+  the engine stores the complete result as a run-scoped
+  ``wse://analyses/<sha256>`` artifact and returns the result without those
+  fields inline, so the response carries the summary and top entries and the
+  artifact's URI. The fields must be optional, so that the inline result is
+  valid against the advertised output schema. Direct use keeps them inline.
+* ``reference_parameters`` names parameters that may be given as a
+  ``VectorReference``: ``<result URI>#<JSON pointer>``, a vector inside a
+  stored analysis result. The engine reads the result (a run reads only the
+  results of its own experiment), checks that the pointer names a list of
+  finite numbers, and hands the vector to the operator in
+  ``TensorRegion.inputs`` as a read-only float32 array. The recorded
+  parameters keep the reference, which is content-addressed.
+
 Edit operators receive the same read-only region and return its new values
 as an array of the region's shape. The engine computes in FP32, casts back to
 the stored dtype, writes only that region, checks shapes and finiteness, and
@@ -20,11 +36,12 @@ Replaying a materialized patch never runs the operator again.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Any, ClassVar, Protocol, runtime_checkable
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Annotated, Any, ClassVar, Protocol, runtime_checkable
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, StringConstraints, ValidationError
 
 from wse.schemas import (
     AxisSlice,
@@ -48,9 +65,17 @@ __all__ = [
     "OperatorSpec",
     "TensorRegion",
     "UsageContract",
+    "VECTOR_REFERENCE_PATTERN",
+    "VectorReference",
     "make_spec",
     "validate_operator",
 ]
+
+# ``wse://analyses/<sha256>#<pointer>``: a JSON pointer (RFC 6901, URI fragment form) into a stored
+# analysis result, whose segments are field names or list indices without leading zeros, for example
+# ``#/right_vectors/0``.
+VECTOR_REFERENCE_PATTERN = r"^wse://analyses/[0-9a-f]{64}#(?:/(?:[A-Za-z_][A-Za-z0-9_]*|0|[1-9][0-9]*))+$"
+VectorReference = Annotated[str, StringConstraints(pattern=VECTOR_REFERENCE_PATTERN)]
 
 # The method each effect category must implement. Probe and edit operators are
 # introduced by later milestones; their methods are reserved here.
@@ -84,7 +109,10 @@ class TensorRegion:
     ``values`` has the region's shape and the stored dtype and is not
     writeable; a BF16 region, which NumPy cannot hold, arrives as its exact
     float32 widening (``dtype`` still names the stored dtype). ``selection``
-    locates it inside the full tensor.
+    locates it inside the full tensor. ``inputs`` holds the vectors of an
+    analysis operator's ``reference_parameters`` that were given as
+    references, keyed by parameter name, as read-only float32 arrays; it is
+    empty otherwise.
     """
 
     tensor: str
@@ -93,6 +121,7 @@ class TensorRegion:
     tensor_shape: tuple[int, ...]
     selection: tuple[AxisSlice, ...]
     values: np.ndarray
+    inputs: Mapping[str, np.ndarray] = field(default_factory=lambda: MappingProxyType({}))
 
     @property
     def element_count(self) -> int:
@@ -175,12 +204,16 @@ class BaseAnalysisOperator:
 
     Subclasses set ``spec``, ``parameters_model``, and ``result_model`` and
     implement ``analyze``. The default ``resolve_parameters`` validates the
-    parameters strictly and rejects unknown names.
+    parameters strictly and rejects unknown names. ``artifact_fields`` and
+    ``reference_parameters`` are the optional declarations described in the
+    module docstring.
     """
 
     spec: ClassVar[OperatorSpec]
     parameters_model: ClassVar[type[BaseModel]] = OperatorParameters
     result_model: ClassVar[type[BaseModel]]
+    artifact_fields: ClassVar[tuple[str, ...]] = ()
+    reference_parameters: ClassVar[tuple[str, ...]] = ()
 
     def resolve_parameters(self, parameters: Mapping[str, Any], element_count: int) -> BaseModel:
         return parse_parameters(self.spec, self.parameters_model, parameters)
@@ -227,6 +260,29 @@ def parse_parameters(
         ) from exc
 
 
+def _validate_vector_declarations(spec: OperatorSpec, implementation: Any) -> None:
+    """``artifact_fields`` are optional result fields; ``reference_parameters`` are parameter fields."""
+    result_fields = implementation.result_model.model_fields
+    for name in tuple(getattr(implementation, "artifact_fields", ()) or ()):
+        declared = result_fields.get(name)
+        if declared is None or declared.is_required():
+            raise WSEError(
+                ErrorCode.INVALID_ARGUMENT,
+                f"analysis operator {spec.ref} declares artifact field {name!r}, which must be an optional field "
+                f"of its result_model (the inline result omits it); result fields: {sorted(result_fields)}",
+                details={"artifact_field": name},
+            )
+    parameter_fields = implementation.parameters_model.model_fields
+    for name in tuple(getattr(implementation, "reference_parameters", ()) or ()):
+        if name not in parameter_fields:
+            raise WSEError(
+                ErrorCode.INVALID_ARGUMENT,
+                f"analysis operator {spec.ref} declares reference parameter {name!r}, which is not a field of its "
+                f"parameters_model; parameters: {sorted(parameter_fields)}",
+                details={"reference_parameter": name},
+            )
+
+
 def validate_operator(extension_id: str, version: str, implementation: Any) -> None:
     """Registry check: the implementation matches its spec and effect contract."""
     spec = getattr(implementation, "spec", None)
@@ -257,6 +313,8 @@ def validate_operator(extension_id: str, version: str, implementation: Any) -> N
             f"edit operator {spec.ref} must declare result_model = PatchStep, the standard "
             "materialized patch representation",
         )
+    if spec.effect == "analysis":
+        _validate_vector_declarations(spec, implementation)
     allowed = EFFECT_COUNTERS[spec.effect]
     if spec.usage.counter not in allowed:
         raise WSEError(

@@ -44,10 +44,13 @@ def test_builtin_registry_contains_mlp_adapter():
     # M2 adds the generic Hugging Face causal-LM adapter to the built-ins.
     assert registry.list("adapter") == [ExtensionRef.parse("hf_causal_lm@1"), ExtensionRef.parse("mlp@1")]
     assert registry.list("operator") == [
+        ExtensionRef.parse("direction_projection@1"),
         ExtensionRef.parse("project_out@1"),
         ExtensionRef.parse("scale_slice@1"),
         ExtensionRef.parse("set_slice@1"),
+        ExtensionRef.parse("svd_top_k@1"),
         ExtensionRef.parse("tensor_norm@1"),
+        ExtensionRef.parse("tensor_norms@1"),
         ExtensionRef.parse("tensor_stats@1"),
         ExtensionRef.parse("tensor_top_k@1"),
     ]

@@ -18,24 +18,39 @@ Response policy:
   exceed the inline limit, a managed call stores the result as a
   content-addressed artifact and returns its ``result_uri`` with
   ``result=None``. Direct calls have no transport and keep results inline.
+* An analysis whose operator declares ``artifact_fields`` (vector results, M2
+  plan Section 5.2) always stores its complete result in a managed call and
+  returns the result without those fields inline, next to ``result_uri``:
+  a summary, the top entries, and the URI. ``result_hash`` and
+  ``result_bytes`` describe the complete, stored result. Should even that
+  inline part exceed the limit, the result is returned as ``None``, as above.
+* A parameter in an operator's ``reference_parameters`` may name a vector of a
+  stored result (``wse.operators.base.VectorReference``). A managed call reads
+  it through the engine's run-scoped reader before any weights are read;
+  direct use has no stored results and refuses references.
 * Regions are read without implicit copies: direct use passes a read-only view
   of the handle's tensor, and managed use reads only the selected region from
-  the safetensors file.
+  the safetensors file. A BF16 region, which NumPy cannot hold, is the one
+  exception: it arrives as its exact float32 widening (M2 plan Section 3.2),
+  and a read reports each value as the shortest decimal that round-trips that
+  widening.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 from pydantic import BaseModel
 
-from wse.operators.base import TensorRegion
+from wse.operators.base import VECTOR_REFERENCE_PATTERN, TensorRegion
 from wse.operators.tensor import shortest_floats
 from wse.adapters.base import CAP_WEIGHTS_READ
 from wse.policy import (
@@ -66,7 +81,9 @@ if TYPE_CHECKING:
     from wse.api import ModelHandle
     from wse.registry import Registry
 
-SUPPORTED_DTYPES = {"float16": np.float16, "float32": np.float32, "float64": np.float64}
+# Stored dtypes that reads and analyses accept, with the NumPy dtype in which a region reaches them.
+SUPPORTED_DTYPES = {"bfloat16": np.float32, "float16": np.float16, "float32": np.float32, "float64": np.float64}
+_FLOAT32_MAX = float(np.finfo(np.float32).max)
 
 # Timing fields are measured with a fixed-width stand-in so that whether a
 # response fits never depends on how long the call took.
@@ -77,6 +94,8 @@ _URI_PLACEHOLDER = "wse://analyses/" + "0" * 64
 
 ReadRegion = Callable[[tuple[slice, ...]], torch.Tensor]
 StoreLarge = Callable[[bytes], str]
+# Returns a stored analysis result (parsed JSON) that the caller may read, or raises NOT_FOUND.
+ReadResult = Callable[[str], Any]
 
 
 # ---------------------------------------------------------------------------
@@ -116,10 +135,22 @@ def _require_supported_dtype(info: TensorInfo) -> None:
 
 
 def _readonly(tensor: torch.Tensor, dtype: str) -> np.ndarray:
-    """A non-writeable NumPy view of ``tensor`` (no copy)."""
-    array = tensor.detach().numpy().view()
-    if array.dtype != SUPPORTED_DTYPES[dtype]:
-        raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"stored dtype {array.dtype} does not match manifest {dtype}")
+    """A non-writeable NumPy view of ``tensor`` (no copy); a BF16 tensor becomes its exact float32 widening.
+
+    The widening puts each BF16 bit pattern in the high half of a float32 (as
+    ``wse.tensors.bf16_to_f32`` does), shifting in place so that the region
+    costs four bytes per element beyond the stored copy.
+    """
+    if dtype == "bfloat16":
+        if tensor.dtype != torch.bfloat16:
+            raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"stored dtype {tensor.dtype} does not match manifest {dtype}")
+        widened = tensor.detach().view(torch.int16).numpy().view(np.uint16).astype(np.uint32)
+        widened <<= 16
+        array = widened.view(np.float32)
+    else:
+        array = tensor.detach().numpy().view()
+        if array.dtype != SUPPORTED_DTYPES[dtype]:
+            raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"stored dtype {array.dtype} does not match manifest {dtype}")
     array.flags.writeable = False
     return array
 
@@ -278,6 +309,89 @@ def bounded_read(
 # ---------------------------------------------------------------------------
 
 
+def resolve_vector_reference(reference: str, read_result: ReadResult, *, parameter: str,
+                             max_length: int) -> np.ndarray:
+    """The vector that ``reference`` (``<result URI>#<JSON pointer>``) names, as a read-only float32 array.
+
+    ``read_result`` returns a stored result the caller may read; a run reads
+    only results its own experiment produced, and any other URI is reported
+    exactly like one that does not exist. The pointer must name a non-empty
+    list of finite numbers within the float32 range, of at most
+    ``max_length`` values.
+    """
+    if not isinstance(reference, str) or not re.fullmatch(VECTOR_REFERENCE_PATTERN, reference):
+        raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                       f"{parameter} reference {reference!r} must have the form "
+                       "wse://analyses/<sha256>#/<field>[/<index>]",
+                       details={"parameter": parameter})
+    uri, _, pointer = reference.partition("#")
+    try:
+        document = read_result(uri)
+    except WSEError as exc:
+        if exc.code != ErrorCode.NOT_FOUND:
+            raise
+        raise WSEError(ErrorCode.NOT_FOUND, f"{parameter} reference {reference!r}: {exc.message}",
+                       details={"parameter": parameter, "uri": uri}) from None
+    value: Any = document
+    walked = ""
+    for segment in pointer.split("/")[1:]:
+        if isinstance(value, dict) and segment in value:
+            value = value[segment]
+        elif isinstance(value, list) and segment.isdigit() and int(segment) < len(value):
+            value = value[int(segment)]
+        else:
+            if isinstance(value, dict):
+                available = f"its fields are {sorted(value)}"
+            elif isinstance(value, list):
+                available = f"it is a list of {len(value)} entries"
+            else:
+                available = "it is a single value"
+            raise WSEError(
+                ErrorCode.INVALID_ARGUMENT,
+                f"{parameter} reference {reference!r} names no value of the stored result: "
+                f"{walked + '/' + segment!r} does not exist ({walked or 'the result'}: {available})",
+                details={"parameter": parameter, "uri": uri, "missing": walked + "/" + segment},
+            )
+        walked += "/" + segment
+    if not (isinstance(value, list) and value
+            and all(isinstance(entry, (int, float)) and not isinstance(entry, bool) for entry in value)):
+        raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                       f"{parameter} reference {reference!r} must name a non-empty list of numbers (a vector); "
+                       f"it names {type(value).__name__ if not isinstance(value, list) else 'a list of other values'}",
+                       details={"parameter": parameter, "uri": uri})
+    if len(value) > max_length:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                       f"{parameter} reference {reference!r} names {len(value)} values; at most {max_length} are "
+                       "accepted",
+                       details={"parameter": parameter, "uri": uri, "length": len(value), "max_length": max_length})
+    wide = np.asarray(value, dtype=np.float64)
+    bad = int(np.count_nonzero(~np.isfinite(wide) | (np.abs(wide) > _FLOAT32_MAX)))
+    if bad:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                       f"{parameter} reference {reference!r} names {bad} value(s) that are not finite float32 numbers",
+                       details={"parameter": parameter, "uri": uri, "nonfinite_count": bad})
+    vector = wide.astype(np.float32)
+    vector.flags.writeable = False
+    return vector
+
+
+def _resolve_references(operator: Any, resolved: Any, read_result: ReadResult | None,
+                        max_length: int) -> dict[str, np.ndarray]:
+    """Vectors of the operator's reference parameters that were given as references, keyed by parameter."""
+    inputs: dict[str, np.ndarray] = {}
+    for name in tuple(getattr(operator, "reference_parameters", ()) or ()):
+        value = getattr(resolved, name, None)
+        if not isinstance(value, str):
+            continue
+        if read_result is None:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                           f"{name} names a stored analysis result, and direct use has no stored results; pass the "
+                           f"{name} inline",
+                           details={"parameter": name})
+        inputs[name] = resolve_vector_reference(value, read_result, parameter=name, max_length=max_length)
+    return inputs
+
+
 def run_analysis(
     *,
     registry: Registry,
@@ -294,12 +408,14 @@ def run_analysis(
     checkpoint_id: str | None,
     management: Management,
     store_large: StoreLarge | None,
+    read_result: ReadResult | None = None,
 ) -> AnalysisResult:
     """Dispatch one analysis through the registry; shared by direct and managed use.
 
     Checks run before any weights are read: permitted kind, exact operator
     version, effect category, adapter capabilities, tensor name, selection,
-    size limits, and parameters.
+    size limits, and parameters, including the vectors of reference
+    parameters, which ``read_result`` reads (``None`` in direct use).
     """
     start = time.perf_counter()
     ref = policy.analysis_operator(kind)
@@ -328,6 +444,7 @@ def run_analysis(
             raise WSEError(ErrorCode.INVALID_ARGUMENT, "pass k either as an argument or in parameters, not both")
         raw["k"] = k
     resolved = operator.resolve_parameters(raw, count)
+    inputs = _resolve_references(operator, resolved, read_result, maximum)
     region = TensorRegion(
         tensor=info.name,
         dtype=info.dtype,
@@ -335,6 +452,7 @@ def run_analysis(
         tensor_shape=tuple(info.shape),
         selection=tuple(entries),
         values=_readonly(read_region(info.name, _slices(entries)), info.dtype),
+        inputs=MappingProxyType(inputs),
     )
     output = operator.analyze(region, resolved)
     if not isinstance(output, operator.result_model):
@@ -374,27 +492,29 @@ def run_analysis(
         management=management,
     )
     limit = policy.limits.max_result_json_bytes
-    if store_large is not None and inline_size(result) > limit:
+    artifact_fields = tuple(getattr(operator, "artifact_fields", ()) or ())
+    if store_large is not None and (artifact_fields or inline_size(result) > limit):
         data = payload_text.encode("utf-8")
-        by_reference = result.model_copy(
-            update={
-                "result": None,
-                "result_uri": _URI_PLACEHOLDER,
-                "usage": result.usage.model_copy(update={"artifact_bytes": len(data)}),
-            }
+        # Keep inline what fits: the result without its vector fields, else nothing.
+        inline_forms: list[dict[str, Any] | None] = [None]
+        if artifact_fields:
+            inline_forms.insert(0, {key: value for key, value in payload.items() if key not in artifact_fields})
+        usage = result.usage.model_copy(update={"artifact_bytes": len(data)})
+        size = 0
+        for inline in inline_forms:
+            by_reference = result.model_copy(update={"result": inline, "result_uri": _URI_PLACEHOLDER, "usage": usage})
+            size = inline_size(by_reference)
+            if size <= limit:
+                return by_reference.model_copy(update={"result_uri": store_large(data)})
+        # Moving the result behind a URI is not enough: the rest of the
+        # response (for example large resolved parameters) is too big.
+        raise WSEError(
+            ErrorCode.INVALID_ARGUMENT,
+            f"the analysis response would serialize to {size} bytes of JSON even with its result "
+            f"stored by reference, above the {limit}-byte response limit; pass smaller parameters",
+            details={"limit": "max_inline_json_bytes", "max_inline_json_bytes": policy.limits.max_inline_json_bytes,
+                     "max_result_json_bytes": limit, "json_bytes": size},
         )
-        size = inline_size(by_reference)
-        if size > limit:
-            # Moving the result behind a URI is not enough: the rest of the
-            # response (for example large resolved parameters) is too big.
-            raise WSEError(
-                ErrorCode.INVALID_ARGUMENT,
-                f"the analysis response would serialize to {size} bytes of JSON even with its result "
-                f"stored by reference, above the {limit}-byte response limit; pass smaller parameters",
-                details={"limit": "max_inline_json_bytes", "max_inline_json_bytes": policy.limits.max_inline_json_bytes,
-                         "max_result_json_bytes": limit, "json_bytes": size},
-            )
-        result = by_reference.model_copy(update={"result_uri": store_large(data)})
     return result
 
 
