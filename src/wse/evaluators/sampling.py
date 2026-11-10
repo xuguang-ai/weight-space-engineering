@@ -96,7 +96,7 @@ _NEUTRAL_VALUES = {"repetition_penalty": 1.0, "num_beams": 1, "typical_p": 1.0, 
 
 
 def default_profile_id(repository: str) -> str:
-    """The default profile ID of a repository: ``Llama-3.2-1B-Instruct`` gives ``llama_3_2_1b_instruct_default``.
+    """The default profile ID of a repository: ``org/Chat-3.2-1B-Instruct`` gives ``chat_3_2_1b_instruct_default``.
 
     The repository's name (after the last ``/``) is lowercased, every
     character other than a letter or digit becomes ``_``, and ``m_`` is
