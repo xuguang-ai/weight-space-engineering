@@ -1,6 +1,6 @@
 # Weight-Space Engineering M2: Open-Weight Language Models, First Target Qwen3.5-0.8B
 
-> **For agentic workers:** Use the `subagent-driven-development` skill during implementation, delivering and reviewing one task at a time. Track execution with the checkboxes below. Steps marked **(operator)** are the user's own actions: installs, downloads, access requests, and live runs that cost money. Implementation has not started. This document, like the M1 plan, names the oracle edits of the Qwen trial, so the reference runner must keep it out of every agent's reach.
+> **For agentic workers:** Use the `subagent-driven-development` skill during implementation, delivering and reviewing one task at a time. Track execution with the checkboxes below. Steps marked **(operator)** are the user's own actions: installs, downloads, access requests, and live runs that cost money. Implementation started on 2026-11-09, and the checkboxes record its progress. This document, like the M1 plan, names the oracle edits of the Qwen trial, so the reference runner must keep it out of every agent's reach.
 
 **Goal:** Let users and agents inspect, edit, evaluate, and replay changes to the weights of open-weight causal language models through the same managed contracts as M1. Qwen3.5-0.8B is the first target. A widely used model from another vendor, Llama-3.2-1B-Instruct, must work through the same generic path without new code.
 
@@ -444,22 +444,22 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
 
 **Files:** create `src/wse/engines/__init__.py` and `src/wse/engines/hf_torch.py`; modify `src/wse/adapters/hf_causal_lm.py`; create `tests/test_hf_engine.py`.
 
-- [ ] Write failing tests:
+- [x] Write failing tests:
   - `test_wse_built_module_matches_from_pretrained_logits_bitwise_on_cpu`, for every fixture;
   - `test_mps_logits_match_cpu_within_tolerance`, skipped without MPS, with `atol` and `rtol` stated per dtype;
   - `test_greedy_generation_matches_transformers_generate`;
   - `test_core_modules_import_no_transformers`, extending M1's import-boundary tests.
-- [ ] Run the tests; they must fail.
-- [ ] Implement module construction on the meta device, assignment of WSE tensors, device selection, forward passes, and batched greedy and sampled generation with a KV cache.
-- [ ] Run the new tests and the full suite.
-- [ ] **(real model)** For three fixed prompts, compare each model's logits with `from_pretrained` on the same snapshot, on CPU and on MPS. Record the maximum absolute difference and any operator that needed `PYTORCH_ENABLE_MPS_FALLBACK=1`.
-- [ ] Review and commit.
+- [x] Run the tests; they must fail.
+- [x] Implement module construction on the meta device, assignment of WSE tensors, device selection, forward passes, and batched greedy and sampled generation with a KV cache.
+- [x] Run the new tests and the full suite.
+- [x] **(real model)** For three fixed prompts, compare each model's logits with `from_pretrained` on the same snapshot, on CPU and on MPS. Record the maximum absolute difference and any operator that needed `PYTORCH_ENABLE_MPS_FALLBACK=1`.
+- [x] Review and commit.
 
 ### Task 5: BF16 edits, binary patches, and exact replay of the published edits
 
 **Files:** modify `src/wse/patches.py` and `src/wse/operators/tensor.py`; create `src/wse/patch_blocks.py` and `src/wse/external_patches.py`; modify `src/wse/cli.py` (`wse import-patch`); create `tests/test_patch_blocks.py` and `tests/test_external_patches.py`.
 
-- [ ] Write failing tests:
+- [x] Write failing tests:
   - `test_bf16_scale_computes_in_fp32_and_rounds_to_nearest_even`, with hand-computed bit patterns, including a tie that rounds to even;
   - `test_changed_elements_are_counted_after_write_back`;
   - `test_sparse_and_dense_blocks_round_trip_and_bind_base_and_result_ids`;
@@ -467,15 +467,15 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
   - `test_lm_understand_v1_sparse_and_lowrank_rebuild`: a synthetic `manifest.json` and `edit.npz`, written by the test, in both forms;
   - `test_a_wrong_base_hash_is_refused_before_any_write`;
   - `test_a_wrong_edited_hash_leaves_no_patch_and_no_candidate`.
-- [ ] Run the tests; they must fail.
-- [ ] Implement:
+- [x] Run the tests; they must fail.
+- [x] Implement:
   - the dtype-aware operators;
   - the helpers `bf16_to_f32` and `f32_to_bf16_bits_rne` in `wse.tensors`, with round-to-nearest-even on the float32 bit pattern;
   - the patch blocks;
   - `rebuild()` from Section 3.4;
   - `wse import-patch`.
-- [ ] Run the new tests and the full suite.
-- [ ] **(real model)** Replay p10c, p25c, and p50c on the imported Qwen3.5-0.8B. All edited hashes must equal their manifests. For p50c these are:
+- [x] Run the new tests and the full suite.
+- [x] **(real model)** Replay p10c, p25c, and p50c on the imported Qwen3.5-0.8B. All edited hashes must equal their manifests. For p50c these are:
 
   | Tensor | `base_sha256` | `edited_sha256` | Changed entries |
   | --- | --- | --- | --- |
@@ -483,13 +483,13 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
   | `model.language_model.layers.19.mlp.down_proj.weight` | `638eedeb701b94aa861f4438e615c07ec6c60ee703db1bfee2de577bb6498c3e` | `8ef3c61bc36af113ad58e89dbb0a4a14dcba5a45cb750c15ab515c82ddd12eb2` | 64,928 |
 
   The p50c candidate adds exactly two blobs.
-- [ ] Review and commit.
+- [x] Review and commit.
 
 ### Task 6: Generation evaluation: profiles, presence penalty, graders, and suites
 
 **Files:** create `src/wse/evaluators/sampling.py`, `src/wse/evaluators/generation.py`, `src/wse/evaluators/graders.py`, `src/wse/evaluators/text_suites.py`, and `tests/test_generation_eval.py`; modify `src/wse/registry.py` and `src/wse/schemas.py`.
 
-- [ ] Write failing tests:
+- [x] Write failing tests:
   - `test_presence_penalty_subtracts_once_per_present_output_token_and_ignores_the_prompt`;
   - `test_sampling_order_is_penalty_temperature_top_k_top_p`;
   - `test_each_problem_and_sample_has_its_own_reproducible_seed`;
@@ -499,15 +499,15 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
   - `test_suites_record_hashes_and_reject_overlap_with_the_final_suite`;
   - `test_generation_reports_bind_model_profile_suite_and_grader_identities`;
   - `test_default_profiles_are_frozen_from_generation_config`.
-- [ ] Run the tests; they must fail.
-- [ ] Implement:
+- [x] Run the tests; they must fail.
+- [x] Implement:
   - the profiles, `qwen35think@1` from Section 4.2 among them, and the processor from Section 4.2;
   - chat-template rendering with per-profile template arguments;
   - batched generation with per-row seeds;
   - the graders, metrics, and suite registration.
-- [ ] Before freezing `PresencePenalty`, compare its semantics with vLLM's sampler source and record the comparison in a code comment.
-- [ ] **(real model)** Render one MATH-500 prompt with Qwen3.5-0.8B's template and `qwen35think@1`, and confirm that thinking is enabled.
-- [ ] Run the new tests and the full suite.
+- [x] Before freezing `PresencePenalty`, compare its semantics with vLLM's sampler source and record the comparison in a code comment.
+- [x] **(real model)** Render one MATH-500 prompt with Qwen3.5-0.8B's template and `qwen35think@1`, and confirm that thinking is enabled.
+- [x] Run the new tests and the full suite.
 - [ ] Review and commit.
 
 ### Task 7: Q1 runs, report, and the decision gate
@@ -591,7 +591,7 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
 
 ### Task 11: Probes, generation passes, budgets, policy, and MCP tools
 
-**Files:** create `src/wse/probes.py`, `tests/test_probes.py`, and `tests/test_llm_policy_mcp.py`; modify `src/wse/budget.py`, `src/wse/policy.py`, `src/wse/jobs.py`, `src/wse/worker.py`, `src/wse/mcp_server.py`, `src/wse/schemas.py`, `src/wse/database.py` (migration 9), and `docs/protocol.md`.
+**Files:** create `src/wse/probes.py`, `tests/test_probes.py`, and `tests/test_llm_policy_mcp.py`; modify `src/wse/budget.py`, `src/wse/policy.py`, `src/wse/jobs.py`, `src/wse/worker.py`, `src/wse/mcp_server.py`, `src/wse/schemas.py`, `src/wse/database.py` (migration 10), and `docs/protocol.md`.
 
 - [ ] Write failing tests:
   - `test_probe_hidden_states_match_a_direct_forward_on_the_fixture`;
@@ -610,7 +610,7 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
 - [ ] Implement:
   - probes in the worker;
   - generation passes as development evaluations;
-  - the four ledger counters, with migration 9 backfilling existing experiments;
+  - the four ledger counters, with migration 10 backfilling existing experiments (migration 9, from Task 5, added the `imported_patches` table);
   - policy `qwen_loop_v1` from Section 5.5;
   - `wse_probe`, and the extended `wse_analyze`, `wse_preview_patch`, and `wse_submit_evaluation`;
   - a worker-side cache that keeps loaded models across jobs, keyed by checkpoint ID.
