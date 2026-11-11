@@ -77,6 +77,7 @@ if TYPE_CHECKING:
         PatchPreview,
         PatchSpec,
         FinalEvaluationReport,
+        GenerationComparison,
         ProblemResult,
         Reservation,
         RunGrant,
@@ -1306,13 +1307,31 @@ class Engine:
     def get_experiment(self, experiment_id: str) -> Experiment:
         return self.experiments.get_experiment(experiment_id)
 
+    def resolve_experiment_id(self, experiment_id: str | None = None) -> str:
+        """``experiment_id``, or, when it is ``None``, the experiment of the run this engine is bound to.
+
+        Agent-facing callers (the MCP tools and a strategy's dispatch) let an
+        agent omit the ID of its run's single experiment; an ID that is given
+        is used as given, so a wrong one fails as before. Before the run's
+        experiment exists, an omitted ID fails with ``NOT_FOUND``; an engine
+        bound to no run has no default (``INVALID_ARGUMENT``).
+        """
+        return self.experiments.bound_experiment_id() if experiment_id is None else experiment_id
+
     def preview_patch(self, experiment_id: str, spec: PatchSpec | Mapping[str, Any], key: str) -> PatchPreview:
         """Freeze, validate, and materialize a patch without changing the selected model."""
         return self.experiments.preview_patch(experiment_id, spec, key)
 
-    def apply_patch(self, experiment_id: str, patch_id: str, key: str) -> ModelManifest:
-        """Create a READY candidate checkpoint from a stored preview."""
-        return self.experiments.apply_patch(experiment_id, patch_id, key)
+    def apply_patch(self, experiment_id: str, patch_id: str, key: str, *, bounded: bool = False) -> ModelManifest:
+        """Create a READY candidate checkpoint from a stored preview; return its manifest.
+
+        ``bounded`` returns the manifest as ``wse_apply_patch`` does
+        (``ExperimentService.candidate_view``): whole when it fits the
+        experiment policy's inline-result limit, else with only the tensors
+        that differ from the parent checkpoint and ``unchanged_tensors``.
+        """
+        manifest = self.experiments.apply_patch(experiment_id, patch_id, key)
+        return self.experiments.candidate_view(experiment_id, manifest) if bounded else manifest
 
     def select_checkpoint(
         self, experiment_id: str, checkpoint_id: str, expected_selected_id: str, key: str
@@ -1366,9 +1385,14 @@ class Engine:
             policy_uri=f"wse://experiments/{experiment_id}/policy", constraint_status=constraint_status,
         )
 
-    def inspect_model_details(self, experiment_id: str, checkpoint_id: str) -> ModelInspection:
-        """An owned checkpoint's manifest with whole-tensor statistics by layer (charged as compute time)."""
-        return self.experiments.inspect_details(experiment_id, checkpoint_id)
+    def inspect_model_details(self, experiment_id: str, checkpoint_id: str, *, cursor: Any = None) -> ModelInspection:
+        """An owned checkpoint's manifest with whole-tensor statistics by layer (charged as compute time).
+
+        An inspection whose tensors exceed the experiment policy's
+        inline-result limit is paged: ``cursor`` is ``None`` for the first
+        page, then the ``tensor_page.next_cursor`` of the page before.
+        """
+        return self.experiments.inspect_details(experiment_id, checkpoint_id, cursor=cursor)
 
     def find_patch(self, patch_id: str) -> PatchDocument:
         """A visible patch by ID alone: its preview and stored artifact."""
@@ -1484,15 +1508,31 @@ class Engine:
         self._require_operator("storing evaluation data")
         return self.datasets.put(data, generation=generation)
 
-    def get_report(self, experiment_id: str, report_id: str) -> EvaluationReport:
-        """An evaluation report of the experiment; final reports are withheld until it is closed."""
+    def get_report(self, experiment_id: str, report_id: str, *, bounded: bool = False) -> EvaluationReport:
+        """An evaluation report of the experiment; final reports are withheld until it is closed.
+
+        ``bounded`` returns the report as ``wse_get_report`` does, within the
+        experiment policy's inline-result limit (``EvaluationService.report_view``):
+        whole when it fits; else, for a generation report, with every tail
+        shortened to one common bound; else a ``ReportOverview`` (a subclass)
+        without its per-example results, which names the paged report resource.
+        """
+        if bounded:
+            return self.evaluation.report_view(experiment_id, report_id)
         return self.evaluation.get_report(experiment_id, report_id)
 
     def list_reports(self, experiment_id: str) -> list[EvaluationReport]:
         return self.evaluation.list_reports(experiment_id)
 
-    def compare(self, experiment_id: str, base_report_id: str, candidate_report_id: str) -> ComparisonReport:
-        """Paired difference and intervals of two development reports on the same examples and configuration."""
+    def compare(self, experiment_id: str, base_report_id: str,
+                candidate_report_id: str) -> ComparisonReport | GenerationComparison:
+        """Paired difference and intervals of two development reports on the same examples and configuration.
+
+        Two generation reports (passes of a generation suite) give a
+        ``GenerationComparison``: accuracy, limit-hit rate, and mean generated
+        tokens, each with a paired interval over problems. Other reports give
+        M1's ``ComparisonReport`` of accuracy.
+        """
         return self.evaluation.compare(experiment_id, base_report_id, candidate_report_id)
 
     def freeze(self, experiment_id: str, expected_selected_id: str) -> Experiment:

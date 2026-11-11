@@ -51,7 +51,7 @@ import torch
 from pydantic import BaseModel
 
 from wse.operators.base import MAX_VECTOR_REFERENCE_LENGTH, VECTOR_REFERENCE_PATTERN, TensorRegion
-from wse.operators.tensor import shortest_floats
+from wse.operators.tensor import FLOAT32_OVERFLOW, shortest_floats
 from wse.adapters.base import CAP_WEIGHTS_READ
 from wse.policy import (
     OperationPolicy,
@@ -83,7 +83,6 @@ if TYPE_CHECKING:
 
 # Stored dtypes that reads and analyses accept, with the NumPy dtype in which a region reaches them.
 SUPPORTED_DTYPES = {"bfloat16": np.float32, "float16": np.float16, "float32": np.float32, "float64": np.float64}
-_FLOAT32_MAX = float(np.finfo(np.float32).max)
 
 # Timing fields are measured with a fixed-width stand-in so that whether a
 # response fits never depends on how long the call took.
@@ -316,8 +315,9 @@ def resolve_vector_reference(reference: str, read_result: ReadResult, *, paramet
     ``read_result`` returns a stored result the caller may read; a run reads
     only results its own experiment produced, and any other URI is reported
     exactly like one that does not exist. The pointer must name a non-empty
-    list of finite numbers within the float32 range, of at most
-    ``max_length`` values.
+    list of finite numbers that round to finite float32 values (so
+    ``3.4028235e+38``, the float32 maximum in its shortest digits, is one), of
+    at most ``max_length`` values.
     """
     if isinstance(reference, str) and len(reference) > MAX_VECTOR_REFERENCE_LENGTH:
         raise WSEError(ErrorCode.INVALID_ARGUMENT,
@@ -371,7 +371,7 @@ def resolve_vector_reference(reference: str, read_result: ReadResult, *, paramet
                        "accepted",
                        details={"parameter": parameter, "uri": uri, "length": len(value), "max_length": max_length})
     wide = np.asarray(value, dtype=np.float64)
-    bad = int(np.count_nonzero(~np.isfinite(wide) | (np.abs(wide) > _FLOAT32_MAX)))
+    bad = int(np.count_nonzero(~np.isfinite(wide) | (np.abs(wide) >= FLOAT32_OVERFLOW)))
     if bad:
         raise WSEError(ErrorCode.INVALID_ARGUMENT,
                        f"{parameter} reference {reference!r} names {bad} value(s) that are not finite float32 numbers",

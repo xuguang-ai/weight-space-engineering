@@ -7,6 +7,14 @@ that region, computed in FP32; the patch engine writes them back to the
 stored dtype (BF16, F16, or F32) with round-to-nearest-even. None of them calls the model adapter's
 ``forward``. Element values in results use the shortest decimal digits that
 round-trip the stored dtype.
+
+A number is accepted where a float32 value is expected (``set_slice``
+values, a ``scale_slice`` factor) when it is finite and rounds to a finite
+float32 (``float32_finite``: its magnitude is below ``2^128 - 2^103``),
+which includes the shortest digits of the largest float32,
+``3.4028235e+38``. A flat list of ``set_slice`` values is accepted for a
+selection with at most one axis longer than 1, and is recorded in the
+selection's nesting.
 """
 
 from __future__ import annotations
@@ -233,7 +241,13 @@ BUILTIN_ANALYSES: dict[str, BaseAnalysisOperator] = {
 
 _EDIT_USAGE = UsageContract(counter="candidate_commits", units_per_call=1, model_forward_calls=0)
 _EDIT_CAPABILITIES = [CAP_WEIGHTS_READ, CAP_WEIGHTS_SLICE_EDIT]
-_FLOAT32_MAX = float(np.finfo(np.float32).max)
+# Magnitudes at or above this round to infinity in float32: the largest float32 plus half its spacing.
+FLOAT32_OVERFLOW = 2.0 ** 128 - 2.0 ** 103
+
+
+def float32_finite(value: float) -> bool:
+    """True when ``value`` is finite and rounds to a finite float32 (``3.4028235e+38`` does)."""
+    return math.isfinite(value) and abs(value) < FLOAT32_OVERFLOW
 
 # Nested lists of numbers, one nesting level per axis of the selection.
 NestedValues = TypeAliasType("NestedValues", "list[float] | list[NestedValues]")
@@ -263,6 +277,13 @@ class SetSliceOperator(BaseEditOperator):
     )
 
     def resolve_parameters(self, parameters: Mapping[str, Any], region: TensorRegion) -> SetSliceParameters:
+        """The checked values, in the selection's nesting.
+
+        A flat list is accepted for a selection with at most one axis longer
+        than 1 (for example ``[v, v, v, v]`` for one row of four columns) and
+        is recorded in the selection's nesting (``[[v, v, v, v]]``), so both
+        forms make the same patch.
+        """
         parsed = parse_parameters(self.spec, SetSliceParameters, parameters)
         assert isinstance(parsed, SetSliceParameters)
         expected = tuple(region.values.shape)
@@ -270,11 +291,18 @@ class SetSliceOperator(BaseEditOperator):
             array = np.array(parsed.values, dtype=np.float64)
         except ValueError:
             array = None
+        squeezable = sum(1 for extent in expected if extent != 1) <= 1
+        if array is not None and array.ndim == 1 and array.shape != expected and squeezable \
+                and array.size == math.prod(expected):
+            array = array.reshape(expected)
+            parsed = SetSliceParameters(values=array.tolist())
         if array is None or array.shape != expected:
+            flat = (f"; a flat list of {math.prod(expected)} values is accepted too" if squeezable else
+                    "; a flat list is accepted only when at most one axis of the selection is longer than 1")
             raise WSEError(
                 ErrorCode.INVALID_ARGUMENT,
                 f"set_slice values must be nested lists of shape {list(expected)} to match the selection "
-                f"exactly; got {_shape_text(parsed.values)}",
+                f"exactly ({_nesting(expected)}); got {_shape_text(parsed.values)}{flat}",
                 details={"expected_shape": list(expected), "tensor": region.tensor},
             )
         _require_float32_range(array, "set_slice values", region.tensor)
@@ -291,7 +319,7 @@ class ScaleSliceParameters(OperatorParameters):
     @field_validator("factor")
     @classmethod
     def _finite(cls, value: float) -> float:
-        if not math.isfinite(value) or abs(value) > _FLOAT32_MAX:
+        if not float32_finite(value):
             raise ValueError("factor must be a finite number within the float32 range")
         return value
 
@@ -325,8 +353,16 @@ def _shape_text(values: Any) -> str:
         return "ragged nested lists"
 
 
+def _nesting(shape: tuple[int, ...]) -> str:
+    """The nesting that ``shape`` needs, in words: ``a list of 2 lists of 4 numbers`` for ``(2, 4)``."""
+    text = f"{shape[-1]} numbers"
+    for extent in reversed(shape[:-1]):
+        text = f"{extent} lists of {text}"
+    return f"a list of {text}"
+
+
 def _require_float32_range(array: np.ndarray, what: str, tensor: str) -> None:
-    bad = int(np.count_nonzero(~np.isfinite(array) | (np.abs(array) > _FLOAT32_MAX)))
+    bad = int(np.count_nonzero(~np.isfinite(array) | (np.abs(array) >= FLOAT32_OVERFLOW)))
     if bad:
         raise WSEError(
             ErrorCode.INVALID_ARGUMENT,

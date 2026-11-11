@@ -12,7 +12,19 @@
   experiment. It rejects reports whose suite, data, configuration, sample,
   or clusters differ (``INCOMPATIBLE_REPORTS``) and reports the paired
   accuracy difference with a cluster-bootstrap interval, plus exact
-  Clopper-Pearson intervals on fully correct clusters.
+  Clopper-Pearson intervals on fully correct clusters. Two reports of a
+  generation suite (generation passes, whose reports carry per-problem
+  results) are paired by ``compare_generation`` instead: accuracy, limit-hit
+  rate, and mean generated tokens, each with a paired cluster-bootstrap
+  interval over problems (a ``GenerationComparison`` that names the
+  experiment, the reports, and their checkpoints).
+* **Inline reports.** ``report_view`` is a report as ``wse_get_report``
+  returns it, within the experiment policy's inline-result limit (both of
+  its copies in an MCP response, ``wse.policy.response_size``, within twice
+  ``max_result_json_bytes``): whole when it fits; else, for a generation
+  report, with every tail shortened to the same bound (each still the end of
+  its output); else a ``ReportOverview`` without its per-example results,
+  which points to the paged report resource.
 * **Final evaluation.** An operator action on a ``FROZEN`` experiment: it
   evaluates the frozen selected checkpoint and, as a fixed control, the
   experiment's base checkpoint on the task's final suite with one fixed
@@ -38,6 +50,7 @@ from pydantic import ValidationError
 from wse.audit import record_event
 from wse.database import utc_now
 from wse.evaluators.classification import fully_correct_interval, paired_comparison
+from wse.policy import response_size
 from wse.schemas import (
     OBJECT_ID_PATTERNS,
     ComparisonReport,
@@ -46,6 +59,8 @@ from wse.schemas import (
     EvaluationReport,
     EvaluationSuite,
     FinalEvaluationReport,
+    GenerationComparison,
+    ReportOverview,
     TaskDefinition,
     Usage,
     WSEError,
@@ -56,12 +71,47 @@ if TYPE_CHECKING:
     from wse.api import Engine, EvaluationResult
 
 FINAL_BATCH_SIZE = 64
+# The fields of a report that an overview leaves out: its per-example results.
+REPORT_DETAIL_FIELDS = ("problems", "scores", "cluster_ids")
 
 
 def _new_report_id() -> str:
     import secrets
 
     return f"report_{secrets.token_hex(16)}"
+
+
+def _shorter_tails(report: EvaluationReport, budget: int) -> EvaluationReport | None:
+    """``report`` with every sample's tail cut to the largest common bound whose response fits ``budget`` bytes.
+
+    A tail is cut to its own end (``tail_excerpt``), so it stays the end of
+    its output. ``None`` when the report has no tails or does not fit even
+    with empty ones.
+    """
+    from wse.evaluators.generation import json_string_bytes, tail_excerpt
+
+    tails = [sample.tail for problem in report.problems or [] for sample in problem.samples if sample.tail]
+    if not tails:
+        return None
+
+    def cut(bound: int) -> EvaluationReport:
+        return report.model_copy(update={"problems": [problem.model_copy(update={"samples": [
+            sample.model_copy(update={"tail": tail_excerpt(sample.tail, bound)}) if sample.tail else sample
+            for sample in problem.samples]}) for problem in report.problems]})
+
+    def fits(bound: int) -> bool:
+        return response_size(cut(bound).model_dump(mode="json")) <= budget
+
+    low, high = 0, max(json_string_bytes(tail) for tail in tails)
+    if not fits(low):
+        return None
+    while low < high:  # the largest bound that fits
+        middle = (low + high + 1) // 2
+        if fits(middle):
+            low = middle
+        else:
+            high = middle - 1
+    return cut(low)
 
 
 class EvaluationService:
@@ -221,6 +271,31 @@ class EvaluationService:
                 raise missing from None
             raise
 
+    def report_view(self, experiment_id: str, report_id: str) -> EvaluationReport | ReportOverview:
+        """A report as ``wse_get_report`` returns it, within the experiment policy's inline-result limit.
+
+        The report itself when both of its copies in an MCP response
+        (``response_size``) take at most twice ``max_result_json_bytes``.
+        Otherwise a generation report's tails are shortened to the largest
+        common bound that fits (each tail stays the end of its output; the
+        stored report and the resource keep the tails as generated); when
+        even empty tails do not fit, the result is a ``ReportOverview``. Final
+        reports are withheld until the experiment is closed, as by
+        ``get_report``.
+        """
+        report = self.get_report(experiment_id, report_id)
+        limit = self.experiments.experiment_policy(experiment_id).operations.limits.max_result_json_bytes
+        if response_size(report.model_dump(mode="json")) <= 2 * limit:
+            return report
+        shortened = _shorter_tails(report, 2 * limit)
+        if shortened is not None:
+            return shortened
+        size = len(report.canonical_json().encode("utf-8"))
+        omitted = [name for name in REPORT_DETAIL_FIELDS if getattr(report, name) is not None]
+        return ReportOverview.model_validate({**report.model_dump(mode="json", exclude=set(omitted)),
+                                              "omitted": omitted, "report_bytes": size, "limit_bytes": limit,
+                                              "resource_uri": report.report_uri})
+
     def list_reports(self, experiment_id: str) -> list[EvaluationReport]:
         experiment = self.experiments._experiment_row(experiment_id)
         rows = self.db.conn.execute(
@@ -270,8 +345,13 @@ class EvaluationService:
             **paired,
         )
 
-    def compare(self, experiment_id: str, base_report_id: str, candidate_report_id: str) -> ComparisonReport:
-        """Paired comparison of two development reports of the experiment (read-only, not charged)."""
+    def compare(self, experiment_id: str, base_report_id: str,
+                candidate_report_id: str) -> ComparisonReport | GenerationComparison:
+        """Paired comparison of two development reports of the experiment (read-only, not charged).
+
+        Reports of a generation suite give a ``GenerationComparison``
+        (``compare_generation``); others, M1's ``ComparisonReport``.
+        """
         experiment = self.experiments._experiment_row(experiment_id)
         base = self._load_report(experiment, base_report_id)
         candidate = self._load_report(experiment, candidate_report_id)
@@ -281,6 +361,8 @@ class EvaluationService:
                                f"report {report.report_id} is a final report; its comparison is part of the final "
                                "evaluation report", details={"report_id": report.report_id})
         self._check_comparable(base, candidate)
+        if base.problems is not None or candidate.problems is not None:
+            return self._generation_comparison(experiment_id, base, candidate)
         if base.scores is None or candidate.scores is None or base.cluster_ids is None:
             raise WSEError(ErrorCode.INCOMPATIBLE_REPORTS,
                            f"evaluator {base.evaluator} reports no per-example scores, so its reports cannot be paired",
@@ -289,6 +371,18 @@ class EvaluationService:
             raise WSEError(ErrorCode.INCOMPATIBLE_REPORTS, "the reports cover different clusters of examples",
                            details={"mismatched": ["cluster_ids"]})
         return self._comparison(experiment_id, base, candidate, base.scores, candidate.scores, base.cluster_ids)
+
+    @staticmethod
+    def _generation_comparison(experiment_id: str, base: EvaluationReport,
+                               candidate: EvaluationReport) -> GenerationComparison:
+        """``compare_generation`` of two generation reports, naming the experiment, the reports, and the checkpoints."""
+        from wse.evaluators.generation import compare_generation
+
+        comparison = compare_generation(base, candidate)
+        return GenerationComparison.model_validate({
+            **comparison.model_dump(mode="json"), "experiment_id": experiment_id, "base_report_id": base.report_id,
+            "candidate_report_id": candidate.report_id, "base_checkpoint_id": base.checkpoint_id,
+            "candidate_checkpoint_id": candidate.checkpoint_id, "management": "managed"})
 
     # -- final evaluation (operator) ---------------------------------------------
 
@@ -520,5 +614,5 @@ def render_markdown(value: EvaluationReport | ComparisonReport | FinalEvaluation
     return evaluation_report_markdown(value)
 
 
-__all__ = ["EvaluationService", "FINAL_BATCH_SIZE", "comparison_markdown", "evaluation_report_markdown",
-           "final_report_markdown", "render_markdown"]
+__all__ = ["EvaluationService", "FINAL_BATCH_SIZE", "REPORT_DETAIL_FIELDS", "comparison_markdown",
+           "evaluation_report_markdown", "final_report_markdown", "render_markdown"]

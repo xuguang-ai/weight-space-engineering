@@ -14,17 +14,25 @@ decisions, and usage accounting.
   experiment, and that experiment's candidates, patches, jobs, and reports;
   any other ID fails exactly like an ID that does not exist. Operator
   actions (imports, grants, freezing, final evaluation) are not exposed.
-* **Tools.** The 13 tools of Section 4.1. Names use only letters, digits,
-  and ``_`` (at most 64 characters), because OpenAI Agents SDK forwards MCP
-  tool names verbatim as model function names. Every mutation takes an
-  ``idempotency_key``.
+* **Tools.** The 13 tools of Section 4.1 and, for language models (M2 plan
+  Section 5.6), ``wse_probe`` (activation probes) and ``wse_get_report``
+  (whole reports). Names use only letters, digits, and ``_`` (at most 64
+  characters), because OpenAI Agents SDK forwards MCP tool names verbatim as
+  model function names. Every mutation takes an ``idempotency_key``. Every
+  tool that names the experiment lets the agent omit ``experiment_id``: a
+  run-bound server has one experiment (``Engine.resolve_experiment_id``).
 * **Results.** A successful call returns ``structuredContent`` validated
   against the tool's ``outputSchema`` and a text content block that is the
   canonical compact JSON of exactly the same object, because OpenAI Agents
   SDK shows the model the text, not ``structuredContent``. Every result has
   a one-line ``summary``, the artifact ``uris`` it refers to, the per-call
   usage where the domain object records one, and the experiment's
-  cumulative budget, around the domain ``result``.
+  cumulative budget, around the domain ``result``. Results stay within the
+  experiment policy's inline-result limit also for open-weight models with
+  hundreds of tensors: previews list the changed tensors, inspections are
+  paged, an applied candidate's manifest lists its changed tensors, and a
+  report too large for one result is a ``ReportOverview`` that names its
+  paged resource. M1 models, whose results fit whole, keep their M1 forms.
 * **Errors.** A domain failure is returned as an MCP tool error
   (``isError``) whose text is ``Error executing tool <name>: `` followed by
   the canonical JSON ``{"error": {"code", "message", "retryable",
@@ -61,16 +69,20 @@ from wse.api import MODEL_PAGE_SIZE, Engine, model_list_page
 from wse.api import manifest_uri as _manifest_uri
 from wse.jobs import MAX_WAIT_SECONDS
 from wse.jobs import _wait_seconds as wait_seconds_value
+from wse.probes import DEFAULT_SUMMARY_TOP, MAX_PROBE_SITES, MAX_SUMMARY_TOP
 from wse.store import ANALYSIS_URI_PREFIX
 from wse.schemas import (
+    MAX_PROBE_STRING_CHARACTERS,
     AnalysisResult,
     AxisSlice,
     BudgetEntry,
     ComparisonReport,
     ErrorCode,
     EvalConfig,
+    EvaluationReport,
     Experiment,
     ExperimentDescription,
+    GenerationComparison,
     Job,
     ModelInspection,
     ModelList,
@@ -78,6 +90,12 @@ from wse.schemas import (
     ModelSummary,
     PatchPreview,
     PatchSpec,
+    ProbeGroups,
+    ProbeOutputText,
+    ProbeRoleSite,
+    ProbeStringText,
+    ProbeSuiteText,
+    ReportOverview,
     TensorSlice,
     Usage,
     WSEError,
@@ -89,6 +107,7 @@ RESOURCE_PAGE_BYTES = 32 * 1024
 PAGE_ENVELOPE_BYTES = 256
 WAIT_POLL_SECONDS = 0.05
 READ_COUNTERS = ("tensor_read_calls", "compute_seconds")
+PROBE_COUNTERS = ("probe_calls", "teacher_forced_tokens", "compute_seconds")
 
 T = TypeVar("T")
 logger = logging.getLogger("wse.mcp")
@@ -106,8 +125,9 @@ class ToolUsage(BaseModel):
     previews, and settled jobs) and ``null`` when the result records none;
     the call's charges are then visible in ``cumulative``. ``cumulative``
     maps ledger counters to their limit, consumed, reserved, and remaining
-    amounts; read and analysis results list only the counters they charge,
-    which keeps those responses within the response-size limit.
+    amounts; read, analysis, and probe-job results list only the counters
+    they charge, and ``wse_get_report`` (not charged) lists none, which keeps
+    those responses within the response-size limit.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -158,6 +178,8 @@ PATCH_SPEC_SCHEMA = _inline_refs(PatchSpec.model_json_schema())
 EVAL_CONFIG_SCHEMA = _inline_refs(EvalConfig.model_json_schema())
 
 IdArg = Annotated[str, Field(description="An ID returned by an earlier tool call.")]
+ExperimentIdArg = Annotated[str | None, Field(description="This run's experiment ID (from wse_create_experiment); "
+                                                          "omit it to use this run's experiment.")]
 KeyArg = Annotated[str, Field(description="A client-chosen key: repeating a request with the same key and input "
                                           "returns the original result without charging again; use a new key for a "
                                           "new request.")]
@@ -167,6 +189,43 @@ EvalConfigArg = Annotated[Any, WithJsonSchema({**EVAL_CONFIG_SCHEMA, "descriptio
                                                "and seed of the suite; the server fixes the device and batch size."})]
 WaitArg = Annotated[float, Field(json_schema_extra={"minimum": 0, "maximum": MAX_WAIT_SECONDS},
                                  description="Seconds (0-10) to hold the call until the job is terminal.")]
+CursorArg = Annotated[str | None, Field(description="Omit for the first page; pass tensor_page.next_cursor for the "
+                                                    "next one.")]
+PARAMETERS_SCHEMA: dict[str, Any] = {
+    "anyOf": [{"type": "object"}, {"type": "null"}], "default": None,
+    "description": "The analysis's own parameters, for example {\"axis\": \"rows\"} for tensor_norms, {\"k\": 4} for "
+                   "svd_top_k, or {\"direction\": [...] or \"<result_uri>#<JSON pointer>\", \"axis\": \"columns\"} for "
+                   "direction_projection."}
+PROBE_TEXTS_SCHEMA: dict[str, Any] = {
+    "type": "array", "minItems": 1,
+    "items": {"anyOf": [_inline_refs(model.model_json_schema())
+                        for model in (ProbeOutputText, ProbeStringText, ProbeSuiteText)]},
+    "description": "The texts to teacher-force, at most the policy's texts_per_probe_call, each cut to its last "
+                   "tokens_per_probe_text tokens: {\"output_uri\": ..., \"last\": n} (an output of this run's "
+                   "generation passes, a sample's output_uri from wse_get_report; last, optional, keeps its last n "
+                   "tokens), "
+                   f"{{\"text\": \"...\"}} (1 to {MAX_PROBE_STRING_CHARACTERS} characters), or {{\"suite_id\": ..., "
+                   "\"item\": i} (an item of a development suite of this run's task)."}
+PROBE_SITES_SCHEMA: dict[str, Any] = {
+    "type": "array", "minItems": 1, "maxItems": MAX_PROBE_SITES,
+    "items": {"anyOf": [{"type": "string", "minLength": 1}, _inline_refs(ProbeRoleSite.model_json_schema())]},
+    "description": "Where to read activations: \"residual:<i>\" (the residual stream entering decoder layer i; "
+                   "residual:<L> is the last layer's output), \"<module path>:input\" or \"<module path>:output\" (a "
+                   "module path is a tensor name without its last part, such as model.layers.3.mlp.down_proj), or a "
+                   "role site {\"role\": \"mlp.down\", \"layer\": 3, \"point\": \"input\"}."}
+PROBE_GROUPS_SCHEMA: dict[str, Any] = {
+    "anyOf": [_inline_refs(ProbeGroups.model_json_schema()), {"type": "null"}], "default": None,
+    "description": "Optional: two disjoint groups of text indices, {\"a\": [...], \"b\": [...]}, with at least three "
+                   "texts together; each site then gets the contrast mean(a) - mean(b)."}
+PROBE_TOP_SCHEMA: dict[str, Any] = {
+    "anyOf": [{"type": "integer", "minimum": 1, "maximum": MAX_SUMMARY_TOP}, {"type": "null"}], "default": None,
+    "description": f"Optional: the top standardized dimensions per site in the summary (1-{MAX_SUMMARY_TOP}; "
+                   f"default {DEFAULT_SUMMARY_TOP})."}
+ParametersArg = Annotated[Any, WithJsonSchema(PARAMETERS_SCHEMA)]
+ProbeTextsArg = Annotated[Any, WithJsonSchema(PROBE_TEXTS_SCHEMA)]
+ProbeSitesArg = Annotated[Any, WithJsonSchema(PROBE_SITES_SCHEMA)]
+ProbeGroupsArg = Annotated[Any, WithJsonSchema(PROBE_GROUPS_SCHEMA)]
+ProbeTopArg = Annotated[Any, WithJsonSchema(PROBE_TOP_SCHEMA)]
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, idempotent_hint=True, destructive_hint=False,
                             open_world_hint=False)
@@ -318,16 +377,22 @@ class WSEMCPServer:
             (self.wse_inspect_model, METERED),
             (self.wse_read_tensor, METERED),
             (self.wse_analyze, METERED),
+            (self.wse_probe, MUTATION),
             (self.wse_preview_patch, MUTATION),
             (self.wse_apply_patch, MUTATION),
             (self.wse_submit_evaluation, MUTATION),
             (self.wse_get_job, READ_ONLY),
+            (self.wse_get_report, READ_ONLY),
             (self.wse_cancel_job, MUTATION),
             (self.wse_compare, READ_ONLY),
             (self.wse_select_checkpoint, MUTATION),
         ]
         for function, annotations in tools:
             self.server.add_tool(function, name=function.__name__, annotations=annotations)
+
+    def _experiment_id(self, experiment_id: str | None) -> str:
+        """The experiment a call names: ``experiment_id``, or this run's experiment when it is omitted."""
+        return self.engine.resolve_experiment_id(experiment_id)
 
     def wse_list_models(self, cursor: Annotated[str | None, Field(
             description="Omit for the first page; pass next_cursor for the next one.")] = None,
@@ -354,154 +419,258 @@ class WSEMCPServer:
                 usage=self._usage(experiment.experiment_id, None), result=description)
         return _respond(self._call(run))
 
-    def wse_get_experiment(self, experiment_id: IdArg) -> Annotated[CallToolResult,
-                                                                    ToolResponse[ExperimentDescription]]:
+    def wse_get_experiment(self, *, experiment_id: ExperimentIdArg = None,
+                           ) -> Annotated[CallToolResult, ToolResponse[ExperimentDescription]]:
         """State, task definition and objective, selected checkpoint, budget, permitted operations, and suites."""
         def run() -> ToolResponse[ExperimentDescription]:
-            description = self._describe(experiment_id)
+            eid = self._experiment_id(experiment_id)
+            description = self._describe(eid)
             experiment = description.experiment
             return ToolResponse[ExperimentDescription](
                 summary=f"experiment {experiment.experiment_id} is {experiment.state} in {experiment.mode} mode; "
                         f"selected checkpoint {experiment.selected_checkpoint_id}",
                 uris=[description.policy_uri, *(_manifest_uri(c.checkpoint_id) for c in description.checkpoints)],
-                usage=self._usage(experiment_id, None), result=description)
+                usage=self._usage(eid, None), result=description)
         return _respond(self._call(run))
 
-    def wse_inspect_model(self, experiment_id: IdArg, checkpoint_id: IdArg,
-                          ) -> Annotated[CallToolResult, ToolResponse[ModelInspection]]:
+    def wse_inspect_model(self, *, experiment_id: ExperimentIdArg = None, checkpoint_id: IdArg,
+                          cursor: CursorArg = None) -> Annotated[CallToolResult, ToolResponse[ModelInspection]]:
         """The manifest of a checkpoint of this experiment and whole-tensor statistics by layer.
 
-        The manifest is free; computing the statistics is charged as compute time.
+        The manifest is free; computing the statistics is charged as compute time. A model whose tensors do not
+        fit one result is paged: tensor_page names the page's tensors, and its next_cursor, passed as cursor,
+        returns the next page.
         """
         def run() -> ToolResponse[ModelInspection]:
-            inspection = self.engine.inspect_model_details(experiment_id, checkpoint_id)
-            return ToolResponse[ModelInspection](
-                summary=f"{inspection.role} checkpoint {checkpoint_id}: {len(inspection.manifest.tensors)} tensors, "
-                        f"{inspection.manifest.parameter_count} parameters",
-                uris=[inspection.manifest_uri], usage=self._usage(experiment_id, inspection.usage),
-                result=inspection)
+            eid = self._experiment_id(experiment_id)
+            inspection = self.engine.inspect_model_details(eid, checkpoint_id, cursor=cursor)
+            manifest, page = inspection.manifest, inspection.tensor_page
+            summary = (f"{inspection.role} checkpoint {checkpoint_id}: {len(manifest.tensors)} tensors, "
+                       f"{manifest.parameter_count} parameters")
+            if page is not None:
+                summary = (f"{inspection.role} checkpoint {checkpoint_id}: tensors {page.start}-{page.stop - 1} of "
+                           f"{page.tensor_count} (page {page.page + 1} of {page.page_count}), "
+                           f"{manifest.parameter_count} parameters; "
+                           + (f"pass cursor {page.next_cursor} for the next page" if page.next_cursor
+                              else "the last page"))
+            return ToolResponse[ModelInspection](summary=summary, uris=[inspection.manifest_uri],
+                                                 usage=self._usage(eid, inspection.usage), result=inspection)
         return _respond(self._call(run))
 
-    def wse_read_tensor(self, experiment_id: IdArg, checkpoint_id: IdArg,
+    def wse_read_tensor(self, *, experiment_id: ExperimentIdArg = None, checkpoint_id: IdArg,
                         tensor: Annotated[str, Field(description="Exact tensor name from the manifest.")],
                         selection: SelectionArg) -> Annotated[CallToolResult, ToolResponse[TensorSlice]]:
         """Read a bounded slice (at most 2,048 elements); larger requests fail with the largest permitted selection."""
         def run() -> ToolResponse[TensorSlice]:
-            region = self.engine.read_model_tensor(experiment_id, checkpoint_id, tensor, selection)
+            eid = self._experiment_id(experiment_id)
+            region = self.engine.read_model_tensor(eid, checkpoint_id, tensor, selection)
             return ToolResponse[TensorSlice](
                 summary=f"{region.element_count} values of {region.tensor}", uris=[],
-                usage=self._usage(experiment_id, region.usage, READ_COUNTERS), result=region)
+                usage=self._usage(eid, region.usage, READ_COUNTERS), result=region)
         return _respond(self._call(run))
 
-    def wse_analyze(self, experiment_id: IdArg, checkpoint_id: IdArg,
+    def wse_analyze(self, *, experiment_id: ExperimentIdArg = None, checkpoint_id: IdArg,
                     kind: Annotated[str, Field(description="A permitted analysis kind (see wse_get_experiment).")],
                     tensor: Annotated[str, Field(description="Exact tensor name from the manifest.")],
                     selection: SelectionArg,
                     k: Annotated[int | None, Field(description="top_k only: 1 <= k <= min(64, element count); "
                                                                "defaults to min(16, element count).")] = None,
+                    parameters: ParametersArg = None,
                     ) -> Annotated[CallToolResult, ToolResponse[AnalysisResult]]:
-        """Run a permitted registered analysis (stats, norm, or top_k) on a tensor slice."""
+        """Run a permitted registered analysis on a tensor slice (stats, norm, top_k, and the kinds the policy adds).
+
+        Vector results (tensor_norms, svd_top_k, direction_projection) are stored at result_uri, and the result
+        carries a summary and the top entries. A stored vector is named <result_uri>#<JSON pointer>, for example
+        #/right_vectors/0 or a probe's #/sites/0/contrast/direction, in parameters of a later analysis or in a
+        wse_preview_patch operation.
+        """
         def run() -> ToolResponse[AnalysisResult]:
-            result = self.engine.analyze_model(experiment_id, checkpoint_id, kind, tensor, selection, k)
+            eid = self._experiment_id(experiment_id)
+            result = self.engine.analyze_model(eid, checkpoint_id, kind, tensor, selection, k, parameters=parameters)
             counters = tuple(name for name, value in result.usage.model_dump().items()
                              if isinstance(value, (int, float)) and value) + ("compute_seconds",)
             return ToolResponse[AnalysisResult](
                 summary=f"{result.kind} of {result.element_count} elements of {result.tensor}",
                 uris=[result.result_uri] if result.result_uri else [],
-                usage=self._usage(experiment_id, result.usage, counters), result=result)
+                usage=self._usage(eid, result.usage, counters), result=result)
         return _respond(self._call(run))
 
-    def wse_preview_patch(self, experiment_id: IdArg, patch_spec: PatchSpecArg, idempotency_key: KeyArg,
-                          ) -> Annotated[CallToolResult, ToolResponse[PatchPreview]]:
+    def wse_probe(self, *, experiment_id: ExperimentIdArg = None, checkpoint_id: IdArg, texts: ProbeTextsArg,
+                  sites: ProbeSitesArg, idempotency_key: KeyArg, groups: ProbeGroupsArg = None,
+                  top: ProbeTopArg = None) -> Annotated[CallToolResult, ToolResponse[Job]]:
+        """Queue an activation probe of a checkpoint of this experiment and return its job; wait with wse_get_job.
+
+        Each text is teacher-forced in one forward pass. The finished job's result is an inline summary: per text
+        its tokens, window, and mean log-probability; per site its mean norms and, with groups, the contrast norm
+        and the top standardized dimensions. Every vector is stored at the summary's result_uri and is named
+        <result_uri>#/sites/<i>/contrast/direction (or #/sites/<i>/group_means/a, #/sites/<i>/mean), with i the
+        site's position, in wse_analyze parameters or a wse_preview_patch operation. Charged: one probe call and
+        the teacher-forced tokens its forwards read.
+        """
+        def run() -> ToolResponse[Job]:
+            eid = self._experiment_id(experiment_id)
+            job = self.engine.submit_probe(eid, checkpoint_id, texts, sites, idempotency_key, groups=groups, top=top)
+            return self._job_response(eid, job)
+        return _respond(self._call(run))
+
+    def wse_preview_patch(self, *, experiment_id: ExperimentIdArg = None, patch_spec: PatchSpecArg,
+                          idempotency_key: KeyArg) -> Annotated[CallToolResult, ToolResponse[PatchPreview]]:
         """Validate a declarative patch and save an immutable preview without changing the selected checkpoint.
 
         Example patch_spec for a hypothetical 8-input MLP (IDs come from earlier results):
         {"base_checkpoint_id": "ckpt_...", "hypothesis": "Hidden unit 3 dominates the output.",
         "operations": [{"op": "scale_slice", "tensor": "layers.0.weight",
         "selection": [{"start": 3, "stop": 4, "step": 1}, {"start": 0, "stop": 8, "step": 1}], "factor": 0.5}]}
+        Each operation names a permitted edit (see wse_get_experiment) with its parameters, for example
+        fill_slice's value, project_out's direction and columns, or add_low_rank's u, v, and alpha; a direction or
+        factor may be a stored vector, <result_uri>#<JSON pointer>. For a model with many tensors, tensors lists
+        the changed tensors' diffs and unchanged_tensors counts the others.
         """
         def run() -> ToolResponse[PatchPreview]:
-            preview = self.engine.preview_patch(experiment_id, patch_spec, idempotency_key)
+            eid = self._experiment_id(experiment_id)
+            preview = self.engine.preview_patch(eid, patch_spec, idempotency_key)
             return ToolResponse[PatchPreview](
                 summary=f"patch {preview.patch_id} changes {preview.changed_elements} of {preview.parameter_count} "
                         "parameters", uris=[preview.patch_uri],
-                usage=self._usage(experiment_id, preview.usage), result=preview)
+                usage=self._usage(eid, preview.usage), result=preview)
         return _respond(self._call(run))
 
-    def wse_apply_patch(self, experiment_id: IdArg, patch_id: IdArg, idempotency_key: KeyArg,
+    def wse_apply_patch(self, *, experiment_id: ExperimentIdArg = None, patch_id: IdArg, idempotency_key: KeyArg,
                         ) -> Annotated[CallToolResult, ToolResponse[ModelManifest]]:
-        """Create a candidate checkpoint from a previewed patch (by patch_id only); it does not select it."""
+        """Create a candidate checkpoint from a previewed patch (by patch_id only); it does not select it.
+
+        For a model with many tensors, the manifest lists the tensors the patch changed and unchanged_tensors
+        counts the others; wse_inspect_model lists them all.
+        """
         def run() -> ToolResponse[ModelManifest]:
-            manifest = self.engine.apply_patch(experiment_id, patch_id, idempotency_key)
+            eid = self._experiment_id(experiment_id)
+            manifest = self.engine.apply_patch(eid, patch_id, idempotency_key, bounded=True)
+            summary = f"candidate checkpoint {manifest.checkpoint_id} from patch {patch_id}"
+            if manifest.unchanged_tensors is not None:
+                summary += (f"; its manifest lists the {len(manifest.tensors)} changed tensors of "
+                            f"{len(manifest.tensors) + manifest.unchanged_tensors}")
             return ToolResponse[ModelManifest](
-                summary=f"candidate checkpoint {manifest.checkpoint_id} from patch {patch_id}",
-                uris=[_manifest_uri(manifest.checkpoint_id), _patch_uri(patch_id)],
-                usage=self._usage(experiment_id, None), result=manifest)
+                summary=summary, uris=[_manifest_uri(manifest.checkpoint_id), _patch_uri(patch_id)],
+                usage=self._usage(eid, None), result=manifest)
         return _respond(self._call(run))
 
-    def wse_submit_evaluation(self, experiment_id: IdArg, checkpoint_id: IdArg,
+    def wse_submit_evaluation(self, *, experiment_id: ExperimentIdArg = None, checkpoint_id: IdArg,
                               suite_id: Annotated[str, Field(description="A development suite of the experiment.")],
                               eval_config: EvalConfigArg, idempotency_key: KeyArg,
                               ) -> Annotated[CallToolResult, ToolResponse[Job]]:
-        """Queue a development evaluation and return its job immediately; poll it with wse_get_job."""
+        """Queue a development evaluation and return its job immediately; poll it with wse_get_job.
+
+        The evaluation of a generation suite is a generation pass, charged in passes and generated tokens.
+        """
         def run() -> ToolResponse[Job]:
-            job = self.engine.submit_evaluation(experiment_id, checkpoint_id, suite_id, eval_config, idempotency_key)
-            return self._job_response(experiment_id, job)
+            eid = self._experiment_id(experiment_id)
+            job = self.engine.submit_evaluation(eid, checkpoint_id, suite_id, eval_config, idempotency_key)
+            return self._job_response(eid, job)
         return _respond(self._call(run))
 
-    def wse_get_job(self, experiment_id: IdArg, job_id: IdArg, wait_seconds: WaitArg = 0,
+    def wse_get_job(self, *, experiment_id: ExperimentIdArg = None, job_id: IdArg, wait_seconds: WaitArg = 0,
                     ) -> Annotated[CallToolResult, ToolResponse[Job]]:
-        """A job's state, progress, and, once it succeeded, its report summary; can wait up to 10 seconds."""
+        """A job's state, progress, and, once it succeeded, its result; can wait up to 10 seconds.
+
+        An evaluation's result is its report summary with report_id (read the whole report with
+        wse_get_report); a probe's is its summary with result_uri.
+        """
         # The wait happens here, polling outside the lock; the service validates every argument.
+        eid = self._call(self._experiment_id, experiment_id)
         wait = self._call(wait_seconds_value, wait_seconds)
         deadline = time.monotonic() + wait
         while True:
-            job = self._call(self.engine.get_job, experiment_id, job_id, 0)
+            job = self._call(self.engine.get_job, eid, job_id, 0)
             left = deadline - time.monotonic()
             if job.terminal or left <= 0:
-                return _respond(self._call(self._job_response, experiment_id, job))
+                return _respond(self._call(self._job_response, eid, job))
             time.sleep(min(WAIT_POLL_SECONDS, left))
 
-    def wse_cancel_job(self, experiment_id: IdArg, job_id: IdArg, idempotency_key: KeyArg,
+    def wse_get_report(self, *, experiment_id: ExperimentIdArg = None, report_id: IdArg,
+                       ) -> Annotated[CallToolResult, ToolResponse[ReportOverview | EvaluationReport]]:
+        """A report of this experiment: metrics, intervals, and per-example results; not charged.
+
+        A generation pass's report gives, per problem and sample, correct, finished, limit_hit, generated_tokens,
+        the tail of the output's text, and its output_uri (which wse_probe takes). Tails are shortened evenly when
+        the report would otherwise exceed the inline-result limit; a report that exceeds it even so (for example
+        many samples per problem) comes back without problems, scores, and cluster_ids: omitted names them, and
+        resource_uri is the paged MCP resource that holds the whole report.
+        To see per-output results through tools instead, evaluate fewer problems (wse_submit_evaluation with a
+        smaller preregistered sample_count) and pair reports with wse_compare. Final reports appear only after the
+        experiment is closed.
+        """
+        def run() -> ToolResponse[ReportOverview | EvaluationReport]:
+            eid = self._experiment_id(experiment_id)
+            report = self.engine.get_report(eid, report_id, bounded=True)
+            summary = (f"report {report.report_id} of checkpoint {report.checkpoint_id} on {report.suite_id} "
+                       f"({report.split}): metrics {canonical_json(report.metrics)} on {report.sample_count} examples")
+            if isinstance(report, ReportOverview):
+                summary += (f"; its {report.report_bytes} bytes exceed the {report.limit_bytes}-byte inline limit, so "
+                            f"{', '.join(report.omitted)} are omitted; the whole report is the paged resource "
+                            f"{report.resource_uri}")
+            return ToolResponse[ReportOverview | EvaluationReport](
+                summary=summary, uris=[report.report_uri], usage=self._usage(eid, None, ()), result=report)
+        return _respond(self._call(run))
+
+    def wse_cancel_job(self, *, experiment_id: ExperimentIdArg = None, job_id: IdArg, idempotency_key: KeyArg,
                        ) -> Annotated[CallToolResult, ToolResponse[Job]]:
         """Request that a job stop; computation already performed remains charged."""
         def run() -> ToolResponse[Job]:
-            return self._job_response(experiment_id, self.engine.cancel_job(experiment_id, job_id, idempotency_key))
+            eid = self._experiment_id(experiment_id)
+            return self._job_response(eid, self.engine.cancel_job(eid, job_id, idempotency_key))
         return _respond(self._call(run))
 
     def _job_response(self, experiment_id: str, job: Job) -> ToolResponse[Job]:
         summary = f"job {job.job_id} is {job.state}"
+        uris = [_report_uri(job.report_id)] if job.report_id else []
         if job.result and "metrics" in job.result:
             summary += f"; metrics {canonical_json(job.result['metrics'])} on {job.result.get('sample_count')} examples"
+        if job.kind == "probe" and job.result and job.result.get("result_uri"):
+            uris.append(job.result["result_uri"])
+            summary += (f"; probe of {len(job.result.get('texts') or [])} texts at "
+                        f"{len(job.result.get('sites') or [])} sites, every vector at {job.result['result_uri']}")
         if job.error is not None:
             summary += f"; {job.error.code.value}: {job.error.message}"
-        return ToolResponse[Job](summary=summary, uris=[_report_uri(job.report_id)] if job.report_id else [],
-                                 usage=self._usage(experiment_id, job.usage), result=job)
+        counters = PROBE_COUNTERS if job.kind == "probe" else None  # a probe's summary may fill the result limit
+        return ToolResponse[Job](summary=summary, uris=uris, usage=self._usage(experiment_id, job.usage, counters),
+                                 result=job)
 
-    def wse_compare(self, experiment_id: IdArg, base_report_id: IdArg, candidate_report_id: IdArg,
-                    ) -> Annotated[CallToolResult, ToolResponse[ComparisonReport]]:
-        """Paired difference of two development reports with intervals; mismatched configurations are rejected."""
-        def run() -> ToolResponse[ComparisonReport]:
-            comparison = self.engine.compare(experiment_id, base_report_id, candidate_report_id)
-            return ToolResponse[ComparisonReport](
-                summary=f"accuracy {comparison.base_value:g} -> {comparison.candidate_value:g} "
-                        f"(difference {comparison.difference:+g})",
-                uris=[_report_uri(base_report_id), _report_uri(candidate_report_id)],
-                usage=self._usage(experiment_id, None), result=comparison)
+    def wse_compare(self, *, experiment_id: ExperimentIdArg = None, base_report_id: IdArg,
+                    candidate_report_id: IdArg,
+                    ) -> Annotated[CallToolResult, ToolResponse[GenerationComparison | ComparisonReport]]:
+        """Paired difference of two development reports with intervals; mismatched configurations are rejected.
+
+        Two reports of a generation suite are paired on accuracy, limit-hit rate, and mean generated tokens.
+        """
+        def run() -> ToolResponse[GenerationComparison | ComparisonReport]:
+            eid = self._experiment_id(experiment_id)
+            comparison = self.engine.compare(eid, base_report_id, candidate_report_id)
+            if isinstance(comparison, GenerationComparison):
+                summary = "; ".join(
+                    f"{name} {comparison.base[name]:g} -> {comparison.candidate[name]:g} (difference "
+                    f"{comparison.differences[name].estimate:+g})"
+                    for name in ("accuracy", "limit_hit_rate", "mean_generated_tokens")) + \
+                    f" over {comparison.samples} outputs of {comparison.problems} problems"
+            else:
+                summary = (f"accuracy {comparison.base_value:g} -> {comparison.candidate_value:g} "
+                           f"(difference {comparison.difference:+g})")
+            return ToolResponse[GenerationComparison | ComparisonReport](
+                summary=summary, uris=[_report_uri(base_report_id), _report_uri(candidate_report_id)],
+                usage=self._usage(eid, None), result=comparison)
         return _respond(self._call(run))
 
-    def wse_select_checkpoint(self, experiment_id: IdArg, checkpoint_id: IdArg,
+    def wse_select_checkpoint(self, *, experiment_id: ExperimentIdArg = None, checkpoint_id: IdArg,
                               expected_selected_id: Annotated[str, Field(
                                   description="The currently selected checkpoint ID (compare-and-swap).")],
                               idempotency_key: KeyArg) -> Annotated[CallToolResult, ToolResponse[Experiment]]:
         """Select a checkpoint of this experiment by compare-and-swap; selecting an ancestor rolls back."""
         def run() -> ToolResponse[Experiment]:
-            experiment = self.engine.select_checkpoint(experiment_id, checkpoint_id, expected_selected_id,
-                                                       idempotency_key)
+            eid = self._experiment_id(experiment_id)
+            experiment = self.engine.select_checkpoint(eid, checkpoint_id, expected_selected_id, idempotency_key)
             return ToolResponse[Experiment](
                 summary=f"selected checkpoint {experiment.selected_checkpoint_id}",
                 uris=[_manifest_uri(experiment.selected_checkpoint_id)],
-                usage=self._usage(experiment_id, None), result=experiment)
+                usage=self._usage(eid, None), result=experiment)
         return _respond(self._call(run))
 
     # -- resources --------------------------------------------------------------

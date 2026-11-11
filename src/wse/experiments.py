@@ -53,6 +53,21 @@ Rules implemented here (Sections 4.1, 5.1-5.3, and 6.2 of the plan):
   2,048-value direction) as ``{length, sha256}``; the exact patch, which keeps
   every value, is an operator view. A run reads a large analysis result only
   when its own experiment produced it.
+* Agent-facing results stay within the experiment policy's inline-result
+  limit, also for open-weight models with hundreds of tensors: a result
+  fits when both of its copies in an MCP response, its JSON and the escaped
+  text mirror (``wse.policy.response_size``), take at most twice
+  ``max_result_json_bytes``. A preview lists the diff of every tensor when
+  that fits, as for M1 models, and otherwise only the changed tensors,
+  counting the others (``PatchPreview.unchanged_tensors``). An inspection whose
+  tensors do not fit one result is paged (``inspect_details``,
+  ``inspection_pages``). The bounded view of an applied candidate
+  (``candidate_view``) lists only the tensors that differ from its parent
+  when the whole manifest does not fit. Page boundaries and the choice of
+  form depend on the manifest and the policy only, never on measured times
+  or values.
+* A service bound to a run has at most one experiment, so agent-facing
+  callers may omit its ID (``bound_experiment_id``).
 * Rejected mutations (creation, previews, applies, selections, freezing) are
   recorded as audit events and leave state unchanged.
 * ``freeze`` (operator only) is a compare-and-swap on the selected ID that
@@ -87,6 +102,7 @@ from wse.policy import (
     ExperimentPolicy,
     builtin_experiment_policies,
     constant_factor_bounds,
+    response_size,
 )
 from wse.schemas import (
     CHECKPOINT_ID_PATTERN,
@@ -110,6 +126,7 @@ from wse.schemas import (
     RunGrant,
     StorageCost,
     TensorInfo,
+    TensorPage,
     TensorStatistics,
     Usage,
     WSEError,
@@ -124,6 +141,10 @@ if TYPE_CHECKING:
 
 PATCH_URI_PREFIX = "wse://patches/"
 TASK_ID_PATTERN = r"^[A-Za-z0-9_.\-]{1,128}$"
+INSPECTION_CURSOR_PREFIX = "tensors:"
+# The widest JSON form of a measured float (23 characters): agent-facing results are sized with it in place of
+# measured times and statistics, so that whether they fit never depends on a measurement.
+_WIDEST_FLOAT = 2.2250738585072014e-308
 
 
 class _Recorded(Exception):
@@ -190,6 +211,80 @@ def _candidate_tensor_infos(
             info = info.model_copy(update={"blob_id": blob_id(tensor)})
         infos.append(info)
     return infos
+
+
+def _response_bytes(value: Any) -> int:
+    """``response_size`` of a model or plain JSON value: both of its copies in an MCP tool result."""
+    return response_size(value.model_dump(mode="json") if hasattr(value, "model_dump") else value)
+
+
+def _fits(value: Any, limit: int) -> bool:
+    """Whether ``value`` fits an inline result under the limit ``limit`` (``max_result_json_bytes``)."""
+    return _response_bytes(value) <= 2 * limit
+
+
+def _fit_tensor_diffs(preview: PatchPreview, limit: int) -> PatchPreview:
+    """``preview`` with every tensor's diff when it fits ``limit``, else with the changed tensors' diffs only.
+
+    The size is measured with the widest compute time, so the form depends on
+    the model and the patch only. The aggregates cover every tensor either way.
+    """
+    widest = preview.model_copy(update={"usage": preview.usage.model_copy(update={"compute_seconds": _WIDEST_FLOAT})})
+    if _fits(widest, limit):
+        return preview
+    changed = [diff for diff in preview.tensors if diff.changed_elements]
+    return preview.model_copy(update={"tensors": changed, "unchanged_tensors": len(preview.tensors) - len(changed)})
+
+
+def _widest_statistics(info: TensorInfo, operator: Any) -> TensorStatistics:
+    """A tensor's statistics entry with every number at its widest: the size that pages of inspections allow."""
+    wide = -_WIDEST_FLOAT
+    return TensorStatistics(tensor=info.name, shape=list(info.shape), dtype=info.dtype, operator=operator,
+                            statistics={"count": info.element_count, "mean": wide, "std": wide, "min": wide,
+                                        "max": wide, "nonfinite_count": info.element_count}, unavailable=None)
+
+
+def _shortened(entry: TensorStatistics, budget: int) -> TensorStatistics:
+    """``entry`` within ``budget`` response bytes: a long reason why statistics are unavailable is cut (``...``)."""
+    if entry.unavailable is None or _response_bytes(entry) <= budget:
+        return entry
+    text = entry.unavailable
+    while text and _response_bytes(entry.model_copy(update={"unavailable": text + "..."})) > budget:
+        text = text[:-1]
+    return entry.model_copy(update={"unavailable": text + "..."})
+
+
+def inspection_pages(manifest: ModelManifest, *, limit: int, operator: Any = None) -> list[tuple[int, int]]:
+    """The tensor ranges ``(start, stop)`` of a model inspection's pages, in manifest order.
+
+    One range covers every tensor when the inspection of them all fits the
+    inline-result limit ``limit`` (``_fits``: both copies in an MCP response);
+    otherwise each page holds as many consecutive tensors as fit with the
+    page's ``tensor_page``. Sizes count each tensor's statistics at their
+    widest (``_widest_statistics``) and the widest measured time, so pages
+    depend on the manifest and the limit only.
+    """
+    count = len(manifest.tensors)
+    template = ModelInspection(
+        experiment_id="exp_" + "0" * 32, checkpoint_id=manifest.checkpoint_id, role="candidate",
+        manifest=manifest.model_copy(update={"tensors": []}), tensor_statistics=[],
+        manifest_uri=f"wse://models/{manifest.checkpoint_id}/manifest",
+        usage=Usage(compute_seconds=_WIDEST_FLOAT, analysis_calls=0, tensor_read_calls=0, model_forward_calls=0))
+    # An entry of each list costs its response bytes (whose two string quotes stand in for its comma in both copies).
+    costs = [_response_bytes(info) + _response_bytes(_widest_statistics(info, operator)) for info in manifest.tensors]
+    if _response_bytes(template) + sum(costs) <= 2 * limit:
+        return [(0, count)]
+    widest = TensorPage(start=count, stop=count, tensor_count=count, page=count, page_count=count,
+                        next_cursor=f"{INSPECTION_CURSOR_PREFIX}{count}")
+    base = _response_bytes(template.model_copy(update={"tensor_page": widest}))
+    pages, start, used = [], 0, base
+    for index, cost in enumerate(costs):
+        if index > start and used + cost > 2 * limit:
+            pages.append((start, index))
+            start, used = index, base
+        used += cost
+    pages.append((start, count))
+    return pages
 
 
 class ExperimentService:
@@ -463,6 +558,24 @@ class ExperimentService:
     def get_experiment(self, experiment_id: str) -> Experiment:
         return self._experiment(self._experiment_row(experiment_id))
 
+    def bound_experiment_id(self) -> str:
+        """The experiment of the run this service is bound to: the one an agent-facing call uses when it omits an ID.
+
+        A run has at most one experiment, so its ID is never ambiguous.
+        Before the experiment exists the call fails with ``NOT_FOUND``; a
+        service bound to no run has no default (``INVALID_ARGUMENT``).
+        """
+        if self.bound_run_id is None:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, "experiment_id is required: this engine is bound to no run, so "
+                           "it has no default experiment")
+        row = self.db.conn.execute("SELECT experiment_id FROM experiments WHERE run_id = ?",
+                                   (self.bound_run_id,)).fetchone()
+        if row is None:
+            raise WSEError(ErrorCode.NOT_FOUND, f"run {self.bound_run_id} has no experiment yet; create it with "
+                           "wse_create_experiment, then omit experiment_id or pass the ID it returns",
+                           details={"run_id": self.bound_run_id})
+        return row["experiment_id"]
+
     def experiment_policy(self, experiment_id: str) -> ExperimentPolicy:
         row = self._experiment_row(experiment_id)
         policy = self.get_policy(row["policy_id"])
@@ -519,7 +632,7 @@ class ExperimentService:
         """The manifest of an owned checkpoint (no tensor data; not charged)."""
         return self.load_manifest(experiment_id, checkpoint_id)
 
-    def inspect_details(self, experiment_id: str, checkpoint_id: str) -> ModelInspection:
+    def inspect_details(self, experiment_id: str, checkpoint_id: str, *, cursor: Any = None) -> ModelInspection:
         """The manifest of an owned checkpoint with whole-tensor statistics by layer.
 
         Statistics come from the experiment policy's registered ``stats``
@@ -531,6 +644,15 @@ class ExperimentService:
         OPEN, compute time is exhausted, the time limit was reached, the
         tensor exceeds ``max_analysis_elements``, or the policy has no
         ``stats`` kind.
+
+        When every tensor's entries would exceed the policy's inline-result
+        limit, the inspection is paged (``inspection_pages``): ``cursor``
+        (``None`` for the first page, then the ``tensor_page.next_cursor`` of
+        the page before) selects the page, whose tensors alone are listed and
+        have their statistics computed and charged; a reason why statistics
+        are unavailable is then shortened to its tensor's share of the page.
+        Any other cursor fails with ``INVALID_ARGUMENT`` before anything is
+        computed.
         """
         manifest = self.load_manifest(experiment_id, checkpoint_id)
         row = self._experiment_row(experiment_id)
@@ -538,6 +660,20 @@ class ExperimentService:
         experiment_policy = self.experiment_policy(experiment_id)
         policy = experiment_policy.operations
         limit = experiment_policy.budget.seconds_per_operation
+        operator = policy.analyses.get("stats")
+        pages = inspection_pages(manifest, limit=policy.limits.max_result_json_bytes, operator=operator)
+        starts = {f"{INSPECTION_CURSOR_PREFIX}{start}": number for number, (start, _) in enumerate(pages)}
+        if cursor is None or cursor == "":
+            number = 0
+        elif isinstance(cursor, str) and cursor in starts:
+            number = starts[cursor]
+        else:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                           f"cursor {cursor!r} was not returned by wse_inspect_model for checkpoint {checkpoint_id}; "
+                           "omit it for the first page and pass a page's tensor_page.next_cursor for the next",
+                           details={"cursor": str(cursor), "page_count": len(pages)})
+        first, last = pages[number]
+        infos = manifest.tensors[first:last]
         blocked: str | None = None
         if row["state"] != "OPEN":
             blocked = f"statistics are computed only while the experiment is OPEN; it is {row['state']}"
@@ -551,7 +687,7 @@ class ExperimentService:
         metered = blocked is None
         start = time.perf_counter()
         statistics = []
-        for info in manifest.tensors:
+        for info in infos:
             entry: dict[str, Any] = {"tensor": info.name, "shape": list(info.shape), "dtype": info.dtype}
             if blocked is None and time.perf_counter() - start >= limit:
                 blocked = (f"the per-operation time limit of {limit:g} s was reached; analyze the remaining "
@@ -579,9 +715,17 @@ class ExperimentService:
                 self._require_open(self._experiment_row(experiment_id, conn))
                 charged = self.ledger.charge_compute(conn, experiment_id, elapsed)
             usage = Usage(compute_seconds=charged, analysis_calls=0, tensor_read_calls=0, model_forward_calls=0)
+        page = None
+        if len(pages) > 1:
+            statistics = [_shortened(entry, _response_bytes(_widest_statistics(info, operator)))
+                          for entry, info in zip(statistics, infos, strict=True)]
+            page = TensorPage(start=first, stop=last, tensor_count=len(manifest.tensors), page=number,
+                              page_count=len(pages),
+                              next_cursor=f"{INSPECTION_CURSOR_PREFIX}{last}" if number + 1 < len(pages) else None)
+            manifest = manifest.model_copy(update={"tensors": list(infos)})
         return ModelInspection(experiment_id=experiment_id, checkpoint_id=checkpoint_id, role=role,
                                manifest=manifest, tensor_statistics=statistics,
-                               manifest_uri=f"wse://models/{checkpoint_id}/manifest", usage=usage)
+                               manifest_uri=f"wse://models/{checkpoint_id}/manifest", usage=usage, tensor_page=page)
 
     def find_patch(self, patch_id: Any) -> PatchDocument:
         """A patch by ID alone (for resource reads), scoped like every other lookup.
@@ -891,6 +1035,7 @@ class ExperimentService:
             usage=Usage(model_forward_calls=0, candidate_commits=0, patch_previews=1, artifact_bytes=size,
                         compute_seconds=round(time.perf_counter() - start, 6)),
         )
+        preview = _fit_tensor_diffs(preview, policy.operations.limits.max_result_json_bytes)
         preview_json = preview.canonical_json()
         with self.db.transaction() as conn:
             recorded = self._lookup(conn, experiment_id, key, "preview_patch", request_hash)
@@ -980,6 +1125,23 @@ class ExperimentService:
 
     def _recorded_manifest(self, result_json: str) -> ModelManifest:
         return self.store.load_manifest(json.loads(result_json)["checkpoint_id"])
+
+    def candidate_view(self, experiment_id: str, manifest: ModelManifest) -> ModelManifest:
+        """A candidate's manifest as ``wse_apply_patch`` returns it, within the policy's inline-result limit.
+
+        The whole manifest when it fits the limit (``_fits``; M1 models do);
+        otherwise only the tensors whose content differs from the parent checkpoint's
+        (their blob IDs differ), with ``unchanged_tensors`` counting the
+        others. Every other field is the manifest's own.
+        """
+        limit = self.experiment_policy(experiment_id).operations.limits.max_result_json_bytes
+        parent = manifest.provenance.parent_checkpoint_id
+        if _fits(manifest, limit) or parent is None:
+            return manifest
+        before = {info.name: info.blob_id for info in self.store.load_manifest(parent).tensors}
+        changed = [info for info in manifest.tensors if info.blob_id is None or before.get(info.name) != info.blob_id]
+        return manifest.model_copy(update={"tensors": changed,
+                                           "unchanged_tensors": len(manifest.tensors) - len(changed)})
 
     def _remaining(self, conn: sqlite3.Connection, experiment_id: str, counter: str) -> int | float:
         return self.ledger.remaining(conn, experiment_id, counter)

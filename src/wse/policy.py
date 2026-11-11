@@ -31,7 +31,10 @@ and the text mirror) within a 64 KiB total. Those two copies also carry the
 tool-response envelope (summary, URIs, cumulative usage) and the JSON-RPC
 framing, so a result may use at most ``max_inline_json_bytes`` less
 ``RESPONSE_ENVELOPE_BYTES`` (1 KiB): 31 KiB under the default policy, which
-keeps the largest permitted response within 64 KiB. Explicit top-k values satisfy
+keeps the largest permitted response within 64 KiB. Because the text copy
+escapes quotes and backslashes, the bounded views of M2 (previews,
+inspections, candidates, and reports of open-weight models) measure both
+copies (``response_size``) against twice that limit. Explicit top-k values satisfy
 ``1 <= k <= min(64, element_count)``; an omitted ``k`` resolves to
 ``min(16, element_count)``.
 
@@ -47,12 +50,15 @@ whole tensor by one constant, as the article's ``save_edit`` did. A
 (``require_partial_scaling``); managed previews also refuse any patch whose
 net effect is such a scaling of a tensor of the experiment's base
 checkpoint, however its operations or earlier candidates produce it
-(``require_no_whole_tensor_scaling``). It is off by default and, while unset,
-absent from the policy's JSON, so stored policies keep their hashes.
+(``ExperimentService._refuse_net_whole_tensor_scaling``, with
+``constant_factor_bounds``), and name no factor. It is off by default and,
+while unset, absent from the policy's JSON, so stored policies keep their
+hashes.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Mapping, Sequence
@@ -305,39 +311,24 @@ def constant_factor_bounds(base: Any, candidate: Any) -> tuple[float, float] | N
     return (lower, upper) if lower <= upper else None
 
 
-def require_no_whole_tensor_scaling(policy: OperationPolicy, tensor: str, base: Any, candidate: Any) -> None:
-    """Refuse a patch whose net effect scales ``tensor`` as a whole by one constant other than 1 (``POLICY_DENIED``).
-
-    Managed previews call this, when the policy sets
-    ``refuse_whole_tensor_scaling``, for every tensor a patch changes, with
-    the tensor of the experiment's base checkpoint as ``base``: patches that
-    split a tensor into parts scaled alike, scale its rest in a later
-    candidate, write ``c * W`` with ``set_slice``, or fill it with 0 have the
-    effect of one whole-tensor scaling and are refused like it. A tensor that
-    the factor 1 reproduces (unchanged up to rounding) is no scaling.
-    ``require_partial_scaling`` is the per-operation fast path.
-    """
-    if not policy.refuse_whole_tensor_scaling:
-        return
-    bounds = constant_factor_bounds(base, candidate)
-    if bounds is None or bounds[0] <= 1.0 <= bounds[1]:
-        return
-    shown = float(f"{(bounds[0] + bounds[1]) / 2:.6g}")
-    raise WSEError(
-        ErrorCode.POLICY_DENIED,
-        f"the patch would leave tensor {tensor!r} {list(candidate.shape)} equal to the experiment's base tensor scaled "
-        f"by one factor (about {shown:g}), which this experiment's operation policy refuses "
-        "(refuse_whole_tensor_scaling): it changes only the tensor's overall scale, whether one operation or several, "
-        "in this patch or with earlier candidates, have that effect. Change a proper part of the tensor in a way that "
-        "is not the same scaling of the whole.",
-        details={"tensor": tensor, "shape": list(candidate.shape), "factor": shown,
-                 "policy_option": "refuse_whole_tensor_scaling", "permitted_operations": sorted(policy.edits)},
-    )
-
-
 def json_size(payload: Mapping[str, Any]) -> int:
     """Size in bytes of the canonical compact JSON of ``payload``."""
     return len(canonical_json(payload).encode("utf-8"))
+
+
+def response_size(payload: Any) -> int:
+    """The bytes ``payload`` takes in an MCP tool result, which carries it twice.
+
+    Once as its canonical compact JSON (``structuredContent``) and once as
+    that text inside a JSON string (the text mirror), where every quote,
+    backslash, and control character is escaped. For numbers the two copies
+    are about equal, as M1's rule (twice ``max_result_json_bytes``) assumes;
+    text-heavy results, such as tails of generated outputs or manifests, take
+    more. The bounded agent-facing views (``wse.experiments``,
+    ``wse.evaluation``) keep it within twice ``max_result_json_bytes``.
+    """
+    text = canonical_json(payload)
+    return len(text.encode("utf-8")) + len(json.dumps(text, ensure_ascii=False).encode("utf-8"))
 
 
 def contract_usage(spec: OperatorSpec, *, compute_seconds: float | None = None, calls: int = 1) -> Usage:

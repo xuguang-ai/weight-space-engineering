@@ -464,7 +464,16 @@ def model_identity(
 
 
 class ModelManifest(_Frozen):
-    """Immutable description of a registered checkpoint."""
+    """Immutable description of a registered checkpoint.
+
+    ``unchanged_tensors`` is set only in the bounded view of a candidate that
+    ``wse_apply_patch`` returns when the whole manifest would exceed the
+    experiment policy's inline-result limit (an open-weight model with
+    hundreds of tensors): ``tensors`` then lists only the tensors whose
+    content differs from the parent checkpoint's, and ``unchanged_tensors``
+    counts the others, whose entries are the parent's. Stored manifests never
+    set it; the whole manifest is the resource ``wse://models/<id>/manifest``.
+    """
 
     schema_version: Literal["1"] = SCHEMA_VERSION
     checkpoint_id: str = Field(pattern=CHECKPOINT_ID_PATTERN.pattern)
@@ -480,6 +489,7 @@ class ModelManifest(_Frozen):
     provenance: Provenance
     license: str
     source: ModelSource | None = _optional()
+    unchanged_tensors: int | None = _optional(ge=0)
 
     @field_validator("config")
     @classmethod
@@ -973,7 +983,16 @@ class StorageCost(_Frozen):
 
 
 class PatchPreview(_Frozen):
-    """Immutable, validated preview of a patch; ``apply_patch`` accepts only its ID."""
+    """Immutable, validated preview of a patch; ``apply_patch`` accepts only its ID.
+
+    ``tensors`` holds the diff of every tensor of the model when the preview
+    fits the experiment policy's inline-result limit with them (M1 models).
+    Otherwise, as for an open-weight model with hundreds of tensors, it holds
+    the diffs of the changed tensors only, and ``unchanged_tensors`` counts
+    the others (absent from the JSON when every tensor is listed). The
+    aggregates (``changed_elements``, ``l2_delta``, ``relative_l2_delta``,
+    ...) cover the whole model either way.
+    """
 
     schema_version: Literal["1"] = SCHEMA_VERSION
     patch_id: str
@@ -998,6 +1017,7 @@ class PatchPreview(_Frozen):
     patch_uri: str
     usage: Usage
     management: Management = "managed"
+    unchanged_tensors: int | None = _optional(ge=0)
 
 
 # ---------------------------------------------------------------------------
@@ -1662,12 +1682,40 @@ class EvaluationReport(_Frozen):
                 "truncation_count": self.truncation_count, "target_met": self.target_met}
 
 
+class ReportOverview(EvaluationReport):
+    """A report too large for an inline tool result: every field except its per-example results.
+
+    ``wse_get_report`` returns it in place of the ``EvaluationReport`` when
+    the report does not fit the experiment policy's inline-result limit
+    (``limit_bytes``, its ``max_result_json_bytes``) even with empty tails,
+    for example a generation pass with many samples per problem;
+    ``report_bytes`` is the whole report's canonical JSON size. ``omitted``
+    names the fields left out (those of ``problems``, ``scores``, and
+    ``cluster_ids`` that the report has), which are ``None`` here.
+    ``resource_uri`` is the report's paged MCP
+    resource (``wse://reports/<report_id>``, read with ``?page=N``), which
+    holds the whole report; a host that cannot read resources sees per-output
+    results by evaluating fewer problems, a smaller preregistered
+    ``sample_count``, whose report fits.
+    """
+
+    omitted: list[str]
+    report_bytes: int
+    limit_bytes: int
+    resource_uri: str
+
+
 class GenerationComparison(_Frozen):
     """Paired candidate-minus-base differences of two generation evaluations on one suite and configuration.
 
     ``differences`` holds ``accuracy``, ``limit_hit_rate``, and
     ``mean_generated_tokens``, each with a paired cluster-bootstrap interval
     over problems.
+
+    A managed comparison (``Engine.compare`` and ``wse_compare`` of two
+    generation reports of an experiment) also names the experiment, the two
+    reports, and their checkpoints, and is labeled ``managed``; these fields
+    are absent from direct comparisons.
     """
 
     schema_version: Literal["1"] = SCHEMA_VERSION
@@ -1681,6 +1729,12 @@ class GenerationComparison(_Frozen):
     base: dict[str, float]
     candidate: dict[str, float]
     differences: dict[str, IntervalEstimate]
+    experiment_id: str | None = _optional()
+    base_report_id: str | None = _optional()
+    candidate_report_id: str | None = _optional()
+    base_checkpoint_id: str | None = _optional()
+    candidate_checkpoint_id: str | None = _optional()
+    management: Management | None = _optional()
 
 
 class ComparisonReport(_Frozen):
@@ -1853,8 +1907,31 @@ class TensorStatistics(_Frozen):
     unavailable: str | None = None
 
 
+class TensorPage(_Frozen):
+    """Which tensors one page of a model inspection holds: ``start`` to ``stop - 1`` of ``tensor_count``.
+
+    ``next_cursor`` (``None`` on the last page) is the ``cursor`` argument
+    that returns the next page.
+    """
+
+    start: int = Field(ge=0)
+    stop: int = Field(ge=0)
+    tensor_count: int = Field(ge=0)
+    page: int = Field(ge=0)
+    page_count: int = Field(ge=1)
+    next_cursor: str | None
+
+
 class ModelInspection(_Frozen):
-    """The manifest of a checkpoint an experiment owns, with whole-tensor statistics by layer."""
+    """The manifest of a checkpoint an experiment owns, with whole-tensor statistics by layer.
+
+    When the inspection of every tensor would exceed the experiment policy's
+    inline-result limit (an open-weight model with hundreds of tensors), it
+    is paged: ``manifest.tensors`` and ``tensor_statistics`` hold one page's
+    tensors in manifest order, ``tensor_page`` says which, and the rest of
+    the manifest is whole. ``tensor_page`` is absent when one result holds
+    every tensor (M1 models).
+    """
 
     schema_version: Literal["1"] = SCHEMA_VERSION
     experiment_id: str
@@ -1865,6 +1942,7 @@ class ModelInspection(_Frozen):
     manifest_uri: str
     usage: Usage | None = None
     management: Management = "managed"
+    tensor_page: TensorPage | None = _optional()
 
 
 class PatchStepSummary(_Frozen):

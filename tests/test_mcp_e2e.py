@@ -40,9 +40,10 @@ TOOL_NAMES = {
     "wse_list_models", "wse_create_experiment", "wse_get_experiment", "wse_inspect_model", "wse_read_tensor",
     "wse_analyze", "wse_preview_patch", "wse_apply_patch", "wse_submit_evaluation", "wse_get_job",
     "wse_cancel_job", "wse_compare", "wse_select_checkpoint",
+    "wse_probe", "wse_get_report",  # M2: language-model probes and whole reports (M2 plan Section 5.6)
 }
 MUTATIONS = {"wse_create_experiment", "wse_preview_patch", "wse_apply_patch", "wse_submit_evaluation",
-             "wse_cancel_job", "wse_select_checkpoint"}
+             "wse_cancel_job", "wse_select_checkpoint", "wse_probe"}
 RESOURCE_TEMPLATES = {"wse://models/{checkpoint_id}/manifest{?page}", "wse://experiments/{experiment_id}/policy{?page}",
                       "wse://reports/{report_id}{?page}", "wse://patches/{patch_id}{?page}",
                       "wse://analyses/{digest}{?page}"}
@@ -197,7 +198,7 @@ def test_discovery_lists_every_tool_and_resource_with_schemas(trial, tmp_path):
                 jsonschema.Draft202012Validator.check_schema(tool.output_schema)
                 assert ("idempotency_key" in tool.input_schema.get("required", [])) == (name in MUTATIONS)
                 assert tool.annotations.read_only_hint == (name in {"wse_list_models", "wse_get_experiment",
-                                                                    "wse_get_job", "wse_compare"})
+                                                                    "wse_get_job", "wse_compare", "wse_get_report"})
             patch_schema = tools["wse_preview_patch"].input_schema["properties"]["patch_spec"]
             assert set(patch_schema["required"]) == {"base_checkpoint_id", "hypothesis", "operations"}
             assert "$ref" not in json.dumps(tools["wse_read_tensor"].input_schema)

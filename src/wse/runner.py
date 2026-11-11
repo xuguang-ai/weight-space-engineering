@@ -122,7 +122,7 @@ __all__ = [
 
 logger = logging.getLogger("wse.runner")
 
-EVALUATION_TOOLS = ("wse_submit_evaluation", "wse_get_job", "wse_cancel_job", "wse_compare")
+EVALUATION_TOOLS = ("wse_submit_evaluation", "wse_get_job", "wse_get_report", "wse_cancel_job", "wse_compare")
 PROBE_TOOLS = ("wse_probe",)
 JOB_TOOLS = ("wse_get_job", "wse_cancel_job")  # evaluations and probes are both jobs
 NO_IMPROVEMENT_PATIENCE = 3
@@ -178,9 +178,10 @@ def jobs_available(policy: ExperimentPolicy) -> bool:
 def allowed_tools(policy: ExperimentPolicy) -> list[str]:
     """The WSE tools a controller of this policy may use, in ``STRATEGY_TOOLS`` order.
 
-    Evaluation tools when the policy permits development evaluations
-    (evaluation batches or generation passes, ``evaluation_available``),
-    ``wse_probe`` when it grants probes, and the job tools for either.
+    Evaluation tools (``EVALUATION_TOOLS``: submission, reports, and
+    comparisons) when the policy permits development evaluations (evaluation
+    batches or generation passes, ``evaluation_available``), ``wse_probe``
+    when it grants probes, and the job tools for either.
     """
     evaluation, probes = policy.evaluation_available, probes_available(policy)
 
@@ -215,7 +216,7 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
         "You control one managed weight-space engineering experiment through the WSE tools listed below. They are "
         "your only tools: you cannot run code, read files, or use the network.",
         "",
-        f"Experiment ID: {experiment_id}",
+        f"Experiment ID: {experiment_id} (the tools use it when you omit experiment_id)",
         f"Task {task.task_id}: {task.title}",
         task.description,
     ]
@@ -270,11 +271,12 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
                  "by patch_id.")
     if evaluation:
         text = ("Evaluate checkpoints with wse_submit_evaluation on a development suite with a preregistered "
-                "eval_config (sample_count, seed), wait with wse_get_job (wait_seconds up to 10), and compare two "
-                "reports with wse_compare.")
+                "eval_config (sample_count, seed), wait with wse_get_job (wait_seconds up to 10), read a whole "
+                "report with wse_get_report, and compare two reports with wse_compare.")
         if passes:
             text += (" A generation suite's report gives every output's grade, length, whether it reached the token "
-                     "limit, the end of its text, and its output_uri.")
+                     "limit, the end of its text, and its output_uri; wse_compare pairs two such reports on accuracy, "
+                     "limit-hit rate, and generated tokens.")
         steps.append(text)
     elif policy.mode == "weights_only":
         steps.append("Development evaluation is not available in this mode: no forward pass of the model is "
@@ -331,8 +333,11 @@ class ExperimentExecutor:
     """Executes strategy actions through a run-bound Engine, by MCP tool name and arguments.
 
     The result of each operation is the JSON of the same domain object the
-    MCP tool returns as ``result``; a domain failure becomes the same error
-    body. Only ``STRATEGY_TOOLS`` are accepted.
+    MCP tool returns as ``result`` (including its bounded forms: reports,
+    inspections, and candidates within the inline-result limit); a domain
+    failure becomes the same error body. As through MCP, ``experiment_id``
+    may be omitted for the run's experiment. Only ``STRATEGY_TOOLS`` are
+    accepted.
     """
 
     def __init__(self, engine: Engine, *, constraint_status: str, tools: Sequence[str] = STRATEGY_TOOLS) -> None:
@@ -341,33 +346,39 @@ class ExperimentExecutor:
         self.engine = engine
         self.constraint_status = constraint_status
         self.tools = tuple(tools)
-        e = engine
+        e, eid = engine, engine.resolve_experiment_id
         self._operations: dict[str, Callable[..., Any]] = {
             "wse_list_models": lambda cursor=None: model_list_page(e.list_models(), cursor),
-            "wse_get_experiment": lambda experiment_id: e.describe_experiment(
-                experiment_id, constraint_status=self.constraint_status),
-            "wse_inspect_model": lambda experiment_id, checkpoint_id: e.inspect_model_details(experiment_id,
-                                                                                              checkpoint_id),
-            "wse_read_tensor": lambda experiment_id, checkpoint_id, tensor, selection: e.read_model_tensor(
-                experiment_id, checkpoint_id, tensor, selection),
-            "wse_analyze": lambda experiment_id, checkpoint_id, kind, tensor, selection, k=None, parameters=None:
-                e.analyze_model(experiment_id, checkpoint_id, kind, tensor, selection, k, parameters=parameters),
-            "wse_probe": lambda experiment_id, checkpoint_id, texts, sites, idempotency_key, groups=None, top=None:
-                e.submit_probe(experiment_id, checkpoint_id, texts, sites, idempotency_key, groups=groups, top=top),
-            "wse_preview_patch": lambda experiment_id, patch_spec, idempotency_key: e.preview_patch(
-                experiment_id, patch_spec, idempotency_key),
-            "wse_apply_patch": lambda experiment_id, patch_id, idempotency_key: e.apply_patch(
-                experiment_id, patch_id, idempotency_key),
-            "wse_submit_evaluation": lambda experiment_id, checkpoint_id, suite_id, eval_config, idempotency_key:
-                e.submit_evaluation(experiment_id, checkpoint_id, suite_id, eval_config, idempotency_key),
-            "wse_get_job": lambda experiment_id, job_id, wait_seconds=0: e.get_job(experiment_id, job_id,
-                                                                                    wait_seconds),
-            "wse_cancel_job": lambda experiment_id, job_id, idempotency_key: e.cancel_job(experiment_id, job_id,
-                                                                                         idempotency_key),
-            "wse_compare": lambda experiment_id, base_report_id, candidate_report_id: e.compare(
-                experiment_id, base_report_id, candidate_report_id),
-            "wse_select_checkpoint": lambda experiment_id, checkpoint_id, expected_selected_id, idempotency_key:
-                e.select_checkpoint(experiment_id, checkpoint_id, expected_selected_id, idempotency_key),
+            "wse_get_experiment": lambda experiment_id=None: e.describe_experiment(
+                eid(experiment_id), constraint_status=self.constraint_status),
+            "wse_inspect_model": lambda *, checkpoint_id, experiment_id=None, cursor=None: e.inspect_model_details(
+                eid(experiment_id), checkpoint_id, cursor=cursor),
+            "wse_read_tensor": lambda *, checkpoint_id, tensor, selection, experiment_id=None: e.read_model_tensor(
+                eid(experiment_id), checkpoint_id, tensor, selection),
+            "wse_analyze": lambda *, checkpoint_id, kind, tensor, selection, k=None, parameters=None,
+                experiment_id=None: e.analyze_model(eid(experiment_id), checkpoint_id, kind, tensor, selection, k,
+                                                    parameters=parameters),
+            "wse_probe": lambda *, checkpoint_id, texts, sites, idempotency_key, groups=None, top=None,
+                experiment_id=None: e.submit_probe(eid(experiment_id), checkpoint_id, texts, sites, idempotency_key,
+                                                   groups=groups, top=top),
+            "wse_preview_patch": lambda *, patch_spec, idempotency_key, experiment_id=None: e.preview_patch(
+                eid(experiment_id), patch_spec, idempotency_key),
+            "wse_apply_patch": lambda *, patch_id, idempotency_key, experiment_id=None: e.apply_patch(
+                eid(experiment_id), patch_id, idempotency_key, bounded=True),
+            "wse_submit_evaluation": lambda *, checkpoint_id, suite_id, eval_config, idempotency_key,
+                experiment_id=None: e.submit_evaluation(eid(experiment_id), checkpoint_id, suite_id, eval_config,
+                                                        idempotency_key),
+            "wse_get_job": lambda *, job_id, wait_seconds=0, experiment_id=None: e.get_job(
+                eid(experiment_id), job_id, wait_seconds),
+            "wse_get_report": lambda *, report_id, experiment_id=None: e.get_report(eid(experiment_id), report_id,
+                                                                                    bounded=True),
+            "wse_cancel_job": lambda *, job_id, idempotency_key, experiment_id=None: e.cancel_job(
+                eid(experiment_id), job_id, idempotency_key),
+            "wse_compare": lambda *, base_report_id, candidate_report_id, experiment_id=None: e.compare(
+                eid(experiment_id), base_report_id, candidate_report_id),
+            "wse_select_checkpoint": lambda *, checkpoint_id, expected_selected_id, idempotency_key,
+                experiment_id=None: e.select_checkpoint(eid(experiment_id), checkpoint_id, expected_selected_id,
+                                                        idempotency_key),
         }
 
     def execute(self, action: Action) -> Observation:

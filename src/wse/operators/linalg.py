@@ -25,6 +25,9 @@ float64 products over fixed blocks of rows, so memory stays bounded for the
 largest tensors (a [248320, 1024] embedding), and the same input gives the
 same result on one machine and library version. Nonfinite selections are
 refused, as by ``tensor_norm@1``. A row or column of zero norm has cosine 0.
+An inline direction value is accepted when it rounds to a finite float32
+(``wse.operators.tensor.float32_finite``), as the edit operators accept
+theirs, so ``3.4028235e+38``, the float32 maximum in its shortest digits, is.
 
 SVD. A selection of at most ``SVD_EXACT_MAX_ELEMENTS`` (4,194,304 = 2^22)
 elements uses LAPACK's divide-and-conquer SVD (``numpy.linalg.svd``) in
@@ -74,7 +77,7 @@ from wse.operators.base import (
     parse_parameters,
 )
 from wse.operators.directions import MAX_DIRECTION_LENGTH, MIN_DIRECTION_NORM
-from wse.operators.tensor import shortest_floats
+from wse.operators.tensor import float32_finite, shortest_floats
 from wse.policy import DEFAULT_TOP_K, MAX_TOP_K
 from wse.schemas import ErrorCode, UsageContract, WSEError, json_hash
 
@@ -118,8 +121,6 @@ MAX_SEED = 2**63 - 1
 _BLOCK_ELEMENTS = 1 << 20
 
 _ANALYSIS_USAGE = UsageContract(counter="analysis_calls", units_per_call=1, model_forward_calls=0)
-_FLOAT32_MAX = float(np.finfo(np.float32).max)
-
 Axis = Literal["rows", "columns"]
 _AXIS_DESCRIPTION = ("rows: one value per row of the selection (axis 0), over the selected columns; columns: one value "
                      "per column (axis 1), over the selected rows")
@@ -434,7 +435,7 @@ class DirectionProjectionParameters(OperatorParameters):
     @classmethod
     def _finite_direction(cls, value: list[float] | str) -> list[float] | str:
         if isinstance(value, list):
-            bad = sum(1 for entry in value if not (math.isfinite(entry) and abs(entry) <= _FLOAT32_MAX))
+            bad = sum(1 for entry in value if not float32_finite(entry))
             if bad:
                 raise ValueError(f"direction values must be finite numbers within the float32 range; {bad} are not")
         return value

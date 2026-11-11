@@ -165,7 +165,7 @@ def test_later_failure_in_a_multi_operation_patch_produces_no_candidate(task_mod
 @pytest.mark.parametrize(
     "values",
     [
-        [-1, 1, -1, 1],  # flat list for a [1, 4] region: no implicit reshaping
+        [-1, 1, -1, 1, -1],  # a flat list for a [1, 4] region must hold its 4 values (M2 accepts exactly 4)
         [[-1, 1, -1]],  # too few
         [[1.0]],  # no broadcasting
         [[-1, 1], [-1, 1]],  # wrong shape
