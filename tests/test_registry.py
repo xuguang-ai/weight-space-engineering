@@ -44,7 +44,9 @@ def test_builtin_registry_contains_mlp_adapter():
     # M2 adds the generic Hugging Face causal-LM adapter to the built-ins.
     assert registry.list("adapter") == [ExtensionRef.parse("hf_causal_lm@1"), ExtensionRef.parse("mlp@1")]
     assert registry.list("operator") == [
+        ExtensionRef.parse("add_low_rank@1"),
         ExtensionRef.parse("direction_projection@1"),
+        ExtensionRef.parse("fill_slice@1"),
         ExtensionRef.parse("project_out@1"),
         ExtensionRef.parse("scale_slice@1"),
         ExtensionRef.parse("set_slice@1"),
@@ -58,7 +60,7 @@ def test_builtin_registry_contains_mlp_adapter():
 
 def test_builtin_edits_are_registered_through_operator_specs():
     registry = builtin_registry()
-    for ref in ("set_slice@1", "scale_slice@1"):
+    for ref in ("set_slice@1", "scale_slice@1", "project_out@1", "fill_slice@1", "add_low_rank@1"):
         spec = registry.resolve_ref("operator", ref).spec
         assert spec.effect == "edit"
         assert spec.required_capabilities == sorted([CAP_WEIGHTS_READ, "weights.slice_edit"])

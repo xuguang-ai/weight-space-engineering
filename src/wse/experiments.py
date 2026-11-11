@@ -16,7 +16,12 @@ Rules implemented here (Sections 4.1, 5.1-5.3, and 6.2 of the plan):
   only that run's experiment.
 * ``preview_patch`` freezes the spec with the server-resolved base hash,
   materializes the patch through the registered edit operators, and stores an
-  immutable preview without changing the selected checkpoint.
+  immutable preview without changing the selected checkpoint. It runs only the
+  edit operators that the experiment policy lists, whether an operation names
+  an alias or an exact reference (``scale_slice@1``). Vector references among
+  the operators' parameters are read through the run-scoped reader of
+  ``find_analysis_result`` before any weights are read, so another run's
+  result fails exactly like a result that does not exist.
 * ``apply_patch`` accepts only a ``patch_id``, replays the stored materialized
   patch (no editing operator runs), and commits the candidate, its ownership,
   the candidate-commit charge, the idempotent result, and audit events in one
@@ -31,9 +36,11 @@ Rules implemented here (Sections 4.1, 5.1-5.3, and 6.2 of the plan):
   ``patch_previews`` (its deltas reveal the edited region's base values) plus
   compute seconds; applies charge compute seconds; inspection statistics
   charge compute seconds only.
-* A run sees a patch without its materialized after-values; the exact patch
-  is an operator view. A run reads a large analysis result only when its own
-  experiment produced it.
+* A run sees a patch without its materialized after-values, and with each
+  inline vector of an operator's reference parameters (for example a
+  2,048-value direction) as ``{length, sha256}``; the exact patch, which keeps
+  every value, is an operator view. A run reads a large analysis result only
+  when its own experiment produced it.
 * Rejected mutations (creation, previews, applies, selections, freezing) are
   recorded as audit events and leave state unchanged.
 * ``freeze`` (operator only) is a compare-and-swap on the selected ID that
@@ -60,8 +67,9 @@ from pydantic import ValidationError
 from wse.audit import experiment_events, record_event, record_failure
 from wse.budget import BudgetLedger, budget_error
 from wse.database import utc_now
+from wse.operators.base import MAX_REPORTED_PROBLEMS
 from wse.patch_blocks import read_patch_file, write_patch_file
-from wse.patches import materialize_patch, replay_patch
+from wse.patches import materialize_patch, replay_patch, resolve_references, summarize_vector_parameters
 from wse.policy import LEDGER_COUNTERS, ExperimentPolicy, builtin_experiment_policies
 from wse.schemas import (
     CHECKPOINT_ID_PATTERN,
@@ -572,8 +580,23 @@ class ExperimentService:
                                   dtype=step.dtype, before_hash=step.before_hash, after_hash=step.after_hash,
                                   changed_elements=step.changed_elements)
                  for step in artifact.patch.steps]
-        return PatchDocument(preview=self.get_patch(row["experiment_id"], patch_id), spec=artifact.spec,
+        return PatchDocument(preview=self.get_patch(row["experiment_id"], patch_id), spec=self._shown_spec(artifact.spec),
                              steps=steps, result_weights_hash=artifact.patch.result_weights_hash)
+
+    def _shown_spec(self, spec: FrozenPatchSpec) -> FrozenPatchSpec:
+        """The frozen spec as a run reads it: each inline vector of an operator's reference parameters as
+        ``{length, sha256}``, so that a 2,048-value direction stays within the inline-result limit. The stored
+        spec keeps the values."""
+        operations = []
+        for operation in spec.operations:
+            try:
+                operator = self.engine.registry.resolve_ref("operator", operation.operator)
+            except WSEError:
+                operator = None  # not registered here: shown as recorded
+            names = tuple(getattr(operator, "reference_parameters", ()) or ())
+            operations.append(operation.model_copy(update={
+                "parameters": summarize_vector_parameters(operation.parameters, names)}) if names else operation)
+        return spec.model_copy(update={"operations": operations})
 
     def _metered(self, experiment_id: str, checkpoint_id: Any, counter: str, units: int,
                  compute: Callable[[ExperimentPolicy], Any],
@@ -692,18 +715,24 @@ class ExperimentService:
         try:
             return PatchSpec.model_validate(dict(spec))
         except ValidationError as exc:
+            # The message and details list the first problems and count the rest, so that a spec with many invalid
+            # operations cannot produce an unbounded error (or audit record).
+            errors = exc.errors(include_url=False, include_input=False, include_context=False)
             problems = "; ".join(
                 f"{'.'.join(str(part) for part in error['loc']) or 'patch_spec'}: {error['msg']}"
-                for error in exc.errors(include_url=False)
+                for error in errors[:MAX_REPORTED_PROBLEMS]
             )
-            extra = [error["loc"][0] for error in exc.errors() if error["type"] == "extra_forbidden"
+            if len(errors) > MAX_REPORTED_PROBLEMS:
+                problems += f"; and {len(errors) - MAX_REPORTED_PROBLEMS} more problems"
+            extra = [error["loc"][0] for error in errors if error["type"] == "extra_forbidden"
                      and len(error["loc"]) == 1]
             hint = (" The server resolves the base content hash itself; do not send it."
                     if "base_weights_hash" in extra else "")
             raise WSEError(
                 ErrorCode.INVALID_PATCH,
                 f"invalid patch_spec: {problems}.{hint}",
-                details={"errors": json.loads(exc.json(include_url=False, include_input=False))},
+                details={"errors": json.loads(exc.json(include_url=False, include_input=False))[:MAX_REPORTED_PROBLEMS],
+                         "error_count": len(errors)},
             ) from exc
 
     def preview_patch(self, experiment_id: str, spec: PatchSpec | Mapping[str, Any], key: str) -> PatchPreview:
@@ -735,12 +764,18 @@ class ExperimentService:
         parsed = self._parse_spec(raw)
         policy = self.experiment_policy(experiment_id)
         self._owned_checkpoint(self.db.conn, experiment_id, parsed.base_checkpoint_id)
+        operations = [{"op": operation.op, **operation.operator_request()} for operation in parsed.operations]
+        # Vector references resolve through the run-scoped reader, as analyses do, before any weights are read.
+        references = resolve_references(operations, self.find_analysis_result, registry=self.engine.registry,
+                                        policy=policy.operations)
         base = self.engine._open_checkpoint(parsed.base_checkpoint_id)
         edit = materialize_patch(
             base,
-            [{"op": operation.op, **operation.operator_request()} for operation in parsed.operations],
+            operations,
             registry=self.engine.registry,
             policy=policy.operations,
+            references=references,
+            managed=True,
         )
         frozen = FrozenPatchSpec(
             base_checkpoint_id=parsed.base_checkpoint_id,

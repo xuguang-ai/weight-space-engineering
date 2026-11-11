@@ -24,13 +24,34 @@ A step records its result in one of two forms. M1 models (raw-bytes weights
 hash) keep M1's inline ``values``. Open-weight models (blob weights hash)
 record a binary block (``wse.patch_blocks``, M2 plan Section 3.3), whose bytes
 travel next to the patch in ``EditResult.blocks`` and in binary patch files.
-M1's limit on elements per patch counts inline values and inline
-``set_slice`` values, not operator results recorded as blocks.
+M1's limit on elements per patch (``max_patch_elements``) counts what is
+inline: M1 steps' values, ``set_slice`` values, and the inline numbers of an
+operator's ``inline_parameters`` (``project_out``'s direction and columns,
+``add_low_rank``'s inline factor columns); operator results recorded as blocks
+count nothing.
+
+Operators are resolved through the policy. A public alias must be one the
+policy lists. In direct use an exact reference (``"project_out@1"``) names any
+registered edit operator; in a managed preview (``managed=True``) it must be
+one that the policy lists, and any other is refused exactly like an alias the
+policy does not list (``POLICY_DENIED``).
 
 Every edit refuses members of an alias group (``UNSUPPORTED_CAPABILITY``) and,
 first, tensors whose role the model's family descriptor protects
-(``POLICY_DENIED``, ``wse.policy.require_unprotected``). Replay writes a
-recorded patch as recorded and checks no protection.
+(``POLICY_DENIED``, ``wse.policy.require_unprotected``). A policy that sets
+``refuse_whole_tensor_scaling`` also refuses a ``scale_slice`` of a whole
+tensor (``wse.policy.require_partial_scaling``). Replay writes a recorded
+patch as recorded and checks no protection.
+
+Vector references (``wse.operators.base``): parameters that an operator
+declares in ``reference_parameters`` may name a vector of a stored analysis
+result. A managed preview resolves every reference of a patch with
+``resolve_references`` through its run-scoped reader before any weights are
+read, and passes the vectors to ``materialize_patch``; direct use has no
+stored results and refuses references. Replay never reads a reference, since
+a step records its after-values. ``summarize_vector_parameters`` gives the
+agent-facing form of recorded parameters, whose inline vectors it echoes as
+``{length, sha256}``.
 """
 
 from __future__ import annotations
@@ -46,10 +67,17 @@ from pydantic import BaseModel
 
 from wse.adapters.base import CAP_WEIGHTS_READ, CAP_WEIGHTS_SLICE_EDIT
 from wse.adapters.families import model_family
-from wse.operators.base import TensorRegion
+from wse.operators.base import TensorRegion, reference_entries
+from wse.operators.directions import vector_summary
 from wse.patch_blocks import apply_block, make_block
 from wse.operators.tensor import shortest_floats
-from wse.policy import OperationPolicy, default_operation_policy, require_capabilities, require_unprotected
+from wse.policy import (
+    OperationPolicy,
+    default_operation_policy,
+    require_capabilities,
+    require_partial_scaling,
+    require_unprotected,
+)
 from wse.schemas import (
     AxisSlice,
     ErrorCode,
@@ -73,6 +101,7 @@ from wse.tensors import (
 )
 
 if TYPE_CHECKING:
+    from wse.analysis import ReadResult
     from wse.api import EditResult, ModelHandle
     from wse.registry import Registry
 
@@ -147,12 +176,23 @@ def _derive(model: ModelHandle, tensors: Mapping[str, torch.Tensor]) -> ModelHan
 
 
 def _resolve_operator(
-    operator_id: str | ExtensionRef, registry: Registry, policy: OperationPolicy
+    operator_id: str | ExtensionRef, registry: Registry, policy: OperationPolicy, *, managed: bool = False
 ) -> tuple[str, ExtensionRef, Any]:
-    """Resolve an exact ``id@version`` or a policy alias to an edit operator."""
+    """Resolve an exact ``id@version`` or a policy alias to an edit operator.
+
+    A ``managed`` edit accepts an exact reference only when the policy lists
+    it; direct use accepts that of any registered edit operator.
+    """
     if isinstance(operator_id, ExtensionRef) or (isinstance(operator_id, str) and "@" in operator_id):
         ref = ExtensionRef.parse(operator_id)
         label = str(ref)
+        if managed and ref not in policy.edits.values():
+            # Refused exactly like an alias that the policy does not list (OperationPolicy.edit_operator).
+            raise WSEError(
+                ErrorCode.POLICY_DENIED,
+                f"edit operation {label!r} is not permitted; permitted operations: {sorted(policy.edits)}",
+                details={"op": label, "permitted_operations": sorted(policy.edits)},
+            )
     else:
         ref = policy.edit_operator(operator_id)
         label = operator_id
@@ -234,6 +274,110 @@ def _wrap_step_error(index: int, op: Any, exc: WSEError) -> WSEError:
 
 
 # ---------------------------------------------------------------------------
+# Vector parameters
+# ---------------------------------------------------------------------------
+
+
+def _declared(operator: Any, declaration: str) -> tuple[str, ...]:
+    return tuple(getattr(operator, declaration, ()) or ())
+
+
+def resolve_references(
+    operations: Sequence[Mapping[str, Any]],
+    read_result: ReadResult,
+    *,
+    registry: Registry | None = None,
+    policy: OperationPolicy | None = None,
+) -> dict[str, np.ndarray]:
+    """Resolve the vector references of a patch's operations; return each vector by its reference.
+
+    Managed previews call this before any weights are read, with their
+    run-scoped reader: a run reads only results its own experiment produced,
+    and any other URI fails exactly like one that does not exist
+    (``NOT_FOUND``). A failure names the operation's position, as step
+    failures do. Operations that are malformed or whose operator does not
+    resolve are left for ``materialize_patch`` to report in order.
+    """
+    from wse.analysis import resolve_vector_reference
+    from wse.registry import builtin_registry
+
+    registry = registry or builtin_registry()
+    policy = policy or default_operation_policy()
+    resolved: dict[str, np.ndarray] = {}
+    if (isinstance(operations, (str, bytes, Mapping)) or not isinstance(operations, Sequence)
+            or len(operations) > policy.limits.max_patch_operations):
+        return resolved
+    for index, operation in enumerate(operations):
+        if not isinstance(operation, Mapping) or "op" not in operation:
+            continue
+        try:
+            _, _, operator = _resolve_operator(operation["op"], registry, policy, managed=True)
+        except WSEError:
+            continue
+        for name in _declared(operator, "reference_parameters"):
+            for key, reference in reference_entries(name, operation.get(name)):
+                if reference in resolved:
+                    continue
+                try:
+                    resolved[reference] = resolve_vector_reference(
+                        reference, read_result, parameter=key, max_length=policy.limits.max_analysis_elements)
+                except WSEError as exc:
+                    raise _wrap_step_error(index, operation["op"], exc) from exc
+    return resolved
+
+
+def _reference_inputs(operator: Any, raw: Mapping[str, Any],
+                      references: Mapping[str, np.ndarray] | None) -> dict[str, np.ndarray]:
+    """The resolved vectors of the references among the operator's reference parameters, by parameter key."""
+    inputs: dict[str, np.ndarray] = {}
+    for name in _declared(operator, "reference_parameters"):
+        for key, reference in reference_entries(name, raw.get(name)):
+            if references is None:
+                raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                               f"{key} names a stored analysis result, and direct use has no stored results; pass "
+                               f"{key} inline as a list of numbers",
+                               details={"parameter": key})
+            vector = references.get(reference)
+            if vector is None:
+                raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                               f"the {key} reference {reference!r} was not resolved before the patch was materialized",
+                               details={"parameter": key})
+            inputs[key] = vector
+    return inputs
+
+
+def _is_number_list(value: Any) -> bool:
+    return isinstance(value, list) and bool(value) and all(
+        isinstance(entry, (int, float)) and not isinstance(entry, bool) for entry in value)
+
+
+def _inline_values(value: Any) -> int:
+    """Numbers a recorded parameter holds inline: a list of numbers, or the number lists inside a list."""
+    if _is_number_list(value):
+        return len(value)
+    if isinstance(value, list):
+        return sum(len(entry) for entry in value if _is_number_list(entry))
+    return 0
+
+
+def summarize_vector_parameters(parameters: Mapping[str, Any], names: Sequence[str]) -> dict[str, Any]:
+    """Recorded ``parameters`` as agent-facing views show them: each inline vector of ``names`` as ``{length, sha256}``.
+
+    A parameter of ``names`` holds a vector or a list of vectors; a vector
+    recorded by reference (``{reference, length, sha256}``) stays as it is.
+    The stored documents keep the values.
+    """
+    shown = dict(parameters)
+    for name in names:
+        value = shown.get(name)
+        if _is_number_list(value):
+            shown[name] = vector_summary(value)
+        elif isinstance(value, list):
+            shown[name] = [vector_summary(entry) if _is_number_list(entry) else entry for entry in value]
+    return shown
+
+
+# ---------------------------------------------------------------------------
 # Core edits
 # ---------------------------------------------------------------------------
 
@@ -245,7 +389,10 @@ def _edit_step(
     *,
     registry: Registry,
     policy: OperationPolicy,
-) -> tuple[ModelHandle, PatchStep, dict[str, bytes]]:
+    references: Mapping[str, np.ndarray] | None = None,
+    managed: bool = False,
+) -> tuple[ModelHandle, PatchStep, dict[str, bytes], int]:
+    """One edit; returns the candidate, its step, its blocks, and the inline elements it counts."""
     if not isinstance(parameters, Mapping):
         raise WSEError(ErrorCode.INVALID_ARGUMENT, "edit parameters must be an object with tensor and selection")
     raw = dict(parameters)
@@ -253,7 +400,7 @@ def _edit_step(
     if missing:
         raise WSEError(ErrorCode.INVALID_ARGUMENT, f"edit parameters are missing {missing}")
     tensor, selection = raw.pop("tensor"), raw.pop("selection")
-    label, ref, operator = _resolve_operator(operator_id, registry, policy)
+    label, ref, operator = _resolve_operator(operator_id, registry, policy, managed=managed)
     capabilities = model.adapter.capabilities()
     require_capabilities(capabilities, operator.spec, adapter=str(model.adapter_ref), always=_EDIT_CAPABILITIES)
     info = _info(model, tensor)
@@ -274,6 +421,9 @@ def _edit_step(
         )
     slices = resolve_selection(selection, info.shape, tensor=info.name)
     entries = [AxisSlice(start=s.start, stop=s.stop, step=1) for s in slices]
+    require_partial_scaling(policy, ref, info.name, info.shape, entries)
+    # Vectors given by reference were read before any weights (resolve_references); direct use has none.
+    inputs = _reference_inputs(operator, raw, references)
     current = model._tensors[info.name]
     before_bits = tensor_bits(current)[slices]
     before = bits_to_values(before_bits, info.dtype)  # the stored values; BF16 as its exact float32 widening
@@ -286,6 +436,7 @@ def _edit_step(
         tensor_shape=tuple(info.shape),
         selection=tuple(entries),
         values=view,
+        inputs=MappingProxyType(inputs),
     )
     resolved = operator.resolve_parameters(raw, region)
     output = operator.apply(region, resolved)
@@ -333,7 +484,7 @@ def _edit_step(
         changed_elements=_changed(before_bits, after_bits),
         **form,
     )
-    return candidate, step, blocks
+    return candidate, step, blocks, _inline_elements(step, operator)
 
 
 def _result(base: ModelHandle, candidate: ModelHandle, steps: list[PatchStep],
@@ -345,13 +496,21 @@ def _result(base: ModelHandle, candidate: ModelHandle, steps: list[PatchStep],
                       blocks=MappingProxyType(dict(blocks)))
 
 
-def _inline_elements(step: PatchStep) -> int:
-    """Elements that count toward M1's per-patch limit: inline values (M1 steps and ``set_slice`` input)."""
+def _inline_elements(step: PatchStep, operator: Any) -> int:
+    """Elements that count toward M1's per-patch limit.
+
+    Inline values (M1 steps' values, or else ``set_slice`` input) plus the
+    numbers that the operator's ``inline_parameters`` hold inline
+    (``project_out``'s direction and columns, ``add_low_rank``'s inline factor
+    columns); vectors given by reference count nothing.
+    """
     if step.values is not None:
-        return len(step.values)
-    if "values" in step.parameters:
-        return math.prod(entry.stop - entry.start for entry in step.selection)
-    return 0
+        count = len(step.values)
+    elif "values" in step.parameters:
+        count = math.prod(entry.stop - entry.start for entry in step.selection)
+    else:
+        count = 0
+    return count + sum(_inline_values(step.parameters.get(name)) for name in _declared(operator, "inline_parameters"))
 
 
 def apply_operator(
@@ -372,7 +531,7 @@ def apply_operator(
     """
     from wse.registry import builtin_registry
 
-    candidate, step, blocks = _edit_step(
+    candidate, step, blocks, _ = _edit_step(
         model,
         operator_id,
         parameters,
@@ -388,6 +547,8 @@ def materialize_patch(
     *,
     registry: Registry | None = None,
     policy: OperationPolicy | None = None,
+    references: Mapping[str, np.ndarray] | None = None,
+    managed: bool = False,
 ) -> EditResult:
     """Apply ``operations`` in list order to one snapshot through ``apply_operator``.
 
@@ -396,6 +557,12 @@ def materialize_patch(
     step and for the final result. Any failure raises (``INVALID_PATCH`` for
     invalid content, with ``details["operation_index"]``) and produces no
     candidate. Patch size limits come from ``policy.limits``.
+
+    Managed previews pass ``managed=True``, which accepts an exact operator
+    reference only when the policy lists it, and ``references``, the vectors
+    that ``resolve_references`` read for the patch's vector references. Direct
+    use passes neither, so any registered edit operator may be named exactly
+    and references are refused.
     """
     from wse.registry import builtin_registry
 
@@ -421,11 +588,12 @@ def materialize_patch(
         request = dict(operation)
         op = request.pop("op")
         try:
-            current, step, step_blocks = _edit_step(current, op, request, registry=registry, policy=policy)
+            current, step, step_blocks, inline = _edit_step(current, op, request, registry=registry, policy=policy,
+                                                            references=references, managed=managed)
         except WSEError as exc:
             raise _wrap_step_error(index, op, exc) from exc
         blocks.update(step_blocks)
-        written += _inline_elements(step)
+        written += inline
         if written > limits.max_patch_elements:
             raise WSEError(
                 ErrorCode.INVALID_PATCH,

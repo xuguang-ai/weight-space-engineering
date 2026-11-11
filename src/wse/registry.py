@@ -229,9 +229,10 @@ def builtin_registry() -> Registry:
     M1's extensions, plus the generic Hugging Face causal-LM adapter
     ``hf_causal_lm@1``, the built-in family descriptors, the generation
     evaluator ``generation@1``, the profile ``qwen35think@1``, and the graders
-    ``math_boxed@1`` and ``gsm8k_numeric@1``, the edit operator
-    ``project_out@1``, and the analyses ``tensor_norms@1``, ``svd_top_k@1``,
-    and ``direction_projection@1`` (M2). None of them imports
+    ``math_boxed@1`` and ``gsm8k_numeric@1``, the edit operators
+    ``project_out@1``, ``add_low_rank@1``, and ``fill_slice@1``, and the
+    analyses ``tensor_norms@1``, ``svd_top_k@1``, and
+    ``direction_projection@1`` (M2). None of them imports
     ``transformers`` or ``math_verify`` until it is used.
     """
     from wse.adapters.families import BUILTIN_FAMILIES

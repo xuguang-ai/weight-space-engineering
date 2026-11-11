@@ -31,10 +31,25 @@ the stored dtype, writes only that region, checks shapes and finiteness, and
 records the result in the standard materialized representation
 (``PatchStep``), which is therefore every edit operator's output schema.
 Replaying a materialized patch never runs the operator again.
+
+Edit operators may declare two optional lists of parameter names (M2):
+
+* ``reference_parameters`` names parameters that hold a vector, or a list of
+  vectors, each given inline (a list of numbers) or as a ``VectorReference``.
+  Only managed previews resolve references: the engine reads them through the
+  run-scoped reader before any weights are read and hands each vector to the
+  operator in ``TensorRegion.inputs``, keyed by the parameter name or, for an
+  entry of a list, ``<name>/<index>`` (``reference_entries``). Direct use
+  refuses references. The recorded parameters keep each reference with the
+  length and SHA-256 of the vector it named, and agent-facing patch views
+  echo each inline vector of these parameters as ``{length, sha256}``.
+* ``inline_parameters`` names parameters whose inline numbers (vectors and
+  index lists) count toward a patch's limit on inline elements.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -68,6 +83,7 @@ __all__ = [
     "VECTOR_REFERENCE_PATTERN",
     "VectorReference",
     "make_spec",
+    "reference_entries",
     "validate_operator",
 ]
 
@@ -76,6 +92,11 @@ __all__ = [
 # ``#/right_vectors/0``.
 VECTOR_REFERENCE_PATTERN = r"^wse://analyses/[0-9a-f]{64}#(?:/(?:[A-Za-z_][A-Za-z0-9_]*|0|[1-9][0-9]*))+$"
 VectorReference = Annotated[str, StringConstraints(pattern=VECTOR_REFERENCE_PATTERN)]
+_VECTOR_REFERENCE = re.compile(VECTOR_REFERENCE_PATTERN)
+
+# A parameter error message lists at most this many problems and counts the rest, so that an invalid long vector
+# cannot produce an unbounded message (each problem names one entry).
+MAX_REPORTED_PROBLEMS = 5
 
 # The method each effect category must implement. Probe and edit operators are
 # introduced by later milestones; their methods are reserved here.
@@ -110,9 +131,9 @@ class TensorRegion:
     writeable; a BF16 region, which NumPy cannot hold, arrives as its exact
     float32 widening (``dtype`` still names the stored dtype). ``selection``
     locates it inside the full tensor. ``inputs`` holds the vectors of an
-    analysis operator's ``reference_parameters`` that were given as
-    references, keyed by parameter name, as read-only float32 arrays; it is
-    empty otherwise.
+    operator's ``reference_parameters`` that were given as references, as
+    read-only float32 arrays, keyed by parameter name (``<name>/<index>`` for
+    an entry of a list parameter of an edit operator); it is empty otherwise.
     """
 
     tensor: str
@@ -226,11 +247,15 @@ class BaseEditOperator:
     """Convenience base for edit operators.
 
     Subclasses set ``spec`` and ``parameters_model`` and implement ``apply``.
+    ``reference_parameters`` and ``inline_parameters`` are the optional
+    declarations described in the module docstring.
     """
 
     spec: ClassVar[OperatorSpec]
     parameters_model: ClassVar[type[BaseModel]] = OperatorParameters
     result_model: ClassVar[type[BaseModel]] = PatchStep
+    reference_parameters: ClassVar[tuple[str, ...]] = ()
+    inline_parameters: ClassVar[tuple[str, ...]] = ()
 
     def resolve_parameters(self, parameters: Mapping[str, Any], region: TensorRegion) -> BaseModel:
         return parse_parameters(self.spec, self.parameters_model, parameters)
@@ -249,38 +274,60 @@ def parse_parameters(
         return model.model_validate(dict(parameters))
     except ValidationError as exc:
         accepted = sorted(model.model_fields)
+        errors = exc.errors(include_url=False, include_input=False, include_context=False)
         problems = "; ".join(
             f"{'.'.join(str(part) for part in error['loc']) or 'parameters'}: {error['msg']}"
-            for error in exc.errors(include_url=False)
+            for error in errors[:MAX_REPORTED_PROBLEMS]
         )
+        if len(errors) > MAX_REPORTED_PROBLEMS:
+            problems += f"; and {len(errors) - MAX_REPORTED_PROBLEMS} more problems"
         raise WSEError(
             ErrorCode.INVALID_ARGUMENT,
             f"invalid parameters for {spec.ref}: {problems}. Accepted parameters: {accepted}",
-            details={"operator": str(spec.ref), "accepted_parameters": accepted},
+            details={"operator": str(spec.ref), "accepted_parameters": accepted, "error_count": len(errors)},
         ) from exc
 
 
+def reference_entries(name: str, value: Any) -> list[tuple[str, str]]:
+    """The ``(key, reference)`` pairs of a reference parameter's raw value.
+
+    The value itself when it is a ``VectorReference`` (key ``name``), or each
+    entry of a list that is one (key ``<name>/<index>``). Other values,
+    including strings that are not references, yield nothing: the operator's
+    parameter validation reports them.
+    """
+    if isinstance(value, str):
+        return [(name, value)] if _VECTOR_REFERENCE.fullmatch(value) else []
+    if isinstance(value, list):
+        return [(f"{name}/{index}", entry) for index, entry in enumerate(value)
+                if isinstance(entry, str) and _VECTOR_REFERENCE.fullmatch(entry)]
+    return []
+
+
 def _validate_vector_declarations(spec: OperatorSpec, implementation: Any) -> None:
-    """``artifact_fields`` are optional result fields; ``reference_parameters`` are parameter fields."""
-    result_fields = implementation.result_model.model_fields
-    for name in tuple(getattr(implementation, "artifact_fields", ()) or ()):
-        declared = result_fields.get(name)
-        if declared is None or declared.is_required():
-            raise WSEError(
-                ErrorCode.INVALID_ARGUMENT,
-                f"analysis operator {spec.ref} declares artifact field {name!r}, which must be an optional field "
-                f"of its result_model (the inline result omits it); result fields: {sorted(result_fields)}",
-                details={"artifact_field": name},
-            )
+    """``artifact_fields`` (analyses) are optional result fields; the parameter declarations are parameter fields."""
+    if spec.effect == "analysis":
+        result_fields = implementation.result_model.model_fields
+        for name in tuple(getattr(implementation, "artifact_fields", ()) or ()):
+            declared = result_fields.get(name)
+            if declared is None or declared.is_required():
+                raise WSEError(
+                    ErrorCode.INVALID_ARGUMENT,
+                    f"analysis operator {spec.ref} declares artifact field {name!r}, which must be an optional field "
+                    f"of its result_model (the inline result omits it); result fields: {sorted(result_fields)}",
+                    details={"artifact_field": name},
+                )
     parameter_fields = implementation.parameters_model.model_fields
-    for name in tuple(getattr(implementation, "reference_parameters", ()) or ()):
-        if name not in parameter_fields:
-            raise WSEError(
-                ErrorCode.INVALID_ARGUMENT,
-                f"analysis operator {spec.ref} declares reference parameter {name!r}, which is not a field of its "
-                f"parameters_model; parameters: {sorted(parameter_fields)}",
-                details={"reference_parameter": name},
-            )
+    declarations = ["reference_parameters"] + (["inline_parameters"] if spec.effect == "edit" else [])
+    for declaration in declarations:
+        for name in tuple(getattr(implementation, declaration, ()) or ()):
+            if name not in parameter_fields:
+                raise WSEError(
+                    ErrorCode.INVALID_ARGUMENT,
+                    f"{spec.effect} operator {spec.ref} declares {declaration[:-1].replace('_', ' ')} {name!r}, which "
+                    f"is not a field of its parameters_model; parameters: {sorted(parameter_fields)}",
+                    details={declaration[:-1]: name},
+                )
 
 
 def validate_operator(extension_id: str, version: str, implementation: Any) -> None:
@@ -313,7 +360,7 @@ def validate_operator(extension_id: str, version: str, implementation: Any) -> N
             f"edit operator {spec.ref} must declare result_model = PatchStep, the standard "
             "materialized patch representation",
         )
-    if spec.effect == "analysis":
+    if spec.effect in ("analysis", "edit"):
         _validate_vector_declarations(spec, implementation)
     allowed = EFFECT_COUNTERS[spec.effect]
     if spec.usage.counter not in allowed:

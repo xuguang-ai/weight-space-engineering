@@ -26,7 +26,12 @@ Protections (M2 plan Sections 2.2, 5.1, and 5.5): every policy refuses edits
 of a tensor whose role the model's family descriptor protects
 (``require_unprotected``, ``POLICY_DENIED``), and edits of alias-group members
 (``wse.patches``). Protections are the descriptor's data, not policy fields,
-so the built-in policies and their hashes are unchanged.
+so the built-in policies and their hashes are unchanged. One protection is a
+policy option, because it depends on the operation rather than the tensor:
+``OperationPolicy.refuse_whole_tensor_scaling`` refuses a ``scale_slice``
+whose selection covers its entire tensor (``require_partial_scaling``), as
+the article's ``save_edit`` did. It is off by default and, while unset,
+absent from the policy's JSON, so stored policies keep their hashes.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import Field, model_validator
 
 from wse.schemas import (
+    AxisSlice,
     ErrorCode,
     ExperimentMode,
     ExtensionRef,
@@ -45,6 +51,7 @@ from wse.schemas import (
     Usage,
     WSEError,
     _Frozen,
+    _optional,
     canonical_json,
     json_hash,
 )
@@ -97,12 +104,21 @@ class OperationPolicy(_Frozen):
     ``analyses`` maps each public kind (for example ``"stats"``) and ``edits``
     each public operation alias (for example ``"scale_slice"``) to the exact
     registered operator version that implements it. Names absent from the
-    maps are denied; versions are never substituted.
+    maps are denied; versions are never substituted. A managed preview also
+    accepts an operation named by the exact reference of an operator that
+    ``edits`` lists (``"scale_slice@1"``), and no other.
+
+    ``refuse_whole_tensor_scaling``, when true, refuses edits that scale a
+    whole tensor by one constant (``require_partial_scaling``). It is unset,
+    and so off, by default; unset, it is absent from the policy's JSON.
     """
 
     analyses: dict[str, ExtensionRef]
     edits: dict[str, ExtensionRef] = Field(default_factory=_default_edits)
     limits: ResponseLimits = Field(default_factory=ResponseLimits)
+    refuse_whole_tensor_scaling: bool | None = _optional(
+        description="true refuses a scale_slice whose selection covers its entire tensor (POLICY_DENIED); unset or "
+        "false permits it")
 
     def edit_operator(self, op: Any) -> ExtensionRef:
         if not isinstance(op, str) or op not in self.edits:
@@ -173,12 +189,20 @@ def require_capabilities(
 def require_unprotected(tensor: str, family: FamilyDescriptor | None) -> None:
     """Refuse an edit of ``tensor`` when its role is one that ``family`` protects (``POLICY_DENIED``).
 
-    Every policy applies the protections of the model's family descriptor,
-    whatever operator, policy, or entry point runs the edit. A model without a
-    descriptor (Level 0 or M1) has no roles and so no protected tensors. An
-    operator who needs to edit a protected role registers a descriptor version
-    without that protection and imports the snapshot with it; the new version
-    is recorded in the model's identity.
+    Every run of an edit operator applies the protections of the model's
+    family descriptor, under every policy and through every entry point that
+    runs one: direct ``apply_operator`` and ``materialize_patch``, managed
+    previews, and the tools built on them. Writing recorded values runs no
+    edit operator and checks no protection: exact replay (``replay_patch``,
+    which ``apply_patch`` and export replay use) and the operator-only import
+    of a published patch (``Engine.import_patch``) write the stored values as
+    recorded. That exemption is deliberate, so that published edits are
+    reproduced exactly.
+
+    A model without a descriptor (Level 0 or M1) has no roles and so no
+    protected tensors. An operator who needs to edit a protected role
+    registers a descriptor version without that protection and imports the
+    snapshot with it; the new version is recorded in the model's identity.
     """
     if family is None:
         return
@@ -197,6 +221,31 @@ def require_unprotected(tensor: str, family: FamilyDescriptor | None) -> None:
         f"which protects {', '.join(protected)}. {advice}.",
         details={"tensor": tensor, "role": role, "layer": layer, "family": str(family.ref),
                  "protected_roles": protected, "editable_roles": editable},
+    )
+
+
+def require_partial_scaling(policy: OperationPolicy, operator: ExtensionRef, tensor: str, shape: Sequence[int],
+                            selection: Sequence[AxisSlice]) -> None:
+    """Refuse a whole-tensor ``scale_slice`` when the policy sets ``refuse_whole_tensor_scaling`` (``POLICY_DENIED``).
+
+    A ``scale_slice`` (any version) whose selection covers every element of
+    its tensor scales the tensor by one constant, whatever the factor, which
+    changes only the tensor's overall scale (M2 plan Section 5.5). Any proper
+    part of the tensor may still be scaled, and no other operator is affected.
+    """
+    if not policy.refuse_whole_tensor_scaling or operator.extension_id != "scale_slice":
+        return
+    if any((entry.start, entry.stop) != (0, size) for entry, size in zip(selection, shape)):
+        return
+    others = sorted(alias for alias, ref in policy.edits.items() if ref.extension_id != "scale_slice")
+    alternatives = f", or use another permitted operation: {', '.join(others)}" if others else ""
+    raise WSEError(
+        ErrorCode.POLICY_DENIED,
+        f"scaling the whole of tensor {tensor!r} {list(shape)} by one factor is refused by this experiment's operation "
+        f"policy (refuse_whole_tensor_scaling): it changes only the tensor's overall scale. Scale a proper part of "
+        f"the tensor instead, such as some of its rows or columns or one attention head's range{alternatives}.",
+        details={"tensor": tensor, "shape": list(shape), "operator": str(operator),
+                 "policy_option": "refuse_whole_tensor_scaling", "permitted_operations": sorted(policy.edits)},
     )
 
 
