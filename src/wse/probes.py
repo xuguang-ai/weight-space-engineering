@@ -438,7 +438,7 @@ def _decoder_layers(module: torch.nn.Module) -> torch.nn.ModuleList:
 def _resolve_sites(model: ModelHandle, runtime: HFTorchModel, sites: Any) -> list[_Site]:
     if isinstance(sites, (str, bytes)) or not isinstance(sites, Sequence):
         raise _invalid("sites must be a sequence of site names, such as ['residual:0', "
-                       "'model.layers.0.mlp.down_proj:input']")
+                       "'model.layers.0.self_attn.o_proj:output']")
     names = list(sites)
     if not names:
         raise _invalid("sites must name at least one site")

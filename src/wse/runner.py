@@ -265,7 +265,7 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
     if probes:
         steps.append("Probe activations with wse_probe: texts (outputs of your generation passes by their output_uri, "
                      "strings, or items of a development suite), sites (residual:<i>, <module path>:input or :output, "
-                     "or a role site such as {\"role\": \"mlp.down\", \"layer\": 0, \"point\": \"input\"}), "
+                     "or a role site such as {\"role\": \"attn.o\", \"layer\": 0, \"point\": \"output\"}), "
                      "and optionally two groups of text indices for a contrast; wait for its job with wse_get_job. "
                      "Its vectors are references (<result_uri>#/sites/<i>/contrast/direction) that wse_analyze and "
                      "wse_preview_patch accept.")

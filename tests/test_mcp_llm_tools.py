@@ -39,6 +39,7 @@ import pytest
 
 from test_llm_policy_mcp import (  # noqa: F401 - lm is a fixture
     REVISION,
+    TASK,
     _budget,
     _open_run,
     _samples,
@@ -1030,6 +1031,34 @@ def test_text_heavy_reports_and_the_largest_probe_summaries_fit_one_response(lm,
         assert largest <= MAX_RESPONSE_BYTES
     print(f"report: {_size(report)} B stored, {wire} B on the wire with shortened tails; largest probe job response "
           f"{largest} B")
+
+
+def test_agent_visible_examples_single_out_no_site_of_a_known_method(lm):
+    """The instructions, the tool list (descriptions and schemas), and the errors a run sees give probe sites by
+    neutral examples: no mlp.down, the site of the Qwen loop task's published method."""
+    from wse.mcp_server import WSEMCPServer, server_instructions
+    from wse.policy import builtin_experiment_policies
+    from wse.runner import allowed_tools, render_instructions
+    from wse.schemas import TaskDefinition
+
+    task = TaskDefinition.model_validate({
+        "task_id": TASK, "title": "Answer", "description": "Answer the problems.",
+        "objective": {"task_id": TASK, "description": "Higher accuracy.", "gates": [{"metric": "accuracy",
+                                                                                     "min_value": 0.5}]},
+        "development_suite_id": "practice", "development_examples": 4})
+    policy = builtin_experiment_policies()[QWEN_LOOP_POLICY_ID]
+    run_id, eid = _open_run(lm.workspace, lm.base)
+    with Engine(lm.workspace, run_id=run_id) as bound:
+        server = WSEMCPServer(bound)
+        tools = anyio.run(server.server.list_tools)
+        listed = json.dumps([tool.model_dump(mode="json") for tool in tools])
+        refused = _expect(ErrorCode.INVALID_ARGUMENT, bound.submit_probe, eid, lm.base,
+                          [{"text": "abc"}, {"text": "def"}], [{"role": "attn.o"}], "role")
+        texts = [render_instructions(task, policy, experiment_id=eid, tools=allowed_tools(policy)),
+                 server_instructions(bound), listed, refused.message]
+    assert "wse_probe" in listed and "role site" in texts[0]
+    for text in texts:
+        assert "mlp.down" not in text and "down_proj" not in text, text[:200]
 
 
 def test_an_sdk_agent_under_qwen_loop_v1_sees_every_permitted_tool_and_may_omit_the_experiment_id(lm, monkeypatch):

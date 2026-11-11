@@ -220,8 +220,8 @@ def _probe_sites(manifest: ModelManifest, sites: Any, registry: Any, limit: int)
                 role = ProbeRoleSite.model_validate(dict(site))
             except (ValidationError, TypeError, ValueError):
                 raise WSEError(ErrorCode.INVALID_ARGUMENT,
-                               f"site {index} must be a name or a role site {{\"role\": \"mlp.down\", \"layer\": "
-                               "15, \"point\": \"input\" or \"output\"}} (no layer for embed, lm_head, and "
+                               f"site {index} must be a name or a role site {{\"role\": \"attn.o\", \"layer\": "
+                               "3, \"point\": \"input\" or \"output\"}} (no layer for embed, lm_head, and "
                                "final_norm)", details={"site": index}) from None
             name = f"{role_tensor(manifest, role.role, role.layer, registry=registry).site}:{role.point}"
             resolved.append({"site": name, "requested": role.model_dump(mode="json")})

@@ -229,9 +229,10 @@ the experiment and returns its job; wait for it with `wse_get_job`.
 - `sites` (1 to 128 distinct sites): `"residual:<i>"`, the residual stream
   entering decoder layer `i` (`residual:<L>` is the last layer's output);
   `"<module path>:input"` or `":output"`, where a module path is a tensor
-  name without its last part (`model.layers.7.mlp.down_proj`); or a role site
-  of the model's family descriptor, `{"role": "mlp.down", "layer": 7,
-  "point": "input"}`.
+  name without its last part (`model.layers.7.self_attn.o_proj`); or a role
+  site of the model's family descriptor, `{"role": "attn.o", "layer": 7,
+  "point": "output"}`. A site name has at most 512 characters, and a layer
+  (a residual boundary or a role site's layer) at most 9 digits.
 - `groups` (optional): `{"a": [...], "b": [...]}`, disjoint text indices with
   at least three texts together; each site then gets the contrast
   `mean(a) - mean(b)`, its norm, and standardized differences.
@@ -430,7 +431,8 @@ Freezing and the final evaluation are operator actions (`wse freeze`,
 ## Example session: a language model
 
 The operator has imported Llama-3.2-1B-Instruct (`ckpt_example_llama`; 16
-decoder layers, hidden size 2,048, `mlp.down_proj` weights `[2048, 8192]`),
+decoder layers, hidden size 2,048, 32 attention heads of 64 dimensions, so
+`self_attn.o_proj` weights `[2048, 2048]`),
 registered the task `example_math_v1` with the generation suite
 `example_math_dev_v1` (16 arithmetic word problems, the model's default
 profile `llama_3_2_1b_instruct_default@1`, the grader `gsm8k_numeric@1`, 1
@@ -451,8 +453,8 @@ seed 0), registered the policy `example_lm_v1`, and granted `run_example_lm`.
    `wse_get_job {"job_id": "job_example_pass", "wait_seconds": 10}` returns it
    once succeeded, with `report_id`.
 4. `wse_get_report {"report_id": "report_example_pass"}` returns the report;
-   suppose samples 2, 5, and 11 reached the token limit (`limit_hit` true)
-   and the others finished.
+   suppose the answers of samples 2, 5, and 11 are wrong (`correct` false)
+   and the others right.
 5. `wse_probe` with
 
    ```json
@@ -461,8 +463,7 @@ seed 0), registered the policy `example_lm_v1`, and granted `run_example_lm`.
      "texts": [{"output_uri": "wse://analyses/<sample 2>"}, {"output_uri": "wse://analyses/<sample 5>"},
                {"output_uri": "wse://analyses/<sample 11>"}, {"output_uri": "wse://analyses/<sample 0>"},
                {"output_uri": "wse://analyses/<sample 1>"}, {"output_uri": "wse://analyses/<sample 3>"}],
-     "sites": [{"role": "mlp.down", "layer": 7, "point": "input"},
-               {"role": "mlp.down", "layer": 7, "point": "output"}],
+     "sites": ["residual:8", {"role": "attn.o", "layer": 7, "point": "output"}],
      "groups": {"a": [0, 1, 2], "b": [3, 4, 5]},
      "idempotency_key": "probe-1"
    }
@@ -470,23 +471,23 @@ seed 0), registered the policy `example_lm_v1`, and granted `run_example_lm`.
 
    queues a probe; `wse_get_job` returns its summary with `result_uri`
    `wse://analyses/<probe>`. The contrast at the output of layer 7's
-   `mlp.down_proj` has 2,048 values, one per output row:
-   `wse://analyses/<probe>#/sites/1/contrast/direction`.
-6. `wse_analyze {"checkpoint_id": "ckpt_example_llama", "kind": "direction_projection", "tensor": "model.layers.7.mlp.down_proj.weight", "selection": [{"start": 0, "stop": 2048, "step": 1}, {"start": 0, "stop": 8192, "step": 1}], "parameters": {"direction": "wse://analyses/<probe>#/sites/1/contrast/direction", "axis": "columns"}}`
+   attention projection `self_attn.o_proj` has 2,048 values, one per output
+   row: `wse://analyses/<probe>#/sites/1/contrast/direction`.
+6. `wse_analyze {"checkpoint_id": "ckpt_example_llama", "kind": "direction_projection", "tensor": "model.layers.7.self_attn.o_proj.weight", "selection": [{"start": 0, "stop": 2048, "step": 1}, {"start": 0, "stop": 2048, "step": 1}], "parameters": {"direction": "wse://analyses/<probe>#/sites/1/contrast/direction", "axis": "columns"}}`
    returns the columns most aligned with the contrast in `result.top`.
 7. `wse_preview_patch` with the patch spec
 
    ```json
    {
      "base_checkpoint_id": "ckpt_example_llama",
-     "hypothesis": "Outputs that reach the token limit differ along this direction at layer 7.",
+     "hypothesis": "Outputs with wrong answers differ from right ones along this direction at layer 7's attention output.",
      "operations": [
        {
          "op": "project_out",
-         "tensor": "model.layers.7.mlp.down_proj.weight",
-         "selection": [{"start": 0, "stop": 2048, "step": 1}, {"start": 0, "stop": 8192, "step": 1}],
+         "tensor": "model.layers.7.self_attn.o_proj.weight",
+         "selection": [{"start": 0, "stop": 2048, "step": 1}, {"start": 0, "stop": 2048, "step": 1}],
          "direction": "wse://analyses/<probe>#/sites/1/contrast/direction",
-         "columns": [118, 942, 2305, 4411]
+         "columns": [118, 942, 1305, 1911]
        }
      ]
    }

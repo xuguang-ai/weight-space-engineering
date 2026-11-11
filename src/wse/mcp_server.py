@@ -225,8 +225,8 @@ PROBE_SITES_SCHEMA: dict[str, Any] = {
                         _inline_refs(ProbeRoleSite.model_json_schema())]},
     "description": "Where to read activations: \"residual:<i>\" (the residual stream entering decoder layer i; "
                    "residual:<L> is the last layer's output), \"<module path>:input\" or \"<module path>:output\" (a "
-                   "module path is a tensor name without its last part, such as model.layers.3.mlp.down_proj), or a "
-                   "role site {\"role\": \"mlp.down\", \"layer\": 3, \"point\": \"input\"}."}
+                   "module path is a tensor name without its last part, such as model.layers.3.self_attn.o_proj), or "
+                   "a role site {\"role\": \"attn.o\", \"layer\": 3, \"point\": \"output\"}."}
 PROBE_GROUPS_SCHEMA: dict[str, Any] = {
     "anyOf": [_inline_refs(ProbeGroups.model_json_schema()), {"type": "null"}], "default": None,
     "description": "Optional: two disjoint groups of text indices, {\"a\": [...], \"b\": [...]}, with at least three "
