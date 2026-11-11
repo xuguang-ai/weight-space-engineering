@@ -372,6 +372,9 @@ def test_builtin_registry_contains_the_scripted_strategy():
 
     registry = builtin_registry()
     assert registry.resolve("strategy", "scripted_search", "1") is ScriptedSearchStrategy
+    # M2 adds the scripted discovery strategy (tests/test_direction_search.py).
+    assert registry.list("strategy") == [ExtensionRef.parse("direction_search@1"),
+                                         ExtensionRef.parse("scripted_search@1")]
     with pytest.raises(WSEError) as excinfo:
         registry.resolve_reference("strategy", "scripted_search")  # no alias: versions are explicit
     assert excinfo.value.code == ErrorCode.NOT_FOUND

@@ -232,8 +232,9 @@ def builtin_registry() -> Registry:
     ``math_boxed@1`` and ``gsm8k_numeric@1``, the edit operators
     ``project_out@1``, ``add_low_rank@1``, and ``fill_slice@1``, and the
     analyses ``tensor_norms@1``, ``svd_top_k@1``, and
-    ``direction_projection@1`` (M2). None of them imports
-    ``transformers`` or ``math_verify`` until it is used.
+    ``direction_projection@1``, and the scripted discovery strategy
+    ``direction_search@1`` (M2). None of them imports ``transformers`` or
+    ``math_verify`` until it is used.
     """
     from wse.adapters.families import BUILTIN_FAMILIES
     from wse.adapters.hf_causal_lm import HFCausalLMAdapter
@@ -246,6 +247,7 @@ def builtin_registry() -> Registry:
     from wse.operators.directions import BUILTIN_DIRECTION_EDITS
     from wse.operators.linalg import BUILTIN_LINALG_ANALYSES
     from wse.operators.tensor import BUILTIN_ANALYSES, BUILTIN_EDITS
+    from wse.strategies.direction_search import DirectionSearchStrategy
     from wse.strategies.scripted import ScriptedSearchStrategy
 
     registry = Registry()
@@ -265,6 +267,6 @@ def builtin_registry() -> Registry:
         registry.register("profile", profile.profile_id, profile.version, profile)
     for grader in BUILTIN_GRADERS:
         registry.register("grader", grader.grader_id, grader.version, grader)
-    registry.register("strategy", ScriptedSearchStrategy.strategy_id, ScriptedSearchStrategy.version,
-                      ScriptedSearchStrategy)
+    for strategy in (ScriptedSearchStrategy, DirectionSearchStrategy):
+        registry.register("strategy", strategy.strategy_id, strategy.version, strategy)
     return registry
