@@ -67,6 +67,9 @@ def add_setup_arguments(parser: argparse.ArgumentParser) -> None:
                         help="new tokens per output (at most 8,192 under qwen_loop_v1)")
     parser.add_argument("--profile", default=PROFILE, help=f"the generation profile (default {PROFILE})")
     parser.add_argument("--device", choices=("mps", "cpu"), default="mps", help="the worker's engine device")
+    parser.add_argument("--via-mcp", action="store_true",
+                        help="drive the tools through a real wse serve MCP session (the SDK test double), not the "
+                             "runner's dispatch")
 
 
 def check_setup_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -170,7 +173,7 @@ def _steps(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
         if kind == "tool_result" and pending is not None:
             pending.update(ok=event.get("ok"), error_code=event.get("error_code"), error=event.get("summary"))
             last = steps[-1] if steps else None
-            if pending["tool"] == "wse_get_job" and last is not None and last["tool"] == "wse_get_job" \
+            if pending["tool"] == "wse_get_job" and last is not None and last.get("tool") == "wse_get_job" \
                     and last["arguments"].get("job_id") == pending["arguments"].get("job_id") and pending["ok"]:
                 last["polls"] = last.get("polls", 1) + 1
                 last["last_at"] = pending["at"]
@@ -271,3 +274,34 @@ def experiment_summary(engine: Any, experiment_id: str) -> dict[str, Any]:
         "steps": _steps(controller_events(engine.store.db, experiment_id)),
         "jobs": jobs, "reports": [_report_entry(report) for report in reports], "candidates": candidates,
     }
+
+
+def controller(registry: Any, strategy_class: type, parameters: dict[str, Any], *, via_mcp: bool, max_steps: int,
+               wall_clock_seconds: float) -> Any:
+    """The controller configuration: the strategy through the runner's dispatch, or through MCP.
+
+    With ``via_mcp``, the OpenAI Agents SDK runs its tool loop against a
+    real ``wse serve`` process (stdio MCP), and the strategy chooses every
+    tool call in place of a model (the runner's test double: no network and
+    no credentials). The test double creates its strategy without
+    arguments, so a subclass bound to ``parameters`` is registered under
+    ``<strategy_id>_mcp``. Either way the managed operations, budgets, and
+    audit records are the same.
+    """
+    from wse.agent_adapters.base import AgentConfig
+    from wse.runner import TEST_DOUBLE_PREFIX, StrategyConfig
+
+    if not via_mcp:
+        ref = f"{strategy_class.strategy_id}@{strategy_class.version}"
+        return StrategyConfig(strategy=ref, parameters=parameters, max_steps=max_steps,
+                              wall_clock_seconds=wall_clock_seconds)
+    bound_id = f"{strategy_class.strategy_id}_mcp"
+
+    def __init__(self: Any, **overrides: Any) -> None:
+        strategy_class.__init__(self, **{**parameters, **overrides})
+
+    bound = type(f"{strategy_class.__name__}MCP", (strategy_class,),
+                 {"strategy_id": bound_id, "version": strategy_class.version, "__init__": __init__})
+    registry.register("strategy", bound_id, strategy_class.version, bound)
+    return AgentConfig(model=f"{TEST_DOUBLE_PREFIX}{bound_id}@{strategy_class.version}", max_turns=min(max_steps, 10_000),
+                       wall_clock_seconds=wall_clock_seconds)

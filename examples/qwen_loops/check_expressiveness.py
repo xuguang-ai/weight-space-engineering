@@ -305,8 +305,9 @@ def main(argv: list[str] | None = None) -> int:
              **{f"columns{layer}": np.asarray(directions[layer]["columns"]) for layer in LAYERS})
     registry = builtin_registry()
     registry.register("strategy", ExpressivenessCheck.strategy_id, ExpressivenessCheck.version, ExpressivenessCheck)
-    config = StrategyConfig(strategy=STRATEGY, parameters={"suite_id": setup["suite_id"], "operations": operations},
-                            max_steps=args.max_steps, wall_clock_seconds=args.wall_clock_hours * 3600)
+    config = loop_setup.controller(registry, ExpressivenessCheck,
+                                   {"suite_id": setup["suite_id"], "operations": operations}, via_mcp=args.via_mcp,
+                                   max_steps=args.max_steps, wall_clock_seconds=args.wall_clock_hours * 3600)
     print(f"run {grant.run_id}: {STRATEGY} on {base}, suite {setup['suite_id']}, device {args.device}",
           file=sys.stderr)
     runner = ReferenceRunner(workspace, registry=registry, worker_args=["--device", args.device],

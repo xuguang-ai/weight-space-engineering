@@ -122,8 +122,11 @@ def main(argv: list[str] | None = None) -> int:
         setup = loop_setup.prepare(engine, args)
         grant = engine.grant_run(setup["task_id"], setup["policy_id"], setup["base_checkpoint_id"])
     parameters = _parameters(args, setup["suite_id"])
-    config = StrategyConfig(strategy=STRATEGY, parameters=parameters, max_steps=args.max_steps,
-                            wall_clock_seconds=args.wall_clock_hours * 3600)
+    from wse.registry import builtin_registry
+
+    registry = builtin_registry()
+    config = loop_setup.controller(registry, DirectionSearchStrategy, parameters, via_mcp=args.via_mcp, max_steps=args.max_steps,
+                                   wall_clock_seconds=args.wall_clock_hours * 3600)
     record = {"script": "examples/qwen_loops/run_discovery.py", "workspace": str(workspace), "setup": setup,
               "run_id": grant.run_id, "controller_config": config.model_dump(mode="json"),
               "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
@@ -133,7 +136,8 @@ def main(argv: list[str] | None = None) -> int:
                                 "suite_id": setup["suite_id"], "parameters": parameters}) + "\n")
     print(f"run {grant.run_id}: {STRATEGY} on {setup['base_checkpoint_id']}, suite {setup['suite_id']}, "
           f"device {args.device}", file=sys.stderr)
-    runner = ReferenceRunner(workspace, worker_args=["--device", args.device], log_dir=out / "logs")
+    runner = ReferenceRunner(workspace, registry=registry, worker_args=["--device", args.device],
+                             log_dir=out / "logs")
     status, error = 0, None
     started = time.monotonic()
     try:
