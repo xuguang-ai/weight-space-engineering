@@ -4,10 +4,12 @@
 on a prepared workspace: it issues a run grant (``Engine.grant_run``), runs
 one controller on the grant's experiment through ``ReferenceRunner`` (an LLM
 through the ``openai_agents@1`` adapter and the MCP server, a registered
-stepwise strategy, or any controller mapping the runner accepts), runs the
-hidden final evaluation of the frozen experiment, summarizes it
-(``wse.runner.summarize_trial``), and exports a closed experiment and
-replays the export in a fresh workspace to check byte-identical weights.
+stepwise strategy, or any controller mapping the runner accepts), and, when
+asked, runs the hidden final evaluation of the frozen experiment. It then
+summarizes the experiment (``wse.runner.summarize_trial``), exports a closed
+experiment, and replays the export in a fresh workspace to check
+byte-identical weights. The final evaluation is off by default, because a
+series of trials evaluates only after all of them have frozen.
 Errors from the engine and the runner propagate unchanged; an experiment
 that does not reach ``CLOSED`` is returned in the state it ended in,
 without export or replay.
@@ -104,7 +106,7 @@ def _require_empty(path: Path, what: str) -> None:
 def run_agent_experiment(workspace: str | Path, *, task: str, base: str, policy: str, model: str | None = None,
                          strategy: str | None = None, controller: Mapping[str, Any] | None = None,
                          max_turns: int | None = None, wall_clock_seconds: float | None = None,
-                         out_dir: str | Path | None = None, final_evaluation: bool = True,
+                         out_dir: str | Path | None = None, final_evaluation: bool = False,
                          verify_replay: bool = True) -> AgentRun:
     """Grant, run, final-evaluate, summarize, export, and replay one experiment (see the module docstring).
 
@@ -114,10 +116,14 @@ def run_agent_experiment(workspace: str | Path, *, task: str, base: str, policy:
     ``wall_clock_seconds`` override the controller's defaults for ``model``
     and ``strategy``. ``out_dir`` (default ``<workspace>/agent_runs/<run_id>``)
     receives the runner's logs, the export (``export``), and the replay
-    workspace (``replay``); both must be absent or empty. The hidden final
-    evaluation runs when the experiment ends ``FROZEN`` and
-    ``final_evaluation`` is true; export and replay run when it ends
-    ``CLOSED`` and ``verify_replay`` is true.
+    workspace (``replay``); both must be absent or empty. Export and replay
+    run when the experiment ends ``CLOSED`` and ``verify_replay`` is true.
+
+    The hidden final evaluation runs only with ``final_evaluation=True``, when
+    the experiment ends ``FROZEN``; use it for a single experiment. A series of
+    trials runs its final evaluations only after every trial has frozen, so
+    that no trial can adapt to an earlier trial's final result (M1 plan
+    Section 7.3): run the trials, then ``Engine.final_evaluate`` each one.
     """
     config, kind = _controller_config(model, strategy, controller, max_turns, wall_clock_seconds)
     workspace = Path(workspace).resolve()

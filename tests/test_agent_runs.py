@@ -38,7 +38,7 @@ def _grant_count(engine) -> int:
 
 
 def test_a_scripted_run_closes_succeeds_and_replays_to_identical_weights(engine, workspace, prepared):
-    run = _run(workspace, prepared, strategy=SCRIPTED)
+    run = _run(workspace, prepared, strategy=SCRIPTED, final_evaluation=True)
     assert isinstance(run, AgentRun) and dataclasses.is_dataclass(run)
     with pytest.raises(dataclasses.FrozenInstanceError):
         run.state = "OPEN"  # type: ignore[misc]
@@ -62,15 +62,17 @@ def test_a_scripted_run_closes_succeeds_and_replays_to_identical_weights(engine,
 
 def test_without_replay_verification_nothing_is_exported(workspace, prepared, tmp_path):
     out = tmp_path / "out"
-    run = _run(workspace, prepared, strategy=SCRIPTED, out_dir=out, verify_replay=False)
+    run = _run(workspace, prepared, strategy=SCRIPTED, out_dir=out, final_evaluation=True, verify_replay=False)
     assert run.state == "CLOSED" and run.success is True
     assert run.out_dir == out and run.export_dir is None and run.replay_identical is None
     assert not (out / "export").exists() and not (out / "replay").exists()
 
 
-def test_without_final_evaluation_the_frozen_experiment_is_returned(engine, workspace, prepared, tmp_path):
+def test_by_default_the_frozen_experiment_is_returned_before_its_final_evaluation(engine, workspace, prepared,
+                                                                                   tmp_path):
+    # A series of trials runs its final evaluations only after every trial has frozen (M1 plan Section 7.3).
     controller = {"kind": "strategy", "strategy": SCRIPTED, "wall_clock_seconds": 300.0}
-    run = _run(workspace, prepared, controller=controller, out_dir=tmp_path / "out", final_evaluation=False)
+    run = _run(workspace, prepared, controller=controller, out_dir=tmp_path / "out")
     assert run.state == engine.get_experiment(run.experiment_id).state == "FROZEN"
     assert run.success is None and run.final is None
     assert run.export_dir is None and run.replay_identical is None
@@ -135,7 +137,7 @@ def test_an_agent_run_through_the_sdk_test_double_closes_and_replays(workspace, 
     monkeypatch.delenv("OPENAI_AGENTS_DISABLE_TRACING", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     model = f"{TEST_DOUBLE_PREFIX}{SCRIPTED}"
-    run = _run(workspace, prepared, model=model, max_turns=60, out_dir=tmp_path / "out")
+    run = _run(workspace, prepared, model=model, max_turns=60, out_dir=tmp_path / "out", final_evaluation=True)
     assert os.environ["OPENAI_AGENTS_DISABLE_TRACING"] == "1"
     assert run.summary["controller"] == "openai_agents@1" and run.summary["model"] == model
     assert run.state == "CLOSED" and run.success is True and run.replay_identical is True

@@ -52,8 +52,9 @@ def main(argv: list[str] | None = None) -> int:
             ids = _fixture().setup_workspace(engine, args.out / "bundles")
         ids_file.write_text(json.dumps(ids, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     controller = {"model": args.model} if args.model else {"strategy": "scripted_search@1"}
+    # One experiment, so its final evaluation runs at once (a series would wait until every trial froze).
     run = run_agent_experiment(workspace, task=ids["task_id"], base=ids["task_checkpoint_id"], policy=args.policy,
-                               **controller)
+                               final_evaluation=True, **controller)
     print(f"experiment {run.experiment_id} (run {run.run_id}): {run.state}")
     print(f"controller {run.summary['controller']} ended {run.summary['status']}: {run.summary['reason']}")
     print(f"success: {run.success}; final: {json.dumps(run.final, sort_keys=True)}")

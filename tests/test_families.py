@@ -495,3 +495,30 @@ def test_a_descriptor_that_does_not_fit_the_checkpoint_is_refused_at_import(labe
         error = _expect(ErrorCode.INVALID_MODEL, _import, engine, hf_snapshots["llama_untied"], family="misfit@1")
         assert "misfit@1" in error.message and fragment in error.message, error.message
         assert engine.store.list_ready() == []
+
+
+# A built-in descriptor is frozen once it is released: its identity in a model's configuration is the string
+# "<id>@<version>", so changing its content under the same version would change the roles and protections of
+# stored checkpoints without changing their identity. Change the content only together with a new version.
+FROZEN_DESCRIPTORS = {
+    "llama@1": "sha256:d95523fade801bb4db2b3edfaac5d83d18e374eb27862a549d6287dbad141ad7",
+    "qwen3_5@1": "sha256:6cf72786c7304b4d728b8df4b53a453e33bd6c44fbbbdae14ef852c07f88c038",
+}
+
+
+def test_built_in_descriptors_are_frozen_under_their_versions():
+    from wse.adapters.families import BUILTIN_FAMILIES
+    from wse.schemas import json_hash
+
+    assert {str(d.ref): json_hash(d.model_dump(mode="json")) for d in BUILTIN_FAMILIES} == FROZEN_DESCRIPTORS
+
+
+def test_role_lookups_accept_numpy_integers(handles):
+    import numpy as np
+
+    qwen = handles["qwen3_5"]
+    attention = role_tensor(qwen, "attn.o", layer=np.int64(1))
+    assert attention == role_tensor(qwen, "attn.o", layer=1)
+    assert attention.selection(head=np.int64(2)) == attention.selection(head=2)
+    for bad in (True, 1.0, "1"):
+        _expect(ErrorCode.INVALID_ARGUMENT, role_tensor, qwen, "attn.o", layer=bad)

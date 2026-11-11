@@ -40,7 +40,9 @@ Both models were imported with `wse import-hf` into a fresh workspace.
 Identity hashes:
 
 - **Qwen3.5-0.8B:** config `sha256:5d179f2308164eadf8082febd23e6c01ce636721e5b15ca539074d0902d8d31f`, tokenizer `sha256:89c311e61febfaf933944ad719158c6c2c45dbf74067de0f15265ae5410a87fc`, chat template `sha256:273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80`. The snapshot has no `generation_config.json`.
-- **Llama-3.2-1B-Instruct:** config `sha256:2ff3facc5554c49c17cf89d91e3bb7a798683bab2a258b987937d95617088680`, tokenizer `sha256:ee50c999c9968897333d6ab4ea48fcb978d42a08858e2ece171e4177687ef261`, chat template `sha256:5816fce10444e03c2e9ee1ef8a4a1ea61ae7e69e438613f3b17b69d0426223a4`, generation configuration `sha256:a63b7e5c108ea78be8b33c22a7bfcbf7430a0cd8ffb7de53bc9ca436df195edf`.
+- **Llama-3.2-1B-Instruct:** config `sha256:2ff3facc5554c49c17cf89d91e3bb7a798683bab2a258b987937d95617088680` (see the note below), tokenizer `sha256:ee50c999c9968897333d6ab4ea48fcb978d42a08858e2ece171e4177687ef261`, chat template `sha256:5816fce10444e03c2e9ee1ef8a4a1ea61ae7e69e438613f3b17b69d0426223a4`, generation configuration `sha256:a63b7e5c108ea78be8b33c22a7bfcbf7430a0cd8ffb7de53bc9ca436df195edf`.
+
+  Note on this configuration hash. Task 7 imported Llama at Level 0, and its stored configuration carried a `rope_theta` that `transformers` had written into `config.json`'s `rope_scaling` while building the module. Since M2 Task 8, a Llama import selects the `llama@1` descriptor, and since that task's review fixes it stores `config.json` unchanged, so the same snapshot now gets configuration hash `sha256:756364057c62e1ece05d2137b31bc0c2b355ff2f59c4ad2be31035ed565d3b99`. Its weights, tokenizer, chat-template, and generation-configuration hashes are unchanged. Checkpoints imported before still open with their recorded configuration. Patches recorded on them replay only on them.
 
 Imports took 7 s for Qwen and 10 s for Llama. Importing either snapshot again returned the same checkpoint and stored nothing.
 
@@ -213,10 +215,10 @@ The comparison ran with these settings:
 - evaluation seed 0;
 - MPS at batch size 8.
 
-The block below is idempotent:
+Running the block again:
 
 - import and patch import return the existing checkpoints;
-- `compare-generation` resumes from its output directory.
+- `compare-generation` resumes from its output directory. A run directory written before commit 8fb1eeb records no library versions, so it is read but not continued; continue in a new directory.
 
 After an interruption, run the same block again. `W` and `OUT` must lie outside the repository.
 

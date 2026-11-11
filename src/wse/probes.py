@@ -58,7 +58,9 @@ core: budgets, policy, and the managed tool are not part of this module.
   reduction); only these per-text sums are kept. After each forward the sums
   move to the CPU, where they are widened to float64 and divided by the
   window length (MPS has no float64). Group means, contrast directions,
-  norms, and standardized differences are float64 (NumPy). Log-probabilities
+  norms, and standardized differences are float64 (NumPy); a group's mean is
+  shifted by its first text (``x_0 + mean(x - x_0)``), so a group of identical
+  texts has exactly that text's mean and zero variance. Log-probabilities
   are the engine's float32 ``log_softmax`` values
   (``HFTorchModel.next_token_logprobs``), averaged in float64. Results are
   bitwise reproducible within one device and library version. On
@@ -66,10 +68,11 @@ core: budgets, policy, and the managed tool are not part of this module.
   differed from float64 sums of the same activations by at most 1.2e-7 of
   each dimension's mean magnitude; activations themselves differ between MPS
   and CPU kernels far more (BF16 rounding).
-* **Log-probabilities.** ``mean_logprobs[k]`` is the mean of
-  ``log p(tokens[t + 1] | tokens[:t + 1])`` over the averaged positions ``t``
-  whose next token lies inside the forward (``start <= t < stop - 1``), or
-  ``None`` when there is none (a window of only the last position).
+* **Log-probabilities.** ``mean_logprobs[k]`` is the mean log-probability of
+  the window's own tokens given everything before them: the mean of
+  ``log p(tokens[t] | tokens[:t])`` over ``max(start, 1) <= t < stop``. It is
+  ``None`` only for the window ``[0, 1)``, whose one token has no prefix. A
+  window over an output therefore scores every output token.
 * **Limits.** ``max_tokens`` (default ``DEFAULT_MAX_PROBE_TOKENS``, at most
   ``MAX_PROBE_TOKENS``) bounds each text's forward length ``stop``, and so
   does the model's context (``max_positions``). Cost grows with ``stop``,
@@ -183,6 +186,11 @@ class Contrast:
     sizes: tuple[int, int]
 
 
+def _shifted_mean(rows: np.ndarray) -> np.ndarray:
+    """The mean of ``rows`` shifted by the first row: exact for identical rows, and better conditioned otherwise."""
+    return rows[0] + (rows - rows[0]).mean(axis=0)
+
+
 def _frozen(array: Any) -> np.ndarray:
     """A read-only float64 array: ``array`` itself when it already is one, otherwise a private copy."""
     result = np.asarray(array, dtype=np.float64)
@@ -198,8 +206,8 @@ class ProbeResult:
 
     ``means[site]`` is float64 ``[len(texts), features]``: row ``k`` is text
     ``k``'s mean over its window. ``token_counts[k]`` is the window length and
-    ``mean_logprobs[k]`` the mean next-token log-probability over it (``None``
-    when no averaged position has a next token inside the forward).
+    ``mean_logprobs[k]`` the mean log-probability of the window's tokens given
+    their prefixes (``None`` for the window ``[0, 1)``).
     ``runtime`` records the engine's device, stored dtypes, and library
     versions. Results are immutable (the means are read-only arrays) and,
     since they hold arrays, compare by identity.
@@ -248,7 +256,7 @@ class ProbeResult:
     def group_mean(self, site: str, indices: Sequence[int]) -> np.ndarray:
         """The mean of ``site``'s per-text means over the texts ``indices`` (float64; texts weigh equally)."""
         means = self._site(site)
-        return means[self._group(indices, "indices")].mean(axis=0)
+        return _shifted_mean(means[self._group(indices, "indices")])
 
     def contrast(self, site: str, group_a: Sequence[int], group_b: Sequence[int]) -> Contrast:
         """The contrast of ``site`` between two disjoint groups of texts (module docstring, **Contrasts**)."""
@@ -262,7 +270,7 @@ class ProbeResult:
             raise _invalid("a contrast needs at least three texts in its two groups, so that the pooled standard "
                            "deviation has a degree of freedom; compare group_mean values for single texts")
         a, b = means[rows_a], means[rows_b]
-        mean_a, mean_b = a.mean(axis=0), b.mean(axis=0)
+        mean_a, mean_b = _shifted_mean(a), _shifted_mean(b)
         direction = mean_a - mean_b
         squares = ((a - mean_a) ** 2).sum(axis=0) + ((b - mean_b) ** 2).sum(axis=0)
         pooled = np.sqrt(squares / (len(rows_a) + len(rows_b) - 2))
@@ -461,8 +469,11 @@ def _windows(texts: Any, *, vocab_size: int, context: int | None, max_tokens: in
             raise _invalid(f"text {index}: start and stop must be integers with 0 <= start < stop <= {len(tokens)} "
                            f"(the number of tokens), not start={text.start!r}, stop={text.stop!r}", text=index)
         if stop > max_tokens:
-            raise _invalid(f"text {index}: its forward of {stop} positions exceeds max_tokens {max_tokens}; set stop "
-                           "or raise max_tokens", text=index, stop=stop, max_tokens=max_tokens)
+            advice = ("raise max_tokens, up to " + str(MAX_PROBE_TOKENS) if max_tokens < MAX_PROBE_TOKENS
+                      else f"the forward is at most {MAX_PROBE_TOKENS} positions")
+            raise _invalid(f"text {index}: its forward of {stop} positions exceeds max_tokens {max_tokens}; {advice}, "
+                           "or shorten the text (keep fewer tokens before stop, which removes context)",
+                           text=index, stop=stop, max_tokens=max_tokens)
         if context is not None and stop > context:
             raise _invalid(f"text {index}: its forward of {stop} positions exceeds the model's context of {context} "
                            "positions", text=index, stop=stop, context=context)
@@ -510,7 +521,8 @@ def probe(
         for ids, start, stop in windows:
             for capture in captures:
                 capture.begin(start, stop)
-            values = runtime.next_token_logprobs(ids, start=start)
+            # The window's tokens are scored from the positions before them; position 0 has no prefix.
+            values = runtime.next_token_logprobs(ids, start=max(start, 1) - 1)
             for capture in captures:
                 totals[capture.site.name].append(capture.finish())
             logprobs.append(float(values.to(torch.float64).mean()) if values.numel() else None)

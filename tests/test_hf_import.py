@@ -409,7 +409,7 @@ def test_reimporting_a_snapshot_creates_no_new_checkpoint_or_blob(snapshots, wor
                                                ("llama_untied", "LlamaForCausalLM"),
                                                ("qwen3", "Qwen3ForCausalLM"),
                                                ("gemma3", "Gemma3ForCausalLM")])
-def test_llama_style_checkpoints_import_without_a_descriptor(snapshots, engine, name, model_class):
+def test_checkpoints_named_like_their_modules_import_without_a_name_map(snapshots, engine, name, model_class):
     import transformers
 
     snapshot = snapshots[name]
@@ -437,6 +437,22 @@ def test_llama_style_checkpoints_import_without_a_descriptor(snapshots, engine, 
     for tensor_name, tensor in on_disk.items():
         assert stored[tensor_name].dtype == tensor.dtype
         assert torch.equal(stored[tensor_name].reshape(-1).view(torch.uint8), tensor.reshape(-1).view(torch.uint8))
+
+
+def test_the_stored_configuration_is_the_snapshots_config_json(snapshots, engine, tmp_path):
+    """transformers fills defaults into nested dicts (Llama's rope_scaling gains rope_theta); the import must not."""
+    snapshot = tmp_path / "llama_rope"
+    shutil.copytree(snapshots["llama_untied"], snapshot)
+    config_json = json.loads((snapshot / "config.json").read_text())
+    config_json.update(rope_theta=10000.0, rope_scaling={
+        "rope_type": "llama3", "factor": 4.0, "high_freq_factor": 4.0, "low_freq_factor": 1.0,
+        "original_max_position_embeddings": 32})
+    (snapshot / "config.json").write_text(json.dumps(config_json, indent=2))
+    manifest = _import(engine, snapshot)
+    assert manifest.config["model_config"] == config_json
+    assert "rope_theta" not in manifest.config["model_config"]["rope_scaling"]
+    reopened = engine.open_checkpoint(manifest.checkpoint_id)
+    assert reopened.config["model_config"] == config_json and reopened.config_hash == manifest.config_hash
 
 
 def test_family_descriptors_register_by_exact_version():

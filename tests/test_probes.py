@@ -227,18 +227,20 @@ def test_mean_logprobs_agree_with_log_softmax_of_the_engine_logits(name, handles
     runtime = handle.runtime("cpu")
     tokens = _tokens(7, 14)
     texts = [ProbeText(tokens), ProbeText(tokens, start=3, stop=11), ProbeText(tokens, start=10, stop=11),
-             ProbeText(tokens, start=13)]
+             ProbeText(tokens, start=13), ProbeText(tokens, start=0, stop=1)]
     result = probe(handle, texts, sites=["residual:1"], device="cpu")
     for text, actual in zip(texts, result.mean_logprobs, strict=True):
         stop = _stop(text)
         logprobs = torch.log_softmax(runtime.logits(torch.tensor([tokens[:stop]]))[0], dim=-1)
-        positions = range(text.start, stop - 1)  # averaged positions whose next token lies inside the forward
-        if not positions:
+        targets = range(max(text.start, 1), stop)  # the window's tokens, each scored from the position before it
+        if not targets:
             assert actual is None
             continue
-        expected = torch.stack([logprobs[t, tokens[t + 1]] for t in positions]).to(torch.float64).mean().item()
+        expected = torch.stack([logprobs[t - 1, tokens[t]] for t in targets]).to(torch.float64).mean().item()
         assert isinstance(actual, float) and actual == pytest.approx(expected, rel=1e-12, abs=1e-12)
-    assert result.mean_logprobs[2] is None and result.mean_logprobs[3] is None
+    # A one-token window scores its token from the position before it; only position 0 has no prefix.
+    assert result.mean_logprobs[2] is not None and result.mean_logprobs[3] is not None
+    assert result.mean_logprobs[4] is None
     # The engine's teacher-forced read returns the same per-token values, bitwise, in chunks of any size.
     ids = torch.tensor([tokens])
     logprobs = torch.log_softmax(runtime.logits(ids)[0], dim=-1)
@@ -255,6 +257,23 @@ def test_mean_logprobs_agree_with_log_softmax_of_the_engine_logits(name, handles
 
 
 # -- contrasts -------------------------------------------------------------------------------------
+
+
+def test_the_contrast_of_identical_texts_is_exactly_zero():
+    from wse.probes import ProbeResult
+    from wse.schemas import ModelIdentity
+
+    row = np.array([0.1, 0.2, 0.30000000000000004, -7.123456789, 1e-9])
+    identity = ModelIdentity(adapter={"extension_id": "mlp", "version": "1"}, config_hash="sha256:" + "0" * 64,
+                             weights_hash="sha256:" + "1" * 64)
+    for n_a, n_b in ((3, 2), (5, 7), (2, 1)):
+        means = np.tile(row, (n_a + n_b, 1))
+        result = ProbeResult(sites=("s",), means={"s": means}, token_counts=(1,) * (n_a + n_b),
+                             mean_logprobs=(None,) * (n_a + n_b), model=identity, runtime={})
+        contrast = result.contrast("s", list(range(n_a)), list(range(n_a, n_a + n_b)))
+        assert np.array_equal(contrast.direction, np.zeros_like(row)) and contrast.norm == 0.0
+        assert np.array_equal(contrast.standardized, np.zeros_like(row))
+        assert np.array_equal(result.group_mean("s", list(range(n_a))), row)
 
 
 def test_contrast_direction_is_the_difference_of_group_means(handles):

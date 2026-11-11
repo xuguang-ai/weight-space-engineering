@@ -34,13 +34,19 @@ models) have no roles.
 
 **Protections.** Every policy refuses edits of tensors whose role the model's
 descriptor protects (``wse.policy.require_unprotected``); the built-in
-descriptors protect ``embed``, ``lm_head``, and ``final_norm``. Because the
-descriptor version is recorded in the model's configuration, and so in its
-identity, a model's protections never change while its identity stays.
+descriptors protect ``embed``, ``lm_head``, and ``final_norm``. Exact replay
+and the operator's import of a published patch write recorded values and
+check no protection, so published edits reproduce exactly.
+
+**Versions.** The descriptor version is recorded in the model's configuration,
+and so in its identity. A released descriptor is therefore frozen: changing
+its roles or protections needs a new version, and a test pins the content of
+every built-in descriptor.
 """
 
 from __future__ import annotations
 
+import operator
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -66,6 +72,16 @@ ROLES = (
     "linear_attn.out", "mlp.gate", "mlp.up", "mlp.down", "norm.input", "norm.post_attention",
 )
 MODEL_WIDE_ROLES = ("embed", "lm_head", "final_norm")  # one tensor per model; every other role is per layer
+
+
+def _index(value: Any) -> int | None:
+    """``value`` as an ``int`` when it is an integer (NumPy integers included) other than a bool, else ``None``."""
+    if isinstance(value, bool) or type(value).__name__ == "bool_":
+        return None
+    try:
+        return operator.index(value)
+    except TypeError:
+        return None
 
 
 class _Data(BaseModel):
@@ -158,11 +174,12 @@ class HeadLayout(_Data):
 
     def head_range(self, head: int) -> tuple[int, int]:
         """The ``(start, stop)`` entries of ``head`` along the head axis."""
-        if not isinstance(head, int) or isinstance(head, bool) or not 0 <= head < self.num_heads:
+        index = _index(head)
+        if index is None or not 0 <= index < self.num_heads:
             raise WSEError(ErrorCode.INVALID_ARGUMENT,
                            f"head must be an integer from 0 to {self.num_heads - 1}; got {head!r}",
                            details={"head": repr(head), "num_heads": self.num_heads})
-        return head * self.size, (head + 1) * self.size
+        return index * self.size, (index + 1) * self.size
 
 
 class TensorRole(_Data):
@@ -170,8 +187,8 @@ class TensorRole(_Data):
 
     ``tensor`` is the canonical name, which edits and reads take;
     ``module_name`` is the parameter name in the ``transformers`` module.
-    ``layer`` is ``None`` for the model-wide roles. ``protected`` tensors are
-    refused by every edit.
+    ``layer`` is ``None`` for the model-wide roles. Every edit operator refuses
+    ``protected`` tensors; exact replay and patch imports write recorded values.
     """
 
     role: str
@@ -490,9 +507,12 @@ def role_tensor(model: ModelHandle | ModelManifest, role: str, layer: int | None
     if role in MODEL_WIDE_ROLES and layer is not None:
         raise WSEError(ErrorCode.INVALID_ARGUMENT, f"role {role} is model-wide; omit layer",
                        details={"role": role})
-    if role not in MODEL_WIDE_ROLES and (not isinstance(layer, int) or isinstance(layer, bool) or layer < 0):
-        raise WSEError(ErrorCode.INVALID_ARGUMENT, f"role {role} is per layer; give a layer index (an integer >= 0), "
-                       f"not {layer!r}", details={"role": role})
+    if role not in MODEL_WIDE_ROLES:
+        index = _index(layer)
+        if index is None or index < 0:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, f"role {role} is per layer; give a layer index (an integer "
+                           f">= 0), not {layer!r}", details={"role": role})
+        layer = index
     descriptor = model_family(model, registry=registry)
     if descriptor is None:
         raise WSEError(ErrorCode.NOT_FOUND, "the model has no family descriptor (Level 0), so its tensors have no "

@@ -42,6 +42,7 @@ wse`` and the registry work without the ``models-hf`` extra.
 
 from __future__ import annotations
 
+import copy
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -229,7 +230,9 @@ def causal_lm_class(model_config: dict[str, Any], descriptor: FamilyDescriptor |
                            model_type=model_type)
         config_class, model_class, source = CONFIG_MAPPING[model_type], None, model_config
     try:
-        config = config_class.from_dict(dict(source))
+        # A deep copy: transformers fills defaults into nested dicts in place (Llama's rope_scaling gains
+        # rope_theta), and the stored, hashed configuration must stay the snapshot's config.json.
+        config = config_class.from_dict(copy.deepcopy(dict(source)))
     except Exception as exc:  # transformers validates configurations with many exception types
         raise _invalid(f"{CONFIG_FILE} is not a valid {config_class.__name__}: {exc}") from exc
     if getattr(config, "is_encoder_decoder", False):
