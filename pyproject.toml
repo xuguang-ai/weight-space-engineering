@@ -1,6 +1,6 @@
 [project]
 name = "wse"
-version = "0.1.0"
+version = "0.1.1"
 description = "Weight-space engineering: agent-first, reproducible experiments that edit neural network weights directly"
 readme = "README.md"
 license = "Apache-2.0"
