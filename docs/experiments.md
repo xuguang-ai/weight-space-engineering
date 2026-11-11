@@ -12,10 +12,13 @@ extension contracts in [extensions.md](extensions.md).
 
 1. **Prepare the workspace (operator).** Import the task model and register
    the task, policy, development and final data, and suites. For the
-   signed-sum task, `examples/signed_sum/build_fixture.py OUT --workspace
-   WORKSPACE` does this; the final set and its generation seed live only in
-   the workspace's evaluator storage. [Your own task](#your-own-task) shows
-   the calls.
+   signed-sum task, steps 1 to 4 of
+   [examples/signed_sum/agent_api.py](../examples/signed_sum/agent_api.py),
+   which the README walks through, make these calls;
+   `examples/signed_sum/build_fixture.py OUT --workspace WORKSPACE` makes
+   the same ones for the trial harness. The final set lives only in the
+   workspace's evaluator storage. [Your own task](#your-own-task) describes
+   each part.
 2. **Grant one run per trial** (`wse grant-run TASK POLICY BASE_CHECKPOINT`).
    A grant permits one experiment and one controller run.
 3. **Run the controller** (`wse run --run-id RUN ...`, or
@@ -42,14 +45,16 @@ agent sees only the descriptions of its WSE tools and the tool results. The
 task states the behavior to reach and how it is measured, never what is
 wrong with the model, how the model was built, or how to change it.
 
-For the signed-sum task under `small_model_v1`, the live run of 2026-11-11
-received this text, rendered here from its export's `task.json` and
-`policy.json` with the run's experiment ID:
+For the signed-sum task, the README's live run of 2026-11-11 received this
+text, rendered here from its export's `task.json` and `policy.json` with the
+run's experiment ID and tools. An earlier run that day, under the built-in
+`small_model_v1` with the same values, received the same text apart from
+its experiment ID and the policy's name:
 
 ```text
 You control one managed weight-space engineering experiment through the WSE tools listed below. They are your only tools: you cannot run code, read files, or use the network.
 
-Experiment ID: exp_cba05a78e444f8cc8be78c21af7743ad (the tools use it when you omit experiment_id)
+Experiment ID: exp_ab39f014f54b5d65a6811e0a5d742b4b (the tools use it when you omit experiment_id)
 Task signed_sum_v1: Signed-sum classification
 The registered model reads two real inputs x = (x0, x1) and returns logits for two classes; its prediction is the class with the larger logit. It should predict class 1 when x0 + x1 > 0 and class 0 otherwise. Using only the permitted inspection and editing operations, produce a candidate checkpoint that follows this rule, and select it.
 Model input: x = (x0, x1), two float32 values
@@ -58,7 +63,7 @@ Objective: Predict class 1 exactly when x0 + x1 > 0, measured as accuracy on the
 Acceptance: accuracy at least 1.
 The target is met only by a successful evaluation of development suite signed_sum_dev_v1 covering all 64 examples with accuracy at least 1.
 
-Policy small_model_v1 (mode bounded_eval); budget for the whole experiment:
+Policy signed_sum_policy_v1 (mode bounded_eval); budget for the whole experiment:
 - candidate commits: 20
 - patch previews: 50
 - tensor analyses: 50
@@ -87,74 +92,46 @@ and suites as its first observation ([Stepwise strategies](#stepwise-strategies)
 
 ### Your own task
 
-A task is a `TaskDefinition`, written as `task.json` and registered with
-`Engine.register_task`. Its `description` is the problem statement that the
-agent reads (up to 4,096 characters). `input_description` and
-`output_description` describe the model's interface, and `objective` states
-what is measured and the gates that count as success: for signed sum,
-accuracy of at least 1.0 on the development suite named by
-`development_suite_id`, over all of its `development_examples`. See
-[examples/signed_sum/task.json](../examples/signed_sum/task.json).
+An experiment is registered in four parts. The README's agent example writes
+each one out, in steps 1 to 4 of
+[examples/signed_sum/agent_api.py](../examples/signed_sum/agent_api.py):
 
-The rest of an experiment is registered with the task: the target
-checkpoint, a policy (`policy.json`: the budget and the permitted
-operations), and the development and final evaluation suites. The
-signed-sum example's `setup_workspace`, in
-[examples/signed_sum/build_fixture.py](../examples/signed_sum/build_fixture.py),
-is a complete template (shown here without its docstring and type hints,
-and with comments added):
+1. **The target checkpoint.** `Engine.import_model` stores tensors given in
+   memory with a registered adapter (`mlp@1` for the signed-sum
+   classifier). `Engine.import_hf_snapshot`, or `WSE.from_pretrained`,
+   imports a Hugging Face snapshot at a fixed revision
+   ([models.md](models.md)).
+2. **The task,** a `TaskDefinition` registered with `Engine.register_task`.
+   Its `description` is the problem statement that the agent reads (up to
+   4,096 characters). `input_description` and `output_description` describe
+   the model's interface, and `objective` states what is measured and the
+   gates that count as success: for signed sum, accuracy of at least 1.0 on
+   the development suite named by `development_suite_id`, over all of its
+   `development_examples`.
+3. **The evaluation suites.** `Engine.register_dataset` stores examples in
+   evaluator storage, and `Engine.register_suite` names the evaluator
+   (`classification@1` for signed sum, `generation@1` for a language model),
+   the split, and the preregistered sample counts and seeds. The controller
+   evaluates only `development` suites; only the final evaluator reads the
+   `final` suite, after the selected checkpoint is frozen.
+4. **The policy,** registered with `Engine.register_policy`: the mode, the
+   permitted edits and analyses, and the budget ([Budgets](#budgets)). A
+   registered policy is immutable: registering an ID again with other
+   content fails with `VERSION_CONFLICT`, so a policy with other values
+   needs a new `policy_id`. Every workspace already holds the built-in
+   policies, `small_model_v1` among them.
 
-```python
-def setup_workspace(engine, out_dir, *, final_seed=None, with_reference=False):
-    paths = build(Path(out_dir), with_reference=with_reference)
-
-    # The target checkpoint, the task statement, and the policy
-    task_model = engine.import_bundle(paths["task"])
-    engine.register_task(load_task())
-    policy = engine.register_policy(load_policy())
-
-    # Development and final data, generated at setup time
-    development = engine.register_dataset(
-        suite_data(DEV_PAIRS, DEV_SEED),
-        generation={"generator": GENERATOR, "pairs": DEV_PAIRS, "seed": DEV_SEED, "margin": MARGIN},
-    )
-    seed = secrets.randbits(63) if final_seed is None else int(final_seed)
-    final = engine.register_dataset(
-        suite_data(FINAL_PAIRS, seed),
-        generation={"generator": GENERATOR, "pairs": FINAL_PAIRS, "seed": seed, "margin": MARGIN},
-    )
-
-    # The suites: development for the controller, final for the final evaluator only
-    engine.register_suite(development_suite(development))
-    engine.register_suite({
-        "suite_id": FINAL_SUITE_ID,
-        "task_id": TASK_ID,
-        "split": "final",
-        "evaluator": EVALUATOR,
-        "sample_counts": [2 * FINAL_PAIRS],
-        "seeds": [0],
-        "dataset": final.model_dump(mode="json"),
-    })
-
-    ids = {
-        "task_id": TASK_ID,
-        "policy_id": policy.policy_id,
-        "task_checkpoint_id": task_model.checkpoint_id,
-        "development_suite_id": DEV_SUITE_ID,
-        "final_suite_id": FINAL_SUITE_ID,
-    }
-    if with_reference:
-        ids["reference_checkpoint_id"] = engine.import_bundle(paths["reference"]).checkpoint_id
-    return ids
-```
-
-`load_task()` and `load_policy()` read the example's `task.json` and
-`policy.json`. Only the final evaluator reads the final suite's data, after
-the selected checkpoint is frozen. A run is then granted on the task, the
-policy, and the base checkpoint, as in
-[One experiment in one call](#one-experiment-in-one-call).
+A run is then granted on the task, the policy, and the base checkpoint, as
+in [One experiment in one call](#one-experiment-in-one-call).
 `examples/qwen_loops/loop_setup.py` registers a generation task on
-Qwen3.5-0.8B the same way.
+Qwen3.5-0.8B the same way: its objective is to lower the development
+limit-hit rate without lowering accuracy (the gate `{"metric": "accuracy",
+"min_delta": 0.0}`), and its suite uses `generation@1` with the profile
+`qwen35think@1`, the grader `gsm8k_numeric@1`, and at most 8,192 new tokens.
+`examples/signed_sum/build_fixture.py` registers the same signed-sum task,
+from [task.json](../examples/signed_sum/task.json) and
+[policy.json](../examples/signed_sum/policy.json), for the trial harness and
+the tests.
 
 ### Budgets
 
@@ -178,7 +155,8 @@ The two policies used so far:
 
 `small_model_v1` is defined in
 [examples/signed_sum/policy.json](../examples/signed_sum/policy.json) and
-`qwen_loop_v1` by `wse.policy.qwen_loop_policy()`. The budgets in the
+`qwen_loop_v1` by `wse.policy.qwen_loop_policy()`. The README's agent
+example registers `small_model_v1`'s values as `signed_sum_policy_v1`. The budgets in the
 article that WSE reproduces count larger passes: there, one Qwen pass could
 generate answers to up to 512 practice problems or read up to 1,024 texts
 ([summary](../dev/weight-space-programming-summary.md)), so its 50 forward
@@ -242,55 +220,68 @@ the demo below and the adapter tests use it. Its token counts are synthetic
 ### Agent model configuration
 
 The reference agent needs a model that supports tool calls, named with
-`--model` (or `model=`), and the provider's key in the environment of the
-process that runs it. Models other than `gpt-5.6-luna` have not been
-tested; the recorded trials reached it through an Azure OpenAI deployment.
+`--model` (or `model=`), and the provider's key and endpoint in the
+environment of the process that runs it. The SDK reads them from
+`OPENAI_API_KEY` and `OPENAI_BASE_URL`. Models other than `gpt-5.6-luna`
+have not been tested; the recorded trials reached it through an Azure
+OpenAI deployment.
 
-**OpenAI.** The SDK reads the key from `OPENAI_API_KEY`. Put it in a `.env`
-file at the repository root, which git ignores:
+**The `.env` file.** Copy the repository's template,
+[.env.example](../.env.example), to `.env` at the repository root, which git
+ignores, and fill in your values:
+
+```sh
+cp .env.example .env
+```
 
 ```text
 OPENAI_API_KEY=your-api-key
+OPENAI_BASE_URL=https://api.openai.com/v1
 ```
 
 Then load the file for one command with uv's `--env-file` flag (uv reads no
 `.env` file without it):
 
 ```sh
-uv run --no-sync --env-file .env \
+uv run --extra agents-openai --env-file .env \
   python examples/signed_sum/agent_api.py \
   demo/live \
   --model YOUR_AGENT_MODEL
 ```
 
-To keep the key out of files, enter it at a hidden prompt instead and leave
-out `--env-file .env`. Run the line on its own, because in a pasted block of
-several lines `read` can take the next line as the key:
+**OpenAI.** Keep the template's endpoint, which is OpenAI's own and the
+SDK's default, and name an OpenAI model with `--model`.
+
+**Azure OpenAI or another compatible endpoint.** Set `OPENAI_BASE_URL` to
+the endpoint. For an Azure OpenAI resource, that is the resource's endpoint,
+with the resource's name in place of `YOUR-RESOURCE`, and `--model` is the
+deployment's name. The recorded trials used this route, through the
+Responses API:
+
+```text
+OPENAI_API_KEY=your-azure-key
+OPENAI_BASE_URL=https://YOUR-RESOURCE.services.ai.azure.com/openai/v1
+```
+
+Do not leave `OPENAI_BASE_URL` empty; to use the SDK's default, delete the
+line.
+
+**Without a file.** To keep the key out of files, enter it at a hidden
+prompt instead and leave out `--env-file .env` (for another endpoint, also
+export `OPENAI_BASE_URL`). Run the line on its own, because in a pasted
+block of several lines `read` can take the next line as the key:
 
 ```sh
 printf 'OpenAI API key: '; read -rs OPENAI_API_KEY; echo; export OPENAI_API_KEY
 ```
-
-**Azure OpenAI or another compatible endpoint.** Also set `OPENAI_BASE_URL`;
-the SDK calls OpenAI's own endpoint only when it is unset. For an Azure
-OpenAI resource, the `.env` file holds the Azure key and the resource's
-endpoint, with the resource's name in place of `RESOURCE`:
-
-```text
-OPENAI_API_KEY=your-azure-key
-OPENAI_BASE_URL=https://RESOURCE.services.ai.azure.com/openai/v1
-```
-
-`--model` is then the deployment's name. The recorded trials used this
-route, through the Responses API.
 
 **What stays private, and what is sent.** Neither variable reaches the WSE
 server, whose environment is an allow-list, and neither is written to the
 workspace or an export: the controller record names only the kind of
 endpoint (`openai`, `azure_openai`, or `openai_compatible`). The model
 provider receives the task instructions and the tool results, and bills the
-calls to your account. The signed-sum run of 2026-11-11 made 8 requests,
-with 68,681 input and 1,402 output tokens.
+calls to your account. The README's signed-sum run of 2026-11-11 made 8
+requests, with 68,866 input and 1,428 output tokens.
 
 ### Stop conditions
 
@@ -335,9 +326,9 @@ hash, `constraint_status`, the tracing setting, and the termination record:
 status (`completed`, `stopped`, `max_turns`, `timeout`, `cancelled`,
 `connection_failed`, `error`), reason, stop condition, final message, turns,
 tool calls, elapsed time, usage (for an agent: token counts, the model name,
-and the class of the endpoint the SDK called, `openai` when `OPENAI_BASE_URL`
-is unset, `azure_openai` for an Azure resource, otherwise
-`openai_compatible`; the URL itself is never recorded), provider metadata (SDK, MCP, and protocol
+and the class of the endpoint the SDK called, `openai` for OpenAI's endpoint
+or when `OPENAI_BASE_URL` is unset, `azure_openai` for an Azure resource,
+otherwise `openai_compatible`; the URL itself is never recorded), provider metadata (SDK, MCP, and protocol
 versions, limits, allowed and observed tools), the settlement and freeze, the
 environment (Python, platform, CPU, package versions), and, for an agent, the
 path of the `wse serve` log (`serve_log`; the reason of a `connection_failed`
@@ -411,14 +402,16 @@ tolerances.
 ## Offline demo and representative reports
 
 These commands reproduce the reports below without a model or network
-(each takes a few seconds on CPU; IDs differ per run):
+(each takes a few seconds on CPU; IDs differ per run). The last two run the
+test double through the agent SDK, which the `agents-openai` extra
+installs:
 
 ```sh
-uv run --no-sync python examples/signed_sum/run_trials.py DEMO --label scripted
-uv run --no-sync python examples/signed_sum/run_trials.py DEMO --label control --policy small_model_weights_only_v1
-uv run --no-sync python examples/signed_sum/run_trials.py DEMO --label sdk-double \
+uv run python examples/signed_sum/run_trials.py DEMO --label scripted
+uv run python examples/signed_sum/run_trials.py DEMO --label control --policy small_model_weights_only_v1
+uv run --extra agents-openai python examples/signed_sum/run_trials.py DEMO --label sdk-double \
     --controller openai-agents --model wse-test-double:scripted_search@1
-uv run --no-sync python examples/signed_sum/run_trials.py DEMO --label sdk-double-control \
+uv run --extra agents-openai python examples/signed_sum/run_trials.py DEMO --label sdk-double-control \
     --controller openai-agents --model wse-test-double:scripted_search@1 --policy small_model_weights_only_v1
 ```
 
@@ -445,21 +438,25 @@ nothing about an agent's ability.
 `wse.agent_runs.run_agent_experiment` grants a run, runs the controller, and
 freezes the experiment. With `final_evaluation=True`, as the example below
 passes, it also runs the final evaluation, exports the closed experiment,
-and replays the export. `examples/signed_sum/agent_api.py` builds the
-signed-sum workspace on its first use and runs one experiment this way.
-Offline, with a scripted controller in place of a model, it takes a few
-seconds. The IDs differ per run, and the script prints the export path in
-full, shortened here to `OUT/...`:
+and replays the export. `examples/signed_sum/agent_api.py` sets up a new
+signed-sum workspace in the directory it is given and runs one experiment
+this way; the README walks through its six steps. Offline, with a scripted
+controller in place of a model, it takes a few seconds. The IDs differ per
+run:
 
 ```sh
-uv run --no-sync python examples/signed_sum/agent_api.py OUT
+uv run python examples/signed_sum/agent_api.py demo/offline
 ```
 
 ```text
-experiment exp_a0373ebd434304fad7bacc2ef3280b99 (run run_ad9c7452e48359213d4dbef2da5e6a2c): CLOSED
-controller scripted_search@1 ended stopped: target_met: a full development evaluation of the selected checkpoint meets the target
-success: True; final: {"candidate_accuracy": 1.0, "clopper_pearson_lower": 0.9928210499737405, "clopper_pearson_upper": 1.0, "clusters": 512, "control_accuracy": 0.5, "difference": 0.5, "fully_correct_clusters": 512}
-export: OUT/workspace/agent_runs/run_ad9c7452e48359213d4dbef2da5e6a2c/export; replay byte-identical: True
+scripted_search@1 on model ckpt_eb88256683d4b9a797c577954a537086, task signed_sum_v1, policy signed_sum_policy_v1
+scripted_search@1 ended stopped: target_met: a full development evaluation of the selected checkpoint meets the target
+17 tool calls in 2 s
+edit: scale_slice@1 on layers.1.weight[1:2, 0:4], factor -1.0
+layers.1.weight: [[-1.0, 1.0, -1.0, 1.0], [-1.0, 1.0, -1.0, 1.0]] -> [[-1.0, 1.0, -1.0, 1.0], [1.0, -1.0, 1.0, -1.0]]
+patch: demo/offline/workspace/agent_runs/run_7b3bc43f0068b7e75aac39fcb523d7a0/export/patches/patch_98ebc508141555498571c25a7cdf68e9.json
+final test, 1,024 examples the agent never saw: 50% correct before the edit, 100% after
+the export replays to byte-identical weights: True
 ```
 
 For a live LLM agent, add `--model YOUR_AGENT_MODEL`, a model with tool
@@ -473,42 +470,45 @@ final result.
 
 An operator grants a run, a permission for one experiment under one policy,
 and serves it over MCP; the agent connects to that server and works only
-through its tools. On the workspace that `agent_api.py` prepared in
-`demo/offline`, from the repository root:
+through its tools. On the workspace that `agent_api.py` set up in
+`demo/offline`, from the repository root (the base checkpoint is the model
+the workspace imported; its candidates come from patches):
 
 ```bash
-A=demo/offline
-BASE=$(uv run --no-sync python -c \
-  "import json; print(json.load(open('$A/ids.json'))['task_checkpoint_id'])")
+W=demo/offline/workspace
+BASE=$(uv run python -c "
+from wse.api import Engine
+with Engine('$W') as engine:
+    print(next(m.checkpoint_id for m in engine.list_models() if m.provenance.kind == 'import'))
+")
 
-RUN=$(uv run --no-sync wse --workspace "$A/workspace" \
-  grant-run signed_sum_v1 small_model_v1 "$BASE" \
-  | uv run --no-sync python -c "import json, sys; print(json.load(sys.stdin)['run_id'])")
+RUN=$(uv run wse --workspace "$W" \
+  grant-run signed_sum_v1 signed_sum_policy_v1 "$BASE" \
+  | uv run python -c "import json, sys; print(json.load(sys.stdin)['run_id'])")
 
 # An MCP server over stdio, bound to that run
-uv run --no-sync wse --workspace "$A/workspace" \
+uv run wse --workspace "$W" \
   serve --run-id "$RUN"
 ```
 
 From Python, `run_agent_experiment` does it in one call: it grants a run,
 runs the controller, and freezes the experiment when the controller stops.
 With `model=...`, the controller is the OpenAI Agents SDK agent, connected
-to the run's MCP server:
+to the run's MCP server (run it with `uv run --extra agents-openai`):
 
 ```python
-import json
-from pathlib import Path
-
 from wse.agent_runs import run_agent_experiment
+from wse.api import Engine
 
-A = Path("demo/offline")  # prepared by examples/signed_sum/agent_api.py
-ids = json.loads((A / "ids.json").read_text())
+workspace = "demo/offline/workspace"  # set up by examples/signed_sum/agent_api.py
+with Engine(workspace) as engine:
+    base = next(m.checkpoint_id for m in engine.list_models() if m.provenance.kind == "import")
 
 run = run_agent_experiment(
-    A / "workspace",
-    task=ids["task_id"],
-    base=ids["task_checkpoint_id"],
-    policy=ids["policy_id"],
+    workspace,
+    task="signed_sum_v1",
+    base=base,
+    policy="signed_sum_policy_v1",
     model="wse-test-double:scripted_search@1",
 )
 print(run.state, run.summary["status"])  # FROZEN stopped: the final evaluation is off by default
@@ -522,7 +522,7 @@ trials). With the key in `.env` as in
 [Agent model configuration](#agent-model-configuration):
 
 ```sh
-uv run --no-sync --env-file .env \
+uv run --extra agents-openai --env-file .env \
   python examples/signed_sum/run_trials.py \
   LIVE \
   --label live \

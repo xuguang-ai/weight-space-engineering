@@ -34,7 +34,7 @@ Records: [M2 Q1 report](../dev/m2-q1-report.md), Section 3, and [M2 Q2 report](.
 - the profile `qwen35think@1`, the article's sampling (thinking on, a boxed-answer instruction, temperature 0.6, top-k 20, top-p 0.95, presence penalty 1.5), at its full limit of 32,768 new tokens, evaluation seed 0, and the grader `math_boxed@1`;
 - one process, 6 h 5 min in all.
 
-The recorded run used `wse compare-generation`. The README's Python example, `compare` with `problems=25`, no `max_new_tokens`, and an `out_dir` (which records every problem and resumes an interrupted run), calls the same runner with the same defaults: subset seed 0, evaluation seed 0, and batch size 8.
+The recorded run used `wse compare-generation`. The README's reproduction of it, `compare` with `problems=25`, no `max_new_tokens`, and an `out_dir` (which records every problem and resumes an interrupted run), calls the same runner with the same defaults: subset seed 0, evaluation seed 0, and batch size 8.
 
 | Metric | Base | p50c | Paired difference, p50c − base (95% cluster bootstrap) | Exact 95% intervals (Clopper–Pearson) |
 | --- | ---: | ---: | --- | --- |
@@ -62,61 +62,20 @@ An experiment follows four steps, each with its own tools:
 
 | Step | Question | WSE |
 | --- | --- | --- |
-| **Behavioral diagnosis** | How does the model fail? | Generation evaluation: accuracy, the rate of answers cut off at the token limit, and generated tokens, with intervals |
-| **Mechanism investigation** | Where inside the model? | Weight analyses (norms, singular vectors, projections) and activation probes (mean activations over the last tokens of each output, at the residual stream or any module, and contrasts between groups of outputs) |
-| **Weight intervention** | What change fixes it? | Exact patches from registered operators (scale, set, fill, project out a direction, add a low-rank term), or published edits imported with hash checks |
-| **Evaluation** | Did it help, and at what cost? | A paired comparison with the base on the same problems, prompts, and seeds, resumable and recorded |
+| **Diagnose** | How does the model fail? | Generation evaluation: accuracy, the rate of answers cut off at the token limit, and generated tokens, with intervals; every output's text for measures such as loops |
+| **Probe** | Where inside the model? | Weight analyses (norms, singular vectors, projections) and activation probes (mean activations over the last tokens of each output, at the residual stream or any module, and contrasts between groups of outputs) |
+| **Edit** | What change fixes it? | Exact patches from registered operators (scale, set, fill, project out a direction, add a low-rank term), or published edits imported with hash checks |
+| **Evaluate** | Did it help, and at what cost? | A paired comparison with the base on the same problems, prompts, and seeds, resumable and recorded |
 
 [examples/p50c_four_steps.py](../examples/p50c_four_steps.py) runs them on Qwen3.5-0.8B. It reconstructs a published intervention; it does not rediscover it. The article's agent, GPT-6 Astra, found p50c itself, by analyzing the weights in a Python kernel and running the model on practice problems. In each of layers 15 and 19, p50c subtracts six times the projection of 64 columns of `mlp.down_proj` onto one direction of that layer. Here, the direction and the columns come from p50c's published change: the columns it changes, and the top singular vector of its change to them, signed so that its largest-magnitude entry is positive. WSE's own `project_out` operator then re-executes the edit.
 
-The script uses the data of the README's Python example, plus GSM8K's training set as practice problems, so that the MATH-500 problems stay unseen:
+The README's Python example walks through the script step by step, with the downloads it needs: p50c's directory and GSM8K's training set as practice problems, so that the MATH-500 problems stay unseen. The data directory defaults to `~/wse-data`:
 
 ```bash
-curl -L --create-dirs -o ~/wse-data/gsm8k/train.jsonl \
-  https://raw.githubusercontent.com/openai/grade-school-math/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/data/train.jsonl
-uv run --no-sync python examples/p50c_four_steps.py   # the data directory defaults to ~/wse-data
+uv run --extra models-hf python examples/p50c_four_steps.py ~/wse-data
 ```
 
-The four steps, condensed. The script defines `M` (the data directory), `base` (the imported model), and `recover`, which reads p50c's direction and columns from its published change:
-
-```python
-GSM8K = M / "gsm8k/train.jsonl"
-SITE = "layers.15.mlp.down_proj:output"
-
-# 1. Diagnose: which answers run into the token limit?
-run = base.evaluate(
-    GSM8K,
-    format="gsm8k",
-    problems=32,
-    profile="qwen35think@1",
-    max_new_tokens=8192,
-)
-
-# 2. Probe: how do cut-off and finished answers differ at the output of an MLP projection?
-probe = base.probe(run, sites=[SITE], last=1024)
-contrast = probe.contrast(SITE, run.limit_hit(), run.finished())
-
-# 3. Edit: project a direction out of columns of that projection, in layers 15 and 19.
-model = base
-for layer in (15, 19):
-    name, direction, columns = recover(layer)  # p50c's direction and columns, from its published change
-    edit = model.edit(name, "project_out", direction=direction, columns=columns, alpha=6.0)
-    model = edit.save().model
-
-# 4. Evaluate: a paired, recorded comparison on the same problems, prompts, and seeds.
-comparison = base.compare(
-    model,
-    GSM8K,
-    format="gsm8k",
-    problems=32,
-    profile="qwen35think@1",
-    max_new_tokens=8192,
-    out_dir=M / "runs/four-steps",
-)
-print(comparison.table())
-```
-
-The script probes both layers and compares each contrast with p50c's direction. On an M4 Pro it took 1 h 54 min, almost all of it in three generation passes of about 37 minutes each; a generation pass generates one answer to each problem, and `compare` makes two. It printed (timing lines omitted):
+On an M4 Pro the script took 1 h 54 min, almost all of it in three generation passes of about 37 minutes each; a generation pass generates one answer to each problem, and `compare` makes two. The published version, which also counts loops and prints p50c's change, was run again on a copy of that run's data. Steps 1 to 3 ran in full, and step 1 reproduced the 32 base answers token for token; the edit was stored as the same candidate checkpoint as before, so step 4 resumed from the recorded comparison instead of generating again. It printed:
 
 ```text
 32 problems, 32 samples
@@ -124,8 +83,20 @@ accuracy                     0.062 [0.000, 0.156]
 limit_hit_rate               0.938 [0.844, 1.000]
 mean_generated_tokens       8063.5 [7843.9, 8192.0]
 30 answers cut off at the limit, 2 finished
-layer 15: cosine of the contrast with p50c's direction +0.37
-layer 19: cosine of the contrast with p50c's direction -0.45
+24 of the 30 cut-off answers end in a loop; the end of the first:
+        *   Wait, is it possible the 400 files were the *number of files* he had *downloaded* in the *second* round?
+        *   Yes.
+        *   Wait, is it possible the 400 files were the *number of files* he had *downloaded* in the *first* round?
+        *   No, he downloaded 800 files.
+        *   Wait, is it possible the 400 files were the *number of files* he had *downloaded* in the *second* round?
+        *   Yes.
+        *   Wait, is it possible the 400 files were the *number of files* he had *downloaded* in the *first* round?
+        *   No, he downloaded 800 files.
+2 tensors changed, 130,188 entries; weights cb5a704b1fd2 -> b8dccf8ca463
+  model.language_model.layers.15.mlp.down_proj.weight: 65,260 of 3,670,016 entries, relative L2 change 0.1064, db89c2e60dc5 -> c8df99feb499
+  model.language_model.layers.19.mlp.down_proj.weight: 64,928 of 3,670,016 entries, relative L2 change 0.08106, 2c8c10a14a67 -> d0ae5310479d
+layer 15: p50c changes 64 columns; cosine of the cut-off minus finished contrast with its direction +0.37
+layer 19: p50c changes 64 columns; cosine of the cut-off minus finished contrast with its direction -0.45
 130,134 weights changed
 32 problems, 32 samples per model
 metric                        base   candidate   difference [95% interval]
@@ -141,7 +112,7 @@ Answers cut off at the limit fell from 30 to 21 of 32, and accuracy rose from 2 
 - 32 problems from GSM8K's training set, chosen by subset seed 0 (`sha256_rank@1`), so that the MATH-500 problems stay unseen;
 - `qwen35think@1` at 8,192 new tokens, 1 sample each, and the grader `gsm8k_numeric@1`.
 
-### Step 1: Diagnosis
+### Step 1: Diagnose
 
 | Metric | Base | 95% interval |
 | --- | ---: | --- |
@@ -150,6 +121,8 @@ Answers cut off at the limit fell from 30 to 21 of 32, and accuracy rose from 2 
 | Mean generated tokens | 8,063.5 | [7,843.9, 8,192.0] |
 
 The 30 cut-off answers form one group and the 2 finished ones the other.
+
+**Loops.** An answer ends in a loop when at least half of the lines in its last 2,000 characters repeat an earlier line there; the window's first and last lines, which may be partial, are left out. By this measure 24 of the 30 cut-off answers end in a loop, and neither finished answer does. The first, to `gsm8k_27`, enters a four-line loop at line 250 of its 369 lines (the last 8,709 of its 26,544 characters) and never leaves it. The count depends a little on the window: 21 at 1,000 characters, 24 at 4,000, and 21 at 8,000. Two other measures agree. Ignoring digits gives the same 24. Counting repeated text instead of repeated lines, at least half of the 40-character strings in the last 2,000 characters occur more than once in 25 of the 30 cut-off answers (median share 1.00), and in neither finished answer (0.00 each).
 
 ### Step 2: Probe
 
@@ -190,7 +163,7 @@ In each layer, all 32 answers' components along the direction have the same sign
 
 About 91% of the entries (90.8%) are byte-identical. The rest differ by rounding: p50c's published weights match none of five rounding paths tried. The two that compute in float64 or float32 and round to BF16 once come closest. Exact replay (Section 1) is the hash-exact path; re-executing a recipe is not. (The M2 Q2 report buckets the same differences by a spacing rule instead of steps, which moves up to 6 entries between buckets.)
 
-### Step 4: Evaluation
+### Step 4: Evaluate
 
 | Metric | Base | Edited | Paired difference [95% interval] |
 | --- | ---: | ---: | --- |
@@ -202,6 +175,34 @@ Per problem:
 
 - **Accuracy.** 8 problems were right only with the edit, none only with the base, and 2 with both.
 - **Cut-off answers.** 9 answers that the base ran to the limit finished with the edit, and none went the other way.
+- **Loops.** By step 1's measure, none of the 21 answers that the edited model still runs to the limit ends in a loop (0 at 1,000 characters, 2 at 4,000, and 1 at 8,000). By the repeated-text measure, their median share is 0.04, and 2 of the 21 reach 0.5. They keep re-checking the problem in new words until the limit, with sentences such as "Let's try a different interpretation." and "Let's verify the wording again." The edit removed the verbatim loops but not the over-long reasoning: 9 more answers finished, and 21 still did not.
+
+The loop counts come from the recorded comparison, which keeps every output's text, with step 1's `ends_in_loop`:
+
+```python
+import json
+from pathlib import Path
+
+
+def ends_in_loop(text: str, window: int = 2000) -> bool:
+    """True when at least half of the lines in the last ``window`` characters repeat an earlier line there."""
+    lines = [line.strip() for line in text[-window:].split("\n")[1:-1]]
+    lines = [line for line in lines if line]
+    return bool(lines) and 2 * (len(lines) - len(set(lines))) >= len(lines)
+
+
+rows = [json.loads(line) for line in Path("~/wse-data/runs/four-steps/problems.jsonl").expanduser().open()]
+for checkpoint in ("base", "candidate"):
+    cut_off = [row["outputs"][0]["text"] for row in rows
+               if row["checkpoint"] == checkpoint and row["problem"]["samples"][0]["limit_hit"]]
+    loops = sum(ends_in_loop(text) for text in cut_off)
+    print(f"{checkpoint}: {loops} of {len(cut_off)} cut-off answers end in a loop")
+```
+
+```text
+base: 24 of 30 cut-off answers end in a loop
+candidate: 0 of 21 cut-off answers end in a loop
+```
 
 ### Reproducibility
 
@@ -213,6 +214,7 @@ Per problem:
   - the sign convention of the direction, which flips the printed layer-19 cosine from +0.45 to −0.45 and leaves the edit bit-identical, because negating a direction is exact;
   - comments.
 - **A third process.** The rerun behind the permutation check of step 2 reproduced the 32 base answers token for token.
+- **The published script.** On 2026-11-11 it ran on a copy of the second run's data and repeated steps 1 to 3, in 42.5 minutes while other jobs shared the machine. Step 1 reproduced the 32 base answers token for token, with the same finished flags. `save()` returned the stored candidate, `ckpt_74cd8078…`, so step 4 resumed from the recorded comparison and printed the same table.
 - **An earlier operator run.** An earlier run of the same edit through `WSE.compare`, on the same 32 problems, gave the same aggregates.
 
 **Time.** The whole script took 1 h 54 min. Each generation pass took about 37 minutes: 2,224 s per model in the second run's comparison, and 2,235 s in the first. The probe and the edits took about 1.6 minutes together.
@@ -288,7 +290,12 @@ Record: [M2 Q2 report](../dev/m2-q2-report.md), Sections 3 and 4.
 - The trials used 9–12 turns and 12–16 tool calls each, and every export replayed to byte-identical weights.
 - An earlier set reached 3 of 5 because of a harness defect, fixed before the acceptance set.
 
-**A single run on 2026-11-11,** the README's first example (`examples/signed_sum/agent_api.py demo/live --model gpt-5.6-luna`, from a fresh clone), also met the target, in 8 turns and 11 tool calls, with 68,681 input and 1,402 output tokens, in about 30 s. Its one edit, `scale_slice` by −1 on `layers.1.weight[1:2, 0:4]`, changed 4 of the 22 parameters and gives the same weights as the acceptance set's fix. Final accuracy was 1.0 on 512 pairs against 0.5 for the control, and the export replayed to byte-identical weights. Of its budget it used 1 of 10 development evaluation batches, 1 of 20 candidate commits, and 4 of 100 tensor reads. Its instructions are in [experiments.md](experiments.md#what-the-agent-is-told).
+**Single runs on 2026-11-11.**
+
+- **The README's agent example,** [examples/signed_sum/agent_api.py](../examples/signed_sum/agent_api.py) with `--model gpt-5.6-luna`, which writes out the model, task, data, and policy, under `signed_sum_policy_v1` (the values of `small_model_v1`). It met the target in 8 turns and 11 tool calls, with 68,866 input and 1,428 output tokens, in 20 s. The agent read the four tensors and stated that the two output rows are identical, and that setting class 1's weights to the negation of class 0's gives the logits (−s, s), where s = x0 + x1. It set class 1's row to [1, −1, 1, −1] with `set_slice`, as the acceptance trials did, changing 4 of the 22 parameters, and its first development evaluation met the target. Final accuracy was 1.0 on 512 pairs against 0.5 for the control, and the export replayed to byte-identical weights. Of its budget it used 1 of 10 development evaluation batches, 1 of 20 candidate commits, and 4 of 100 tensor reads. An earlier run of the example that day, before a change that only moved its task and policy definitions into variables, made the same edit in 8 turns and 11 tool calls, with 69,191 input and 1,425 output tokens.
+- **The example's previous version,** which prepared the same task through `build_fixture.py` under `small_model_v1` (run from a fresh clone). It met the target in 8 turns and 11 tool calls, with 68,681 input and 1,402 output tokens, in about 30 s. Its one edit, `scale_slice` by −1 on `layers.1.weight[1:2, 0:4]`, gives the same weights, with the same final result and replay.
+
+The instructions of these runs are in [experiments.md](experiments.md#what-the-agent-is-told).
 
 One small fixture says little about agent capability in general.
 
