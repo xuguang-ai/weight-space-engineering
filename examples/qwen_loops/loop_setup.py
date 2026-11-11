@@ -21,12 +21,17 @@ so a script can be restarted at any time:
   registered: a run needs none, and the final suite (MATH-500) belongs to the
   preregistered trials.
 
+``controller`` configures the strategy through the runner's dispatch or,
+with ``--via-mcp``, through a real ``wse serve`` MCP session, as the M2
+plan's Q2 exit asks; ``strategy_record`` says which in the run's record,
+with the strategy's parameters and resolved configuration.
 ``experiment_summary`` collects everything a report needs about one
-experiment from the operator's view: the controller's record and every step,
-jobs, reports (with every output's grade, length, and limit hit), the probe
-sites, candidates and their patches, paired comparisons with the base, the
-selection, and the budget. ``write_json`` writes atomically, so an interrupted
-write never leaves a partial file.
+experiment from the operator's view: the controller's record and every step
+(with its rationale), jobs, reports (with every output's grade, length, and
+limit hit), the probe sites, candidates and their patches, paired
+comparisons with the base, the selection, and the budget. ``write_json``
+writes atomically, so an interrupted write never leaves a partial file, and
+``merge_json`` updates a record in place, keeping its other keys.
 
 Paths default to the operator storage of the M2 plan
 (``~/Desktop/wse-models``); nothing is downloaded and nothing is written
@@ -89,6 +94,14 @@ def write_json(path: Path, value: Any) -> None:
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(value, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
     os.replace(temporary, path)
+
+
+def merge_json(path: Path, update: Mapping[str, Any]) -> dict[str, Any]:
+    """``update`` merged into the JSON object at ``path`` (written atomically), which keeps its other keys."""
+    current = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    merged = {**current, **update}
+    write_json(path, merged)
+    return merged
 
 
 def _sha256(path: Path) -> str:
@@ -160,11 +173,18 @@ def _trim(value: Any) -> Any:
 
 
 def _steps(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Controller events as steps: each call with its outcome, consecutive polls of one job collapsed."""
+    """Controller events as steps: each call with its outcome, consecutive polls of one job collapsed.
+
+    Model responses are left out (``experiment_summary`` counts them): through
+    MCP one precedes every call, and two polls of one job are consecutive
+    steps whichever path drives the strategy.
+    """
     steps: list[dict[str, Any]] = []
     pending: dict[str, Any] | None = None
     for event in events:
         kind = event["kind"]
+        if kind == "model_response":
+            continue
         if kind == "tool_call":
             arguments = dict(event.get("arguments") or {})
             pending = {"seq": event["seq"], "at": event["created_at"], "tool": event.get("tool"),
@@ -216,6 +236,7 @@ def experiment_summary(engine: Any, experiment_id: str) -> dict[str, Any]:
 
     experiment = engine.get_experiment(experiment_id)
     record = controller_record(engine.store.db, experiment_id)
+    events = controller_events(engine.store.db, experiment_id)
     jobs = []
     for job in engine.list_jobs(experiment_id):
         entry = {"job_id": job.job_id, "kind": job.kind, "state": job.state, "checkpoint_id": job.checkpoint_id,
@@ -271,7 +292,7 @@ def experiment_summary(engine: Any, experiment_id: str) -> dict[str, Any]:
         "controller": None if record is None else {
             "controller": record["controller"], "config": _trim(record["config"]), "started_at": record["started_at"],
             "ended_at": record["ended_at"], "result": record["result"]},
-        "steps": _steps(controller_events(engine.store.db, experiment_id)),
+        "steps": _steps(events), "model_responses": sum(1 for event in events if event["kind"] == "model_response"),
         "jobs": jobs, "reports": [_report_entry(report) for report in reports], "candidates": candidates,
     }
 
@@ -303,5 +324,19 @@ def controller(registry: Any, strategy_class: type, parameters: dict[str, Any], 
     bound = type(f"{strategy_class.__name__}MCP", (strategy_class,),
                  {"strategy_id": bound_id, "version": strategy_class.version, "__init__": __init__})
     registry.register("strategy", bound_id, strategy_class.version, bound)
-    return AgentConfig(model=f"{TEST_DOUBLE_PREFIX}{bound_id}@{strategy_class.version}", max_turns=min(max_steps, 10_000),
-                       wall_clock_seconds=wall_clock_seconds)
+    return AgentConfig(model=f"{TEST_DOUBLE_PREFIX}{bound_id}@{strategy_class.version}",
+                       max_turns=min(max_steps, 10_000), wall_clock_seconds=wall_clock_seconds)
+
+
+def strategy_record(strategy_class: type, parameters: Mapping[str, Any], config: Any) -> dict[str, Any]:
+    """What a run's record says about its strategy, on either path (``controller``).
+
+    The strategy's reference, the controller's reference (the registered
+    ``<strategy_id>_mcp`` subclass through MCP), the path (``dispatch`` or
+    ``mcp``), the parameters (long lists shortened), and the strategy's
+    resolved configuration.
+    """
+    via_mcp = getattr(config, "kind", None) == "agent"
+    return {"strategy": f"{strategy_class.strategy_id}@{strategy_class.version}",
+            "controller": config.model if via_mcp else config.strategy, "path": "mcp" if via_mcp else "dispatch",
+            "parameters": _trim(dict(parameters)), "resolved_config": _trim(strategy_class(**parameters).config())}

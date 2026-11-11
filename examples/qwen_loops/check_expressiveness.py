@@ -11,9 +11,13 @@ reaches the run only as this script's inline patch values, never through an
 agent-visible surface.
 
 A scripted client (the registered strategy ``expressiveness_check@1``
-defined here) drives the managed tools of the run-bound engine through the
-reference runner, which starts one worker on ``--device`` and settles and
-freezes the experiment however the run ends:
+defined here) drives the managed tools through the reference runner, which
+starts one worker on ``--device`` and settles and freezes the experiment
+however the run ends. With ``--via-mcp``, which the M2 plan's Q2 exit asks
+for, the OpenAI Agents SDK drives them through a real ``wse serve`` MCP
+session and the client chooses every call in place of a model (the
+runner's test double: no network, no credentials); without it the runner
+dispatches the client's actions to the run-bound engine:
 
 1. a generation pass of the base on the practice suite (``wse_submit_evaluation``
    and ``wse_get_job``);
@@ -33,13 +37,17 @@ and the recomputed directions are used. The directions used are written to
 
 Output: ``OUT/expressiveness-<run_id>.json`` (and a copy as
 ``OUT/expressiveness.json``): the setup, the directions' provenance, the
-verdict (the limit-hit rates of base and candidate and whether it fell), and
-the experiment's full summary (``loop_setup.experiment_summary``). The
-workspace setup is idempotent, so the script can be restarted; each
-invocation grants a new run.
+client (its path, ``dispatch`` or ``mcp``, and its configuration), its final
+message, the verdict (the limit-hit rates of base and candidate and whether
+it fell), and the experiment's full summary
+(``loop_setup.experiment_summary``). The workspace setup is idempotent, so
+the script can be restarted; each invocation grants a new run.
+``--summarize EXPERIMENT_ID`` updates the summary and the verdict of an
+existing experiment in its run's record without running anything (for
+example after the process was killed); the record's other keys stay.
 
     uv run --no-sync python examples/qwen_loops/check_expressiveness.py OUT \\
-        --workspace ~/Desktop/wse-models/workspaces/q2 --recompute
+        --workspace ~/Desktop/wse-models/workspaces/q2 --recompute --via-mcp
 
 A short smoke run: ``--problems 4 --max-new-tokens 256``.
 """
@@ -232,6 +240,36 @@ def _sha256(path: Path) -> str:
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def verdict(summary: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The limit-hit rates of the base and the candidate from an experiment summary, or ``None`` before both passes."""
+    base = summary["base_checkpoint_id"]
+    metrics = {job["checkpoint_id"]: job.get("metrics") for job in summary["jobs"]
+               if job["kind"] == "evaluation" and job["state"] == "succeeded"}
+    before = metrics.get(base)
+    after = next((value for key, value in metrics.items() if key != base), None)
+    if not (before and after):
+        return None
+    return {"base": before, "candidate": after,
+            "limit_hit_rate_fell": after["limit_hit_rate"] < before["limit_hit_rate"],
+            "comparison": next((c for candidate in summary["candidates"] for c in candidate["comparisons"]), None)}
+
+
+def record_run(out: Path, workspace: Path, experiment_id: str, update: Mapping[str, Any]) -> dict[str, Any]:
+    """The experiment's summary, verdict, and final message, with ``update``, merged into its run's record (whose
+    other keys stay) and copied to ``expressiveness.json``."""
+    from wse.api import Engine
+
+    with Engine(workspace) as engine:
+        summary = loop_setup.experiment_summary(engine, experiment_id)
+    result = (summary["controller"] or {}).get("result") or {}
+    found = verdict(summary)
+    record = {**update, "experiment": summary, "final_message": result.get("final_message"),
+              **({"verdict": found} if found is not None else {})}
+    merged = loop_setup.merge_json(out / f"expressiveness-{summary['run_id']}.json", record)
+    loop_setup.write_json(out / "expressiveness.json", merged)
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -249,9 +287,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--alpha", type=float, default=6.0, help="the projection's alpha (p50c: 6)")
     parser.add_argument("--wall-clock-hours", type=float, default=3.0, help="the controller's wall-clock limit")
     parser.add_argument("--max-steps", type=int, default=3000, help="the controller's step limit (job polls count)")
+    parser.add_argument("--summarize", metavar="EXPERIMENT_ID", default=None,
+                        help="only update the summary and verdict of this experiment in its run's record; run nothing")
     args = parser.parse_args(argv)
     loop_setup.check_setup_arguments(parser, args)
-    if args.directions is None and not args.recompute:
+    if args.summarize is None and args.directions is None and not args.recompute:
         parser.error("give --directions NPZ, --recompute, or both")
     if not math.isfinite(args.alpha):
         parser.error("--alpha must be finite")
@@ -260,9 +300,16 @@ def main(argv: list[str] | None = None) -> int:
     from wse.api import Engine
     from wse.operators.tensor import shortest_floats
     from wse.registry import builtin_registry
-    from wse.runner import ReferenceRunner, StrategyConfig
+    from wse.runner import ReferenceRunner
 
     out, workspace = args.out.expanduser(), args.workspace.expanduser()
+    if args.summarize:
+        record = record_run(out, workspace, args.summarize, {"summarized_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+        print(json.dumps({"summary": str(out / f"expressiveness-{record['experiment']['run_id']}.json"),
+                          "state": record["experiment"]["state"], "final_message": record["final_message"],
+                          "verdict": {key: value for key, value in (record.get("verdict") or {}).items()
+                                      if key != "comparison"}}, indent=2))
+        return 0
     provenance: dict[str, Any] = {}
     with Engine(workspace) as engine:
         setup = loop_setup.prepare(engine, args)
@@ -305,11 +352,12 @@ def main(argv: list[str] | None = None) -> int:
              **{f"columns{layer}": np.asarray(directions[layer]["columns"]) for layer in LAYERS})
     registry = builtin_registry()
     registry.register("strategy", ExpressivenessCheck.strategy_id, ExpressivenessCheck.version, ExpressivenessCheck)
-    config = loop_setup.controller(registry, ExpressivenessCheck,
-                                   {"suite_id": setup["suite_id"], "operations": operations}, via_mcp=args.via_mcp,
+    parameters = {"suite_id": setup["suite_id"], "operations": operations}
+    config = loop_setup.controller(registry, ExpressivenessCheck, parameters, via_mcp=args.via_mcp,
                                    max_steps=args.max_steps, wall_clock_seconds=args.wall_clock_hours * 3600)
-    print(f"run {grant.run_id}: {STRATEGY} on {base}, suite {setup['suite_id']}, device {args.device}",
-          file=sys.stderr)
+    strategy = loop_setup.strategy_record(ExpressivenessCheck, parameters, config)
+    print(f"run {grant.run_id}: {strategy['controller']} ({STRATEGY}, {strategy['path']}) on {base}, suite "
+          f"{setup['suite_id']}, device {args.device}", file=sys.stderr)
     runner = ReferenceRunner(workspace, registry=registry, worker_args=["--device", args.device],
                              log_dir=out / "logs")
     status, error, started = 0, None, time.monotonic()
@@ -321,25 +369,17 @@ def main(argv: list[str] | None = None) -> int:
         status, error = 1, f"{type(exc).__name__}: {exc}"
     record: dict[str, Any] = {"script": "examples/qwen_loops/check_expressiveness.py", "workspace": str(workspace),
                               "setup": setup, "run_id": grant.run_id, "alpha": args.alpha,
-                              "directions": provenance, "error": error,
+                              "directions": provenance, "strategy": strategy,
+                              "controller_config": config.model_dump(mode="json"), "error": error,
                               "elapsed_seconds": round(time.monotonic() - started, 1)}
     if runner.last_experiment_id is not None:
-        with Engine(workspace) as engine:
-            summary = loop_setup.experiment_summary(engine, runner.last_experiment_id)
-        record["experiment"] = summary
-        metrics = {job["checkpoint_id"]: job.get("metrics") for job in summary["jobs"]
-                   if job["kind"] == "evaluation" and job["state"] == "succeeded"}
-        before = metrics.get(base)
-        after = next((value for key, value in metrics.items() if key != base), None)
-        if before and after:
-            record["verdict"] = {
-                "base": before, "candidate": after,
-                "limit_hit_rate_fell": after["limit_hit_rate"] < before["limit_hit_rate"],
-                "comparison": next((c for candidate in summary["candidates"] for c in candidate["comparisons"]),
-                                   None)}
-    loop_setup.write_json(out / f"expressiveness-{grant.run_id}.json", record)
-    loop_setup.write_json(out / "expressiveness.json", record)
+        record = record_run(out, workspace, runner.last_experiment_id, record)
+    else:
+        loop_setup.write_json(out / f"expressiveness-{grant.run_id}.json", record)
+        loop_setup.write_json(out / "expressiveness.json", record)
+    # Through MCP the client's own reason is its final message; the SDK reports that the agent stopped.
     print(json.dumps({"run_id": grant.run_id, "experiment_id": runner.last_experiment_id,
+                      "final_message": record.get("final_message"),
                       "verdict": {key: value for key, value in (record.get("verdict") or {}).items()
                                   if key != "comparison"},
                       "summary": str(out / f"expressiveness-{grant.run_id}.json"), "error": error}, indent=2))

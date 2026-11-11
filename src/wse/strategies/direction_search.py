@@ -82,15 +82,21 @@ output projection, ``[hidden, intermediate]``).
    a reason that states the numbers.
 
 **Budget.** Before the first operation the strategy checks that the
-remaining budget covers its smallest complete plan: two generation passes
-(the base and one candidate), the probes, an analysis, a preview, and a
-commit. Before every later pass it checks that a pass and the tokens the base
-pass reserved remain; when they do not, it stops after the candidates
-evaluated so far. Any operation that fails, a budget error included, stops
-the strategy with the operation and the error code. The default plan (three
-passes, one probe, one analysis, two previews, two commits) fits
-``qwen_loop_v1``: 32 problems at 8,192 tokens take about 40 minutes per pass on
-the operator's MPS, so the plan takes about 2 hours of its 6.
+remaining budget covers the counts of its smallest complete plan: two
+generation passes (the base and one candidate), the probes, an analysis, a
+preview, and a commit, and at least one generated token. The tokens a pass
+reserves are not visible before the base pass (a suite does not show its
+``max_new_tokens``), so the generated tokens of the candidates' passes are
+checked once the base pass has reserved its own: after the probe, only as
+many candidates are built as the remaining tokens can evaluate, and before
+every later pass it checks that a pass and the tokens the base pass reserved
+remain; when they do not, it stops after the candidates evaluated so far. A
+short token budget is therefore found only after the base pass and the
+probe. Any operation that fails, a budget error included, stops the strategy
+with the operation and the error code. The default plan (three passes, one
+probe, one analysis, two previews, two commits) fits ``qwen_loop_v1``: 32
+problems at 8,192 tokens take about 40 minutes per pass on the operator's
+MPS, so the plan takes about 2 hours of its 6.
 
 Every action carries a short observable rationale; idempotency keys derive
 from the step number, so a run is reproducible. This module does not import

@@ -21,18 +21,26 @@ Each invocation:
 2. grants a run under ``qwen_loop_v1`` and runs the strategy through the
    reference runner, which starts one worker on ``--device`` and settles and
    freezes the experiment however the run ends (the first Ctrl-C stops the
-   strategy at its next step; a second aborts at once);
+   strategy at its next step; a second aborts at once). With ``--via-mcp``,
+   which the M2 plan's Q2 exit asks for, the OpenAI Agents SDK drives the
+   managed tools through a real ``wse serve`` MCP session and the strategy
+   chooses every call in place of a model (the runner's test double: no
+   network, no credentials); without it the runner dispatches the
+   strategy's actions to the run-bound engine. The operations are the same;
 3. writes ``OUT/runs/<run_id>.json`` (and a copy as ``OUT/summary.json``):
-   the setup, the strategy's parameters, every step with its rationale and
-   outcome, every job, report, and output, the probe's sites with their
-   separations, the candidates and their patches, paired comparisons with the
-   base, the selection, and the budget. ``OUT/runs.jsonl`` lists every run.
+   the setup, the strategy (its path, ``dispatch`` or ``mcp``, its
+   parameters, and its resolved configuration), the strategy's final
+   message, every step with its rationale and outcome, every job, report,
+   and output, the probe's sites with their separations, the candidates and
+   their patches, paired comparisons with the base, the selection, and the
+   budget. ``OUT/runs.jsonl`` lists every run.
 
 A run grant permits one experiment, so an interrupted run is not resumed:
 invoke the script again and it grants a new run, after the same idempotent
 setup; earlier runs and their summaries stay as they are. ``--summarize
-EXPERIMENT_ID`` rewrites the summary of an existing experiment without running
-anything (for example after the process was killed).
+EXPERIMENT_ID`` updates the summary of an existing experiment in its run's
+record without running anything (for example after the process was killed);
+the record's other keys stay.
 
 Default: 32 problems at 8,192 tokens, three passes, about 2 hours on the
 operator's MPS. Keep the Mac awake (``caffeinate -is``)::
@@ -40,7 +48,7 @@ operator's MPS. Keep the Mac awake (``caffeinate -is``)::
     caffeinate -is uv run --no-sync python examples/qwen_loops/run_discovery.py OUT \\
         --workspace ~/Desktop/wse-models/workspaces/q2 \\
         --snapshot ~/Desktop/wse-models/Qwen3.5-0.8B --repo Qwen/Qwen3.5-0.8B \\
-        --revision 2fc06364715b967f1860aea9cf38778875588b17
+        --revision 2fc06364715b967f1860aea9cf38778875588b17 --via-mcp
 
 A short smoke run: ``--problems 4 --max-new-tokens 256``. Strategy options:
 ``--columns``, ``--alphas``, ``--layers``, ``--last``, and ``--column-rule``
@@ -81,14 +89,16 @@ def _parameters(args: argparse.Namespace, suite_id: str) -> dict:
 
 
 def _summarize(out: Path, workspace: Path, experiment_id: str, extra: dict) -> dict:
+    """The experiment's summary and ``extra`` merged into its run's record (other keys stay), copied to summary.json."""
     from wse.api import Engine
 
     with Engine(workspace) as engine:
-        summary = {**extra, "experiment": loop_setup.experiment_summary(engine, experiment_id)}
-    run_id = summary["experiment"]["run_id"]
-    loop_setup.write_json(out / "runs" / f"{run_id}.json", summary)
-    loop_setup.write_json(out / "summary.json", summary)
-    return summary
+        experiment = loop_setup.experiment_summary(engine, experiment_id)
+    result = (experiment["controller"] or {}).get("result") or {}
+    record = loop_setup.merge_json(out / "runs" / f"{experiment['run_id']}.json",
+                                   {**extra, "final_message": result.get("final_message"), "experiment": experiment})
+    loop_setup.write_json(out / "summary.json", record)
+    return record
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -103,20 +113,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--wall-clock-hours", type=float, default=6.5, help="the controller's wall-clock limit")
     parser.add_argument("--max-steps", type=int, default=5000, help="the controller's step limit (job polls count)")
     parser.add_argument("--summarize", metavar="EXPERIMENT_ID", default=None,
-                        help="only rewrite the summary of this experiment; run nothing")
+                        help="only update the summary of this experiment in its run's record; run nothing")
     args = parser.parse_args(argv)
     loop_setup.check_setup_arguments(parser, args)
     os.environ.setdefault("OPENAI_AGENTS_DISABLE_TRACING", "1")
 
     from wse.api import Engine
-    from wse.runner import ReferenceRunner, StrategyConfig
+    from wse.registry import builtin_registry
+    from wse.runner import ReferenceRunner
     from wse.strategies.direction_search import DirectionSearchStrategy
 
     out, workspace = args.out.expanduser(), args.workspace.expanduser()
     if args.summarize:
         summary = _summarize(out, workspace, args.summarize, {"summarized_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
         print(json.dumps({"summary": str(out / "runs" / f"{summary['experiment']['run_id']}.json"),
-                          "state": summary["experiment"]["state"]}))
+                          "state": summary["experiment"]["state"], "final_message": summary["final_message"]}))
         return 0
     try:
         DirectionSearchStrategy(**_parameters(args, "suite"))  # refuse bad options before anything is granted
@@ -126,20 +137,20 @@ def main(argv: list[str] | None = None) -> int:
         setup = loop_setup.prepare(engine, args)
         grant = engine.grant_run(setup["task_id"], setup["policy_id"], setup["base_checkpoint_id"])
     parameters = _parameters(args, setup["suite_id"])
-    from wse.registry import builtin_registry
-
     registry = builtin_registry()
-    config = loop_setup.controller(registry, DirectionSearchStrategy, parameters, via_mcp=args.via_mcp, max_steps=args.max_steps,
-                                   wall_clock_seconds=args.wall_clock_hours * 3600)
+    config = loop_setup.controller(registry, DirectionSearchStrategy, parameters, via_mcp=args.via_mcp,
+                                   max_steps=args.max_steps, wall_clock_seconds=args.wall_clock_hours * 3600)
+    strategy = loop_setup.strategy_record(DirectionSearchStrategy, parameters, config)
     record = {"script": "examples/qwen_loops/run_discovery.py", "workspace": str(workspace), "setup": setup,
-              "run_id": grant.run_id, "controller_config": config.model_dump(mode="json"),
+              "run_id": grant.run_id, "strategy": strategy, "controller_config": config.model_dump(mode="json"),
               "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
     out.mkdir(parents=True, exist_ok=True)
     with (out / "runs.jsonl").open("a", encoding="utf-8") as index:
         index.write(json.dumps({"run_id": grant.run_id, "started_at": record["started_at"],
-                                "suite_id": setup["suite_id"], "parameters": parameters}) + "\n")
-    print(f"run {grant.run_id}: {STRATEGY} on {setup['base_checkpoint_id']}, suite {setup['suite_id']}, "
-          f"device {args.device}", file=sys.stderr)
+                                "suite_id": setup["suite_id"], "parameters": parameters,
+                                "path": strategy["path"]}) + "\n")
+    print(f"run {grant.run_id}: {strategy['controller']} ({STRATEGY}, {strategy['path']}) on "
+          f"{setup['base_checkpoint_id']}, suite {setup['suite_id']}, device {args.device}", file=sys.stderr)
     runner = ReferenceRunner(workspace, registry=registry, worker_args=["--device", args.device],
                              log_dir=out / "logs")
     status, error = 0, None
@@ -158,8 +169,10 @@ def main(argv: list[str] | None = None) -> int:
         return status or 1
     summary = _summarize(out, workspace, runner.last_experiment_id, record)
     result = (summary["experiment"]["controller"] or {}).get("result") or {}
+    # Through MCP the strategy's own reason is its final message; the SDK reports that the agent stopped.
     print(json.dumps({"experiment_id": runner.last_experiment_id, "state": summary["experiment"]["state"],
                       "status": result.get("status"), "reason": result.get("reason"),
+                      "final_message": summary["final_message"],
                       "selected_checkpoint_id": summary["experiment"]["selected_checkpoint_id"],
                       "summary": str(out / "runs" / f"{grant.run_id}.json"), "error": error}, indent=2))
     return status

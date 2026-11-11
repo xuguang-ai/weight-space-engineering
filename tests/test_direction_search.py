@@ -876,3 +876,97 @@ def test_direction_search_runs_end_to_end_through_the_reference_runner(lm, monke
     assert tools[:3] == ["wse_get_experiment", "wse_inspect_model", "wse_submit_evaluation"]
     assert "wse_get_report" in tools and tools.count("wse_select_checkpoint") == 1
     assert all(call.get("details", {}).get("rationale") for call in calls)
+
+
+# ---------------------------------------------------------------------------
+# The Q2 scripts' helpers (examples/qwen_loops)
+# ---------------------------------------------------------------------------
+
+QWEN_LOOPS = TESTS_DIR.parent / "examples" / "qwen_loops"
+
+
+def _script(name: str):
+    """A module of the Q2 scripts, imported as the scripts import each other (their directory on the path)."""
+    import importlib
+    import sys
+
+    if str(QWEN_LOOPS) not in sys.path:
+        sys.path.insert(0, str(QWEN_LOOPS))
+    return importlib.import_module(name)
+
+
+def test_the_controller_runs_the_strategy_by_dispatch_or_through_mcp_and_the_record_says_which():
+    from wse.registry import builtin_registry
+    from wse.runner import TEST_DOUBLE_PREFIX
+
+    loop_setup = _script("loop_setup")
+    registry = builtin_registry()
+    parameters = {"columns": 4, "suite_id": "practice"}
+    dispatch = loop_setup.controller(registry, DirectionSearchStrategy, parameters, via_mcp=False, max_steps=7,
+                                     wall_clock_seconds=60.0)
+    assert (dispatch.kind, dispatch.strategy, dispatch.parameters) == ("strategy", "direction_search@1", parameters)
+    assert (dispatch.max_steps, dispatch.wall_clock_seconds) == (7, 60.0)
+    mcp = loop_setup.controller(registry, DirectionSearchStrategy, parameters, via_mcp=True, max_steps=20_000,
+                                wall_clock_seconds=60.0)
+    assert (mcp.kind, mcp.model) == ("agent", f"{TEST_DOUBLE_PREFIX}direction_search_mcp@1")
+    assert (mcp.max_turns, mcp.wall_clock_seconds) == (10_000, 60.0)
+    # The test double creates its strategy without arguments: the registered subclass applies the parameters.
+    bound = registry.resolve("strategy", "direction_search_mcp", "1")
+    assert issubclass(bound, DirectionSearchStrategy) and (bound.strategy_id, bound.version) == ("direction_search_mcp",
+                                                                                               "1")
+    assert bound().config() == DirectionSearchStrategy(**parameters).config()
+    assert bound(columns=8).config()["columns"] == 8
+    for config, path in ((dispatch, "dispatch"), (mcp, "mcp")):
+        assert loop_setup.strategy_record(DirectionSearchStrategy, parameters, config) == {
+            "strategy": "direction_search@1", "path": path, "parameters": parameters,
+            "controller": "direction_search@1" if path == "dispatch" else mcp.model,
+            "resolved_config": DirectionSearchStrategy(**parameters).config()}
+
+
+def test_step_summaries_collapse_the_polls_of_a_job_on_either_path():
+    """Through MCP a model response precedes every call; the polls of one job still collapse into one step."""
+    loop_setup = _script("loop_setup")
+    numbers = iter(range(1, 100))
+
+    def event(kind: str, **fields: Any) -> dict:
+        number = next(numbers)
+        return {"seq": number, "created_at": f"t{number}", "kind": kind, **fields}
+
+    def poll() -> list[dict]:
+        return [event("tool_call", tool="wse_get_job", arguments={"job_id": "job_1"}, details={"rationale": "Wait."}),
+                event("tool_result", tool="wse_get_job", ok=True, error_code=None, summary=None)]
+
+    dispatch = [event("run_started"), *poll(), *poll(), *poll(), event("message", output="the search is complete")]
+    mcp = [event("run_started")]
+    for _ in range(3):
+        mcp += [event("model_response", usage={"input_tokens": 1}), *poll()]
+    mcp += [event("model_response", usage={"input_tokens": 1}), event("message", output="Stopping: complete")]
+    for events in (dispatch, mcp):
+        steps = loop_setup._steps(events)
+        assert [step.get("tool") or step.get("event") for step in steps] == ["run_started", "wse_get_job", "message"]
+        last_poll = [event for event in events if event["kind"] == "tool_call"][-1]
+        assert steps[1]["polls"] == 3 and steps[1]["rationale"] == "Wait." and steps[1]["last_at"] == \
+            last_poll["created_at"]
+
+
+def test_summarizing_a_run_again_keeps_its_record(lm, tmp_path):  # noqa: F811
+    """--summarize (both scripts) updates the experiment's summary in the run's record and keeps its other keys."""
+    from test_llm_policy_mcp import _open_run
+
+    run_discovery, check = _script("run_discovery"), _script("check_expressiveness")
+    run_id, eid = _open_run(lm.workspace, lm.base)
+    out = tmp_path / "out"
+    finished = {"script": "run_discovery.py", "setup": {"suite_id": "practice"}, "strategy": {"path": "mcp"},
+                "controller_config": {"kind": "agent"}, "elapsed_seconds": 1.5, "error": None}
+    run_discovery._summarize(out, lm.workspace, eid, finished)
+    run_discovery._summarize(out, lm.workspace, eid, {"summarized_at": "later"})
+    stored = json.loads((out / "runs" / f"{run_id}.json").read_text())
+    assert {key: stored[key] for key in finished} == finished and stored["summarized_at"] == "later"
+    assert stored["experiment"]["experiment_id"] == eid and stored["final_message"] is None
+    assert json.loads((out / "summary.json").read_text()) == stored
+    check.record_run(out, lm.workspace, eid, {"alpha": 6.0, "directions": {"used": "npz"}, "error": None})
+    record = check.record_run(out, lm.workspace, eid, {"summarized_at": "later"})
+    stored = json.loads((out / f"expressiveness-{run_id}.json").read_text())
+    assert stored == record and stored["alpha"] == 6.0 and stored["summarized_at"] == "later"
+    assert "verdict" not in stored  # no pass has run
+    assert json.loads((out / "expressiveness.json").read_text()) == stored
