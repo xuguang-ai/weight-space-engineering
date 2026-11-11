@@ -32,8 +32,10 @@ Rules implemented here (Sections 4.1, 5.1-5.3, and 6.2 of the plan):
   small change of a few elements is never taken for a scaling. Such a
   refusal comes after the patch was materialized against the base, and its
   outcome depends on the base's weights, so it is charged as a preview (one
-  ``patch_previews`` and its compute seconds), stores nothing, and names no
-  factor.
+  ``patch_previews`` and its compute seconds), stores no patch, and names no
+  factor. Like any result, the refusal is recorded under its idempotency
+  key: a retry with the same key and input returns it without charging
+  again.
 * ``apply_patch`` accepts only a ``patch_id``, replays the stored materialized
   patch (no editing operator runs), and commits the candidate, its ownership,
   the candidate-commit charge, the idempotent result, and audit events in one
@@ -109,6 +111,7 @@ from wse.schemas import (
     IDEMPOTENCY_KEY_PATTERN,
     OBJECT_ID_PATTERNS,
     BudgetEntry,
+    DomainError,
     ErrorCode,
     Experiment,
     ExperimentCheckpoint,
@@ -216,6 +219,15 @@ def _candidate_tensor_infos(
             info = info.model_copy(update={"blob_id": blob_id(tensor)})
         infos.append(info)
     return infos
+
+
+def _recorded_preview(result_json: str) -> PatchPreview:
+    """The preview recorded under an idempotency key, or the recorded refusal (a charged scaling refusal) raised again."""
+    recorded = json.loads(result_json)
+    if set(recorded) == {"error"}:
+        error = DomainError.model_validate(recorded["error"])
+        raise WSEError(error.code, error.message, retryable=error.retryable, details=error.details)
+    return PatchPreview.model_validate(recorded)
 
 
 def _response_bytes(value: Any) -> int:
@@ -955,7 +967,7 @@ class ExperimentService:
         request_hash = json_hash({"operation": "preview_patch", "spec": raw})
         recorded = self._lookup(self.db.conn, experiment_id, key, "preview_patch", request_hash)
         if recorded is not None:
-            return PatchPreview.model_validate_json(recorded)
+            return _recorded_preview(recorded)
         return self._guarded("patch.preview", experiment_id, request_hash, None,
                              lambda: self._preview(row, raw, key, request_hash))
 
@@ -986,7 +998,10 @@ class ExperimentService:
                 self._refuse_net_whole_tensor_scaling(row, parsed.base_checkpoint_id, base, edit, policy)
             except WSEError as exc:
                 if exc.code == ErrorCode.POLICY_DENIED:
-                    self._charge_refused_preview(experiment_id, time.perf_counter() - start)
+                    recorded = self._charge_refused_preview(experiment_id, time.perf_counter() - start, exc, key,
+                                                            request_hash)
+                    if recorded is not None:  # another attempt with this key recorded its outcome first
+                        return _recorded_preview(recorded)
                 raise
         frozen = FrozenPatchSpec(
             base_checkpoint_id=parsed.base_checkpoint_id,
@@ -1046,7 +1061,7 @@ class ExperimentService:
         with self.db.transaction() as conn:
             recorded = self._lookup(conn, experiment_id, key, "preview_patch", request_hash)
             if recorded is not None:
-                return PatchPreview.model_validate_json(recorded)
+                return _recorded_preview(recorded)
             self._require_open(self._experiment_row(experiment_id, conn))
             self.store.require_published(relpath)
             self.ledger.charge(conn, experiment_id, "patch_previews", 1)
@@ -1101,22 +1116,35 @@ class ExperimentService:
                 "(refuse_whole_tensor_scaling): it changes only the tensor's overall scale, whether one operation or "
                 "several, in this patch or with earlier candidates, have that effect. Change a proper part of the "
                 "tensor in a way that is not the same scaling of the whole. The refused preview is charged as a "
-                "preview, because its outcome depends on the base's weights.",
+                "preview, because its outcome depends on the base's weights; a retry with the same idempotency key "
+                "returns this refusal without charging again.",
                 details={"tensor": diff.tensor, "shape": list(candidate.shape),
                          "policy_option": "refuse_whole_tensor_scaling",
                          "permitted_operations": sorted(policy.operations.edits), "charged": {"patch_previews": 1}},
             )
 
-    def _charge_refused_preview(self, experiment_id: str, seconds: float) -> None:
-        """Charge a preview refused after it was materialized against the base: one preview and its compute seconds.
+    def _charge_refused_preview(self, experiment_id: str, seconds: float, refusal: WSEError, key: str,
+                                request_hash: str) -> str | None:
+        """Charge a preview refused after it was materialized against the base, and record the refusal under ``key``.
 
-        It stores nothing. Without a preview left the charge fails with
-        ``BUDGET_EXCEEDED``, which then replaces the refusal.
+        One transaction charges one preview and its compute seconds and
+        records the refusal as the key's result, so that a retry with the same
+        key and input returns it without charging again (M1's idempotency
+        rule). It stores no patch. Returns the result another attempt with the
+        same key recorded first, which is then not charged again. Without a
+        preview left the charge fails with ``BUDGET_EXCEEDED``, which then
+        replaces the refusal and records nothing.
         """
         with self.db.transaction() as conn:
+            recorded = self._lookup(conn, experiment_id, key, "preview_patch", request_hash)
+            if recorded is not None:
+                return recorded
             self._require_open(self._experiment_row(experiment_id, conn))
             self.ledger.charge(conn, experiment_id, "patch_previews", 1)
             self.ledger.charge_compute(conn, experiment_id, seconds)
+            self._remember(conn, experiment_id, key, "preview_patch", request_hash,
+                           canonical_json({"error": refusal.to_domain_error().model_dump(mode="json")}))
+        return None
 
     def apply_patch(self, experiment_id: str, patch_id: str, key: str) -> ModelManifest:
         """Create a READY candidate from a validated preview, charging one candidate commit."""

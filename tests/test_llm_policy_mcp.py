@@ -1000,8 +1000,14 @@ def test_net_effect_scaling_checks_have_no_false_positives_and_are_charged_like_
         after = _budget(bound, eid)
         assert after["patch_previews"][1] == before["patch_previews"][1] + 1
         assert after["compute_seconds"][1] > before["compute_seconds"][1]
-        # A retry is a new attempt and is charged again; the key records no result.
-        _expect(ErrorCode.POLICY_DENIED, bound.preview_patch, eid, spec(*halves), "halves")
+        # The key records the charged refusal (M1's idempotency rule): a retry with the same key and input returns
+        # it without a second charge, and the same key with other input is a conflict.
+        retried = _expect(ErrorCode.POLICY_DENIED, bound.preview_patch, eid, spec(*halves), "halves")
+        assert (retried.message, retried.details) == (error.message, error.details)
+        assert _budget(bound, eid) == after
+        _expect(ErrorCode.IDEMPOTENCY_CONFLICT, bound.preview_patch, eid, spec(one), "halves")
+        # A new key is a new attempt, charged again.
+        _expect(ErrorCode.POLICY_DENIED, bound.preview_patch, eid, spec(*halves), "halves-again")
         assert _budget(bound, eid)["patch_previews"][1] == before["patch_previews"][1] + 2
         failures = [event for event in bound.audit_log(eid) if event["event_type"] == "patch.preview.failed"]
         assert len(failures) == 2
