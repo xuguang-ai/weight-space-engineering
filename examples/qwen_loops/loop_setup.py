@@ -191,7 +191,7 @@ def _steps(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
                        "rationale": (event.get("details") or {}).get("rationale"), "arguments": _trim(arguments)}
             continue
         if kind == "tool_result" and pending is not None:
-            pending.update(ok=event.get("ok"), error_code=event.get("error_code"), error=event.get("summary"))
+            pending.update(ok=event.get("ok"), error_code=event.get("error_code"), summary=event.get("summary"))
             last = steps[-1] if steps else None
             if pending["tool"] == "wse_get_job" and last is not None and last.get("tool") == "wse_get_job" \
                     and last["arguments"].get("job_id") == pending["arguments"].get("job_id") and pending["ok"]:

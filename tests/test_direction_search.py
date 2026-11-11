@@ -949,6 +949,24 @@ def test_step_summaries_collapse_the_polls_of_a_job_on_either_path():
             last_poll["created_at"]
 
 
+def test_a_step_keeps_the_outcome_text_as_its_summary_not_as_an_error():
+    """A successful call's outcome text is not an error: steps record it as ``summary``, beside ``ok``."""
+    loop_setup = _script("loop_setup")
+    events = [
+        {"seq": 1, "created_at": "t1", "kind": "tool_call", "tool": "wse_get_experiment", "arguments": {}},
+        {"seq": 2, "created_at": "t2", "kind": "tool_result", "tool": "wse_get_experiment", "ok": True,
+         "error_code": None, "summary": "experiment exp_1 is OPEN"},
+        {"seq": 3, "created_at": "t3", "kind": "tool_call", "tool": "wse_probe", "arguments": {}},
+        {"seq": 4, "created_at": "t4", "kind": "tool_result", "tool": "wse_probe", "ok": False,
+         "error_code": "BUDGET_EXCEEDED", "summary": "probe_calls: 0 remain"},
+    ]
+    succeeded, failed = loop_setup._steps(events)
+    assert succeeded["summary"] == "experiment exp_1 is OPEN" and "error" not in succeeded
+    assert (failed["ok"], failed["error_code"], failed["summary"]) == (False, "BUDGET_EXCEEDED",
+                                                                       "probe_calls: 0 remain")
+    assert "error" not in failed
+
+
 def test_summarizing_a_run_again_keeps_its_record(lm, tmp_path):  # noqa: F811
     """--summarize (both scripts) updates the experiment's summary in the run's record and keeps its other keys."""
     from test_llm_policy_mcp import _open_run
