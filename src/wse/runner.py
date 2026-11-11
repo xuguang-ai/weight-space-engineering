@@ -483,15 +483,17 @@ class StopMonitor:
         return streak
 
 
-def _action_shortfall(action: Action, budget: Mapping[str, BudgetEntry], *, generation: bool = False,
+def _action_shortfall(action: Action, budget: Mapping[str, BudgetEntry], *, generation: bool | None = False,
                       tokens_per_probe_text: int | None = None) -> str | None:
     """The counter the next action cannot afford, from the remaining budget (or ``None``).
 
     ``generation`` marks a ``wse_submit_evaluation`` of a generation suite,
     which needs a generation pass and generated tokens instead of evaluation
-    batches and examples. A probe needs a probe call and, with
-    ``tokens_per_probe_text`` (the policy's), the teacher-forced tokens its
-    texts reserve.
+    batches and examples; ``None`` marks one whose suite the run cannot
+    resolve (``_generation_submission``), which needs only compute time here:
+    the submission itself then reports the domain error, as it does through
+    MCP. A probe needs a probe call and, with ``tokens_per_probe_text`` (the
+    policy's), the teacher-forced tokens its texts reserve.
     """
     needs: dict[str, float] = {}
     arguments = action.arguments
@@ -503,6 +505,8 @@ def _action_shortfall(action: Action, budget: Mapping[str, BudgetEntry], *, gene
         needs["tensor_read_calls"] = 1
     elif action.tool == "wse_analyze":
         needs["analysis_calls"] = 1
+    elif action.tool == "wse_submit_evaluation" and generation is None:
+        pass  # an unresolvable suite: the engine refuses the submission (NOT_FOUND or POLICY_DENIED)
     elif action.tool == "wse_submit_evaluation" and generation:
         needs["generation_passes"] = 1
         needs["generated_tokens"] = 1
@@ -527,14 +531,19 @@ def _action_shortfall(action: Action, budget: Mapping[str, BudgetEntry], *, gene
     return None
 
 
-def _generation_submission(engine: Engine, action: Action) -> bool:
-    """Whether ``action`` submits an evaluation of a generation suite the run may see (a generation pass)."""
+def _generation_submission(engine: Engine, action: Action) -> bool | None:
+    """Whether ``action`` submits an evaluation of a generation suite the run may see (a generation pass).
+
+    ``None`` when the run cannot resolve the suite (a final suite, another
+    task's suite, or a misspelled ID): the submission itself reports that
+    error, so ``_action_shortfall`` checks no evaluation counter for it.
+    """
     if action.tool != "wse_submit_evaluation":
         return False
     try:
         return engine.jobs.generates_text(engine.get_suite(action.arguments.get("suite_id")))
     except WSEError:
-        return False  # the submission itself reports the suite's error
+        return None
 
 
 def _probe_tokens(policy: ExperimentPolicy | None) -> int | None:

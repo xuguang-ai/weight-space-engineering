@@ -948,12 +948,69 @@ def test_action_shortfalls_know_generation_passes_and_probes():
     assert "needs generation_passes" in _action_shortfall(evaluate, budget(generation_passes=0), generation=True)
     assert "needs generated_tokens" in _action_shortfall(evaluate, budget(generated_tokens=0), generation=True)
     assert "needs evaluation_batches" in _action_shortfall(evaluate, budget())  # a forward-batch suite
+    # A suite the run cannot resolve (a final suite, another task's, a typo): only compute time is checked, and the
+    # submission itself reports the domain error, as it does through MCP.
+    assert _action_shortfall(evaluate, budget(), generation=None) is None
+    assert "needs compute_seconds" in _action_shortfall(evaluate, budget(compute_seconds=0), generation=None)
     # A probe needs a probe call and the tokens its texts reserve.
     assert _action_shortfall(probe, budget(), tokens_per_probe_text=1024) is None
     assert "needs probe_calls" in _action_shortfall(probe, budget(probe_calls=0), tokens_per_probe_text=1024)
     assert "needs teacher_forced_tokens" in _action_shortfall(probe, budget(teacher_forced_tokens=4095),
                                                               tokens_per_probe_text=1024)
     assert "needs compute_seconds" in _action_shortfall(probe, budget(compute_seconds=0), tokens_per_probe_text=1)
+
+
+class WrongSuiteStrategy:
+    """Submits a generation pass on a final suite and on a misspelled one, then stops with what it observed."""
+
+    strategy_id, version = "wrong_suite_test", "1"
+
+    def __init__(self, checkpoint_id: str) -> None:
+        self.checkpoint_id = checkpoint_id
+
+    def config(self):
+        return {"checkpoint_id": self.checkpoint_id}
+
+    def next_action(self, objective, observations, remaining_budget):
+        from wse.strategies.base import Action
+
+        suites = ("final", "practise")
+        if len(observations) <= len(suites):
+            suite = suites[len(observations) - 1]
+            return Action.call("wse_submit_evaluation", f"Evaluate on {suite}.", checkpoint_id=self.checkpoint_id,
+                               suite_id=suite, eval_config={"sample_count": 4, "seed": 0}, idempotency_key=suite)
+        return Action.stop("observed " + ", ".join(str(o.error_code) for o in observations[1:]))
+
+
+def test_a_strategy_submission_of_an_unresolvable_suite_gets_the_engine_refusal(lm):
+    """Under qwen_loop_v1 (no evaluation batches), a final or misspelled suite is refused by the engine as through MCP
+    (POLICY_DENIED, NOT_FOUND) and the run goes on; the runner's budget pre-check does not stop it."""
+    from wse.policy import QWEN_LOOP_POLICY_ID
+    from wse.registry import builtin_registry
+    from wse.runner import ReferenceRunner, _generation_submission
+    from wse.schemas import TaskDefinition
+    from wse.strategies.base import Action
+
+    with Engine(lm.workspace) as engine:
+        engine.register_task(TaskDefinition.model_validate({
+            "task_id": TASK, "title": "Finish answers", "description": "Make the model finish its answers.",
+            "objective": {"task_id": TASK, "description": "Fewer outputs at the token limit.",
+                          "gates": [{"metric": "accuracy", "min_value": 0.5}]},
+            "development_suite_id": "practice", "development_examples": 4}))
+        grant = engine.grant_run(TASK, QWEN_LOOP_POLICY_ID, lm.base)
+    with Engine(lm.workspace, run_id=grant.run_id) as bound:
+        assert [_generation_submission(bound, Action.call("wse_submit_evaluation", suite_id=suite))
+                for suite in ("practice", "final", "practise")] == [True, None, None]
+    registry = builtin_registry()
+    registry.register("strategy", "wrong_suite_test", "1", WrongSuiteStrategy)
+    runner = ReferenceRunner(lm.workspace, registry=registry, worker_args=["--poll-seconds", "0.02", "--device", "cpu"])
+    eid = runner.run_experiment(grant.run_id, TASK, QWEN_LOOP_POLICY_ID, {
+        "kind": "strategy", "strategy": "wrong_suite_test@1", "parameters": {"checkpoint_id": lm.base}})
+    result = runner.last_result["result"]
+    assert result["status"] == "completed" and result["stop_condition"] is None, result
+    assert result["reason"] == "the strategy stopped: observed POLICY_DENIED, NOT_FOUND"
+    with Engine(lm.workspace) as engine:
+        assert engine.list_jobs(eid) == [] and engine.get_experiment(eid).budget["generation_passes"].consumed == 0
 
 
 def test_the_stop_monitor_counts_generation_passes_as_evaluations_left(lm):
