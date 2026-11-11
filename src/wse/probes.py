@@ -184,7 +184,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
-from wse.schemas import ErrorCode, ModelIdentity, TensorInfo, WSEError, canonical_json
+from wse.schemas import MAX_LAYER_INDEX, ErrorCode, ModelIdentity, TensorInfo, WSEError, canonical_json
 
 if TYPE_CHECKING:
     from wse.api import ModelHandle
@@ -197,8 +197,13 @@ MAX_PROBE_TOKENS = 16384
 # Enough for two sites in every layer of a 64-layer model.
 MAX_PROBE_SITES = 128
 MAX_SITE_CANDIDATES = 10
+# The longest site name: a module path is a prefix of a tensor name (at most 256 characters in a patch operation)
+# followed by ":input" or ":output". Longer names are refused before they are parsed or echoed.
+MAX_SITE_CHARACTERS = 512
 CAPTURE_POINTS = ("input", "output")
-_RESIDUAL = re.compile(r"residual:(0|[1-9][0-9]*)")
+# A residual boundary has at most 9 digits (MAX_LAYER_INDEX), so parsing it never meets Python's integer-digit limit.
+_RESIDUAL = re.compile(r"residual:(0|[1-9][0-9]{0,8})")
+_RESIDUAL_DIGITS = re.compile(r"residual:[0-9]+")
 # Managed probes: the inline summary's default and largest number of top standardized dimensions per site, and
 # the allowance for the job's other fields around the summary.
 DEFAULT_SUMMARY_TOP = 8
@@ -208,6 +213,27 @@ PROBE_JOB_BYTES = 3 * 1024
 
 def _invalid(message: str, **details: Any) -> WSEError:
     return WSEError(ErrorCode.INVALID_ARGUMENT, message, details=details)
+
+
+def residual_boundary(name: str, index: int) -> int | None:
+    """The layer boundary of a residual site name, or ``None`` for any other name, after the bounds every site obeys.
+
+    A name longer than ``MAX_SITE_CHARACTERS``, and ``residual:`` followed by
+    digits that are not a boundary of at most 9 digits without leading
+    zeros, are ``INVALID_ARGUMENT``; ``index`` is the site's position in the
+    request, which the error names instead of echoing the site.
+    """
+    if len(name) > MAX_SITE_CHARACTERS:
+        raise _invalid(f"site {index} has {len(name)} characters; a site name has at most {MAX_SITE_CHARACTERS}",
+                       site=index)
+    residual = _RESIDUAL.fullmatch(name)
+    if residual:
+        return int(residual.group(1))
+    if _RESIDUAL_DIGITS.fullmatch(name):
+        raise _invalid(f"site {index} ({name[:24]!r}{'...' if len(name) > 24 else ''}) is not a residual site: a "
+                       f"layer boundary has no leading zeros and at most {len(str(MAX_LAYER_INDEX))} digits",
+                       site=index)
+    return None
 
 
 def _integer(value: Any) -> int | None:
@@ -420,6 +446,7 @@ def _resolve_sites(model: ModelHandle, runtime: HFTorchModel, sites: Any) -> lis
         raise _invalid(f"a probe reads at most {MAX_PROBE_SITES} sites, not {len(names)}", sites=len(names))
     if not all(isinstance(name, str) for name in names):
         raise _invalid("every site must be a string")
+    boundaries = [residual_boundary(name, index) for index, name in enumerate(names)]
     if len(set(names)) != len(names):
         repeated = sorted({name for name in names if names.count(name) > 1})
         raise _invalid(f"sites {repeated[:MAX_SITE_CANDIDATES]} are listed more than once",
@@ -427,11 +454,10 @@ def _resolve_sites(model: ModelHandle, runtime: HFTorchModel, sites: Any) -> lis
     paths: dict[str, str] | None = None
     layers: torch.nn.ModuleList | None = None
     resolved = []
-    for name in names:
-        residual = _RESIDUAL.fullmatch(name)
-        if residual:
+    for name, boundary in zip(names, boundaries, strict=True):
+        if boundary is not None:
             layers = layers if layers is not None else _decoder_layers(runtime.module)
-            index, count = int(residual.group(1)), len(layers)
+            index, count = boundary, len(layers)
             if index > count:
                 nearest = sorted(range(count + 1), key=lambda i: (abs(i - index), i))[:MAX_SITE_CANDIDATES]
                 raise WSEError(ErrorCode.NOT_FOUND,

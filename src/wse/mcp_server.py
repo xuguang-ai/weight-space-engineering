@@ -69,7 +69,7 @@ from wse.api import MODEL_PAGE_SIZE, Engine, model_list_page
 from wse.api import manifest_uri as _manifest_uri
 from wse.jobs import MAX_WAIT_SECONDS
 from wse.jobs import _wait_seconds as wait_seconds_value
-from wse.probes import DEFAULT_SUMMARY_TOP, MAX_PROBE_SITES, MAX_SUMMARY_TOP
+from wse.probes import DEFAULT_SUMMARY_TOP, MAX_PROBE_SITES, MAX_SITE_CHARACTERS, MAX_SUMMARY_TOP
 from wse.store import ANALYSIS_URI_PREFIX
 from wse.schemas import (
     MAX_PROBE_STRING_CHARACTERS,
@@ -208,7 +208,8 @@ PROBE_TEXTS_SCHEMA: dict[str, Any] = {
                    "\"item\": i} (an item of a development suite of this run's task)."}
 PROBE_SITES_SCHEMA: dict[str, Any] = {
     "type": "array", "minItems": 1, "maxItems": MAX_PROBE_SITES,
-    "items": {"anyOf": [{"type": "string", "minLength": 1}, _inline_refs(ProbeRoleSite.model_json_schema())]},
+    "items": {"anyOf": [{"type": "string", "minLength": 1, "maxLength": MAX_SITE_CHARACTERS},
+                        _inline_refs(ProbeRoleSite.model_json_schema())]},
     "description": "Where to read activations: \"residual:<i>\" (the residual stream entering decoder layer i; "
                    "residual:<L> is the last layer's output), \"<module path>:input\" or \"<module path>:output\" (a "
                    "module path is a tensor name without its last part, such as model.layers.3.mlp.down_proj), or a "

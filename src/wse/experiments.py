@@ -179,7 +179,11 @@ def _hashable(value: Any) -> Any:
     try:
         return json.loads(canonical_json(value))
     except WSEError:
-        return {"unhashable": type(value).__name__, "text": repr(value)[:256]}
+        try:
+            text = repr(value)[:256]
+        except ValueError:  # an integer beyond Python's digit limit for string conversion
+            text = "<not representable>"
+        return {"unhashable": type(value).__name__, "text": text}
 
 
 def _number(value: Any) -> int | float:

@@ -1419,6 +1419,8 @@ class Job(_Frozen):
 
 # The longest string a probe text may be (characters); its tokens are then cut to the policy's limit.
 MAX_PROBE_STRING_CHARACTERS = 8192
+# The largest layer index of a probe site (9 digits): residual boundaries and role-site layers.
+MAX_LAYER_INDEX = 999_999_999
 ANALYSIS_URI_PATTERN = r"^wse://analyses/[0-9a-f]{64}$"
 
 
@@ -1453,7 +1455,7 @@ class ProbeRoleSite(_Frozen):
     """A role site: the input or output of the module that holds ``role`` (in ``layer``), from the family descriptor."""
 
     role: str = Field(min_length=1, max_length=64)
-    layer: StrictInt | None = Field(default=None, ge=0)
+    layer: StrictInt | None = Field(default=None, ge=0, le=MAX_LAYER_INDEX)
     point: Literal["input", "output"]
 
 

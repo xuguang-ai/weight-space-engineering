@@ -400,6 +400,43 @@ def test_invalid_probe_requests_are_refused_before_anything_is_reserved(lm, monk
         assert "probe" in error.message and bound.list_jobs(other_eid) == []
 
 
+def test_overlong_sites_are_invalid_arguments_on_every_path(lm):
+    """A residual boundary of more than 9 digits (Python converts at most 4,300 to an int), an overlong site name,
+    and a role site's huge layer are INVALID_ARGUMENT, with a JSON body, through the Python API, a strategy's
+    executor, and the MCP handler, before anything is reserved; no error echoes the whole site."""
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from wse.mcp_server import PROBE_SITES_SCHEMA, WSEMCPServer
+    from wse.probes import MAX_SITE_CHARACTERS
+    from wse.runner import ExperimentExecutor
+    from wse.strategies.base import Action
+
+    assert PROBE_SITES_SCHEMA["items"]["anyOf"][0]["maxLength"] == MAX_SITE_CHARACTERS
+    run_id, eid = _open_run(lm.workspace, lm.base)
+    texts = [{"text": "abc"}, {"text": "def"}]
+    cases = (["residual:" + "1" * 5000], ["residual:1234567890"], ["residual:1", "m" * MAX_SITE_CHARACTERS + ":input"],
+             ["x" * 100_000], [{"role": "mlp.down", "layer": 10 ** 9, "point": "input"}],
+             [{"role": "mlp.down", "layer": 10 ** 5000, "point": "input"}])
+    with Engine(lm.workspace, run_id=run_id) as bound:
+        before = _budget(bound, eid)
+        executor = ExperimentExecutor(bound, constraint_status="verified")
+        server = WSEMCPServer(bound)
+        for number, sites in enumerate(cases):
+            error = _expect(ErrorCode.INVALID_ARGUMENT, bound.submit_probe, eid, lm.base, texts, sites, f"py-{number}")
+            assert len(error.message) < 1000 and len(json.dumps(error.details)) < 1000
+            observation = executor.execute(Action.call("wse_probe", checkpoint_id=lm.base, texts=texts, sites=sites,
+                                                       idempotency_key=f"strategy-{number}"))
+            assert observation.error_code == "INVALID_ARGUMENT"
+            with pytest.raises(ToolError) as raised:
+                server.wse_probe(experiment_id=eid, checkpoint_id=lm.base, texts=texts, sites=sites,
+                                 idempotency_key=f"mcp-{number}")
+            body = json.loads(str(raised.value))["error"]
+            assert body["code"] == "INVALID_ARGUMENT" and len(str(raised.value)) < 2000
+        # Within the bounds, a boundary beyond the model's layers is still NOT_FOUND.
+        _expect(ErrorCode.NOT_FOUND, bound.submit_probe, eid, lm.base, texts, ["residual:999999999"], "beyond")
+        assert _budget(bound, eid) == before and bound.list_jobs(eid) == []
+
+
 def test_probe_retries_return_the_same_job_and_other_input_conflicts(lm):
     run_id, eid = _open_run(lm.workspace, lm.base)
     texts = [{"text": "abc"}, {"text": "def"}, {"text": "ghi"}]

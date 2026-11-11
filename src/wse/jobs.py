@@ -199,10 +199,9 @@ def _probe_sites(manifest: ModelManifest, sites: Any, registry: Any, limit: int)
     (``TensorRole.site``). The worker checks again what each site captures.
     """
     import difflib
-    import re
 
     from wse.adapters.families import role_tensor
-    from wse.probes import CAPTURE_POINTS, MAX_SITE_CANDIDATES, canonical_module_paths
+    from wse.probes import CAPTURE_POINTS, MAX_SITE_CANDIDATES, canonical_module_paths, residual_boundary
 
     if isinstance(sites, (str, bytes, Mapping)) or not isinstance(sites, (list, tuple)) or not sites:
         raise WSEError(ErrorCode.INVALID_ARGUMENT, "sites must be a non-empty list of site names ('residual:<i>', "
@@ -228,9 +227,9 @@ def _probe_sites(manifest: ModelManifest, sites: Any, registry: Any, limit: int)
         if not isinstance(site, str) or not site:
             raise WSEError(ErrorCode.INVALID_ARGUMENT, f"site {index} must be a site name or a role site",
                            details={"site": index})
-        residual = re.fullmatch(r"residual:(0|[1-9][0-9]*)", site)
-        if residual:
-            if layers is not None and int(residual.group(1)) > layers:
+        boundary = residual_boundary(site, index)  # refuses overlong names and boundaries of more than 9 digits
+        if boundary is not None:
+            if layers is not None and boundary > layers:
                 raise WSEError(ErrorCode.NOT_FOUND,
                                f"site {site!r} does not exist: the model has {layers} decoder layers, so residual "
                                f"sites run from residual:0 to residual:{layers}",

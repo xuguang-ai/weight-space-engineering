@@ -13,6 +13,7 @@ context 128); every test runs on the CPU.
 from __future__ import annotations
 
 import dataclasses
+import json
 import subprocess
 import sys
 import textwrap
@@ -27,6 +28,7 @@ from wse.probes import (
     MAX_PROBE_SITES,
     MAX_PROBE_TOKENS,
     MAX_SITE_CANDIDATES,
+    MAX_SITE_CHARACTERS,
     Contrast,
     ProbeResult,
     ProbeText,
@@ -341,6 +343,14 @@ def test_probe_refuses_unknown_and_malformed_sites(handles):
                   ["model.layers.1.mlp:weight"], [":input"], [""], [1], "residual:1", [], too_many,
                   ["residual:1", "residual:1"]):
         refused(ErrorCode.INVALID_ARGUMENT, sites)
+    # Residual boundaries have at most 9 digits, and site names at most MAX_SITE_CHARACTERS characters, so neither
+    # Python's limit on integer digits nor an echo of the name can make the error unbounded.
+    for sites in (["residual:" + "1" * 5000], ["residual:1234567890"], ["m" * MAX_SITE_CHARACTERS + ":input"],
+                  ["residual:1", "x" * 100_000]):
+        error = refused(ErrorCode.INVALID_ARGUMENT, sites)
+        assert len(error.message) < 1000 and len(json.dumps(error.details)) < 1000
+    error = refused(ErrorCode.NOT_FOUND, ["residual:999999999"])
+    assert error.details["candidates"][0] == f"residual:{LAYERS}"
     _expect(ErrorCode.INVALID_ARGUMENT, probe, handle, texts, sites=["residual:1"], device="cuda")
     _expect(ErrorCode.INVALID_ARGUMENT, probe, object(), texts, sites=["residual:1"], device="cpu")
 
