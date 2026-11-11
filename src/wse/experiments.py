@@ -130,6 +130,7 @@ from wse.schemas import (
     TensorStatistics,
     Usage,
     WSEError,
+    bounded_echo,
     canonical_json,
     json_hash,
 )
@@ -672,10 +673,11 @@ class ExperimentService:
         elif isinstance(cursor, str) and cursor in starts:
             number = starts[cursor]
         else:
+            shown = bounded_echo(cursor)
             raise WSEError(ErrorCode.INVALID_ARGUMENT,
-                           f"cursor {cursor!r} was not returned by wse_inspect_model for checkpoint {checkpoint_id}; "
+                           f"cursor {shown!r} was not returned by wse_inspect_model for checkpoint {checkpoint_id}; "
                            "omit it for the first page and pass a page's tensor_page.next_cursor for the next",
-                           details={"cursor": str(cursor), "page_count": len(pages)})
+                           details={"cursor": shown, "page_count": len(pages)})
         first, last = pages[number]
         infos = manifest.tensors[first:last]
         blocked: str | None = None

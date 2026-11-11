@@ -95,6 +95,19 @@ class WSEError(Exception):
         return f"WSEError({self.code.value}: {self.message})"
 
 
+MAX_ECHO_CHARACTERS = 64
+
+
+def bounded_echo(value: Any, limit: int = MAX_ECHO_CHARACTERS) -> str:
+    """An invalid argument as an error may echo it: its text, or ``repr`` for other values, cut to ``limit``
+    characters followed by ``...``, so that no input makes an error unbounded."""
+    try:
+        text = value if isinstance(value, str) else repr(value)
+    except ValueError:  # an integer beyond Python's digit limit for string conversion
+        text = f"<{type(value).__name__}>"
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
 # ---------------------------------------------------------------------------
 # Canonical encodings
 # ---------------------------------------------------------------------------

@@ -737,6 +737,41 @@ def test_open_weight_previews_inspections_and_candidates_take_bounded_forms_when
     run(body)
 
 
+def test_invalid_cursors_are_refused_with_a_bounded_echo(hf_snapshots, tmp_path):
+    """An inspection or model-list cursor that no page returned is INVALID_ARGUMENT, echoed at most 64 characters."""
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from wse.mcp_server import WSEMCPServer
+
+    workspace = tmp_path / "workspace"
+    small = _small_limit_policy("small_limits_v1", 8 * 1024)  # paged inspections on the tiny Qwen3.5 fixture
+    with Engine(workspace) as engine:
+        base = engine.import_hf_snapshot(hf_snapshots["qwen3_5"], repo="example-org/Qwen3.5-tiny",
+                                         revision=REVISION).checkpoint_id
+        engine.register_policy(small)
+    run_id, eid = _open_run(workspace, base, policy_id=small.policy_id)
+    with Engine(workspace, run_id=run_id) as bound:
+        server = WSEMCPServer(bound)
+        for cursor in ("x" * 100_000, "tensors:" + "1" * 5000, "tensors:²"):
+            error = _expect(ErrorCode.INVALID_ARGUMENT, bound.inspect_model_details, eid, base, cursor=cursor)
+            assert len(error.message) < 500 and len(error.details["cursor"]) <= 67
+            with pytest.raises(ToolError) as raised:
+                server.wse_inspect_model(experiment_id=eid, checkpoint_id=base, cursor=cursor)
+            assert json.loads(str(raised.value))["error"]["code"] == "INVALID_ARGUMENT"
+            assert len(str(raised.value)) < 1000
+        for cursor in ("x" * 100_000, "models:" + "1" * 5000, "models:²", "models:01"):
+            with pytest.raises(ToolError) as raised:
+                server.wse_list_models(cursor=cursor)
+            assert json.loads(str(raised.value))["error"]["code"] == "INVALID_ARGUMENT"
+            assert len(str(raised.value)) < 1000
+        assert server.wse_list_models(cursor="models:0").structured_content["result"]["models"][0]["checkpoint_id"] \
+            == base
+        # Both cursor arguments advertise the bound.
+        tools = {tool.name: tool for tool in anyio.run(server.server.list_tools)}
+        for name in ("wse_inspect_model", "wse_list_models"):
+            assert tools[name].input_schema["properties"]["cursor"]["maxLength"] == 64
+
+
 def _response_wire_bytes(response) -> int:
     """Bytes of the JSON-RPC response line that carries a ``ToolResponse`` built by the server."""
     from wse.mcp_server import _respond

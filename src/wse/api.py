@@ -15,6 +15,7 @@ never loads SQLite.
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -48,6 +49,7 @@ from wse.schemas import (
     TensorDiff,
     Usage,
     WSEError,
+    bounded_echo,
     canonical_json,
     json_hash,
     model_identity,
@@ -255,13 +257,14 @@ def model_list_page(manifests: Sequence[ModelManifest], cursor: Any = None) -> M
     ``cursor`` is omitted for the first page, or the ``next_cursor`` of the
     previous page.
     """
-    if cursor in (None, ""):
+    parsed = re.fullmatch(r"models:(0|[1-9][0-9]{0,8})", cursor) if isinstance(cursor, str) else None
+    if cursor is None or cursor == "":
         offset = 0
-    elif isinstance(cursor, str) and cursor.startswith("models:") and cursor[7:].isdigit():
-        offset = int(cursor[7:])
+    elif parsed:
+        offset = int(parsed.group(1))
     else:
-        raise WSEError(ErrorCode.INVALID_ARGUMENT, f"cursor {cursor!r} was not returned by wse_list_models; omit it "
-                       "to start from the first page")
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, f"cursor {bounded_echo(cursor)!r} was not returned by "
+                       "wse_list_models; omit it to start from the first page")
     page = manifests[offset:offset + MODEL_PAGE_SIZE]
     models = [ModelSummary(checkpoint_id=m.checkpoint_id, adapter=m.adapter, weights_hash=m.weights_hash,
                            parameter_count=m.parameter_count, tensor_count=len(m.tensors),

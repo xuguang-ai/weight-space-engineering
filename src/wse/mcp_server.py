@@ -72,6 +72,7 @@ from wse.jobs import _wait_seconds as wait_seconds_value
 from wse.probes import DEFAULT_SUMMARY_TOP, MAX_PROBE_SITES, MAX_SITE_CHARACTERS, MAX_SUMMARY_TOP
 from wse.store import ANALYSIS_URI_PREFIX
 from wse.schemas import (
+    MAX_ECHO_CHARACTERS,
     MAX_PROBE_STRING_CHARACTERS,
     AnalysisResult,
     AxisSlice,
@@ -189,7 +190,8 @@ EvalConfigArg = Annotated[Any, WithJsonSchema({**EVAL_CONFIG_SCHEMA, "descriptio
                                                "and seed of the suite; the server fixes the device and batch size."})]
 WaitArg = Annotated[float, Field(json_schema_extra={"minimum": 0, "maximum": MAX_WAIT_SECONDS},
                                  description="Seconds (0-10) to hold the call until the job is terminal.")]
-CursorArg = Annotated[str | None, Field(description="Omit for the first page; pass tensor_page.next_cursor for the "
+CursorArg = Annotated[str | None, Field(json_schema_extra={"maxLength": MAX_ECHO_CHARACTERS},
+                                        description="Omit for the first page; pass tensor_page.next_cursor for the "
                                                     "next one.")]
 PARAMETERS_SCHEMA: dict[str, Any] = {
     "anyOf": [{"type": "object"}, {"type": "null"}], "default": None,
@@ -396,6 +398,7 @@ class WSEMCPServer:
         return self.engine.resolve_experiment_id(experiment_id)
 
     def wse_list_models(self, cursor: Annotated[str | None, Field(
+            json_schema_extra={"maxLength": MAX_ECHO_CHARACTERS},
             description="Omit for the first page; pass next_cursor for the next one.")] = None,
     ) -> Annotated[CallToolResult, ToolResponse[ModelList]]:
         """List the registered checkpoints this run may use (no filesystem paths are scanned)."""
