@@ -235,6 +235,7 @@ Each (problem, sample) pair gets its own seed, derived from the profile seed, th
 - **The article's protocol** runs MATH-500 with 4 samples per problem, up to 32,768 tokens each. Its independent re-run of the edited model generated 43.4 million tokens in about 51 minutes on an H200 with vLLM. The base model reaches the limit on about 93% of answers, so it generates even more.
 - **Task 7 measures local throughput** and estimates the cost of three protocols: the 25-problem comparison, a 100-problem single-sample final suite, and the full protocol.
 - **The user then decides** whether Q3's final evaluation runs locally on a subset or on a GPU worker. A GPU worker would become its own task, inserted before Task 13.
+- **Q3 is paused** (user decision, 2026-11-10): it follows WSE's open-source release, and this gate waits until then. Q2 continues to its exit.
 
 ## 5. Agent-Facing Tools (Q2)
 
