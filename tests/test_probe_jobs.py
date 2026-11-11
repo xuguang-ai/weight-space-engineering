@@ -452,6 +452,40 @@ def test_a_probe_summary_stays_within_the_response_limit(lm):
         assert bound.list_jobs(other_eid) == []
 
 
+def test_the_summary_bound_holds_for_the_widest_numbers_a_summary_writes():
+    """Numbers to 6 significant digits print as up to 19 characters (-1234560000000000.0), and the bound allows that.
+
+    A probe that passes the submission bound must never fail in the worker's ``fit_summary`` (after its forwards
+    were charged), whatever norms and log-probabilities its activations give.
+    """
+    from wse.probes import _json_bytes, _summary, fit_summary, summary_size_bound
+
+    names = [f"model.language_model.layers.{layer}.{module}:{point}" for layer in range(24)
+             for module in ("post_attention_layernorm", "mlp.down_proj", "mlp.gate_proj") for point in ("input",
+                                                                                                    "output")]
+    values = (12.3456789, 1.2345678e15, 9.99999e15, 1e16, 1.23456e-300, 0.000123456)
+    for grouped in (True, False):
+        for count in (3, 64):
+            bounds = summary_size_bound(texts=count, sites=names, grouped=grouped, tokens_per_text=1024)
+            for norm in values:
+                texts = [{"source": "suite_item", "forward_tokens": 1024, "window_start": 1, "window_stop": 1024,
+                          "dropped_tokens": 123456789, "mean_logprob": -norm}] * count
+                sites = [{"site": name, "features": 3584,
+                          **({"group_mean_norms": {"a": norm, "b": norm}, "contrast": {"norm": norm}} if grouped
+                             else {"mean_norm": norm})} for name in names]
+                document = {"checkpoint_id": "ckpt_" + "a" * 32, "tokens_per_text": 1024, "texts": texts,
+                            "sites": sites, "groups": {"a": [0], "b": [1, 2]} if grouped else None}
+                for k in (0, 1, 47, len(names)):
+                    shown = {**document, "sites": sites[:k]}
+                    size = _json_bytes(_summary(shown, [[] if grouped else None] * k, 0, "wse://analyses/" + "a" * 64,
+                                                10 ** 12))
+                    assert size <= bounds[k], (grouped, count, norm, k, size, bounds[k])
+                # At the bound, the worker's summary always fits (here without top dimensions to drop).
+                fit_summary({**document, "sites": [{**site, "contrast": {**site["contrast"], "standardized": []}}
+                                                   if grouped else site for site in sites]},
+                            uri="wse://analyses/" + "a" * 64, size=10 ** 12, top=8, limit=bounds[-1])
+
+
 def test_probes_stop_on_cancellation_and_at_the_time_limit_and_stay_charged(lm, monkeypatch):
     from wse.engines import hf_torch
 

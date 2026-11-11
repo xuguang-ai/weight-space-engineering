@@ -814,9 +814,11 @@ def summary_size_bound(*, texts: int, sites: Sequence[str], grouped: bool, token
     widest forms. Submission refuses a probe whose bound exceeds the limit,
     so the worker's ``fit_summary`` never fails.
     """
-    wide = 1.23456e-300  # the widest 6-digit float: 12 characters
+    # The widest summary number (``_short``): 6 significant digits print in positional notation below 1e16, so a
+    # value in [1e15, 1e16) takes 18 characters and its negative 19 (-1234560000000000.0); exponents take at most 13.
+    wide = -1.23456e15
     record = {"source": "suite_item", "forward_tokens": tokens_per_text, "window_start": 0,
-              "window_stop": tokens_per_text, "dropped_tokens": 10 ** 9, "mean_logprob": -wide}
+              "window_stop": tokens_per_text, "dropped_tokens": 10 ** 9, "mean_logprob": wide}
     entry: dict[str, Any] = {"group_mean_norms": {"a": wide, "b": wide}, "contrast": {"norm": wide}} if grouped \
         else {"mean_norm": wide}
     document = {"checkpoint_id": "ckpt_" + "0" * 32, "tokens_per_text": tokens_per_text,
