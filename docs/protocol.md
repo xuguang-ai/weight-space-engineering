@@ -158,11 +158,11 @@ result in a 63,505-byte JSON-RPC response; values of about 1e15 (19-20
 characters each) limit the read to 1,536 elements, a 31,386-byte result in a
 64,155-byte response.
 
-The envelope (summary, URIs, `usage`, and the framing) stays within that
-allowance in both copies, with every number at its widest, because results
-that can fill the limit list only the counters they charge (above): about
-1.5 to 1.8 KB, where every counter of a language-model policy's ledger
-would take about 5 KB.
+The envelope (summary, URIs, `usage`, the framing, and the SDK's
+`serverInfo` stamp in `_meta`) stays within that allowance in both copies,
+with every number at its widest, because results that can fill the limit
+list only the counters they charge (above): about 1.6 to 1.9 KB, where every
+counter of a language-model policy's ledger would take about 5 KB.
 
 Language models add results whose JSON is mostly text: output tails, tensor
 names and axes, and report keys. The text mirror escapes every quote,

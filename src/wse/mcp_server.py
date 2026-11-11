@@ -110,8 +110,8 @@ RESOURCE_PAGE_BYTES = 32 * 1024
 PAGE_ENVELOPE_BYTES = 256
 WAIT_POLL_SECONDS = 0.05
 # The counters that bounded results list in usage.cumulative: those the call charges. The envelope then stays
-# within RESPONSE_ENVELOPE_BYTES per copy (JSON-RPC framing included) at its widest, which the result limits assume;
-# every counter of the ledger at its widest would take about 5 KB.
+# within RESPONSE_ENVELOPE_BYTES per copy (the JSON-RPC framing and the SDK's serverInfo stamp included) at its
+# widest, which the result limits assume; every counter of the ledger at its widest would take about 5 KB.
 READ_COUNTERS = ("tensor_read_calls", "compute_seconds")
 PROBE_COUNTERS = ("probe_calls", "teacher_forced_tokens", "compute_seconds")
 PREVIEW_COUNTERS = ("patch_previews", "compute_seconds")

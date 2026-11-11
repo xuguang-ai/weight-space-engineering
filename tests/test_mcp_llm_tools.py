@@ -776,7 +776,7 @@ def test_bounded_results_list_the_counters_they_charge_and_their_widest_envelope
     the inline-result limit leaves (RESPONSE_ENVELOPE_BYTES per copy) even with every number at its widest; every
     counter of qwen_loop_v1's ledger would take about 5 KB."""
     from wse.experiments import _WIDEST_FLOAT
-    from wse.mcp_server import WSEMCPServer
+    from wse.mcp_server import WSEMCPServer, _package_version
     from wse.policy import RESPONSE_ENVELOPE_BYTES, response_size
     from wse.schemas import BudgetEntry, ModelInspection, ModelManifest, PatchPreview, TensorPage
 
@@ -817,10 +817,14 @@ def test_bounded_results_list_the_counters_they_charge_and_their_widest_envelope
         responses = [server.wse_preview_patch(experiment_id=eid, patch_spec=spec, idempotency_key="p"),
                      server.wse_apply_patch(experiment_id=eid, patch_id=patch_id, idempotency_key="a"),
                      server.wse_inspect_model(experiment_id=eid, checkpoint_id=lm.base)]
-        envelopes = [_wire_bytes(response) - response_size(response.structured_content["result"])
+        # On the wire the SDK also stamps 2026-era results with the server's identity (_meta, spec #3002).
+        stamp = {"io.modelcontextprotocol/serverInfo": {"name": "wse", "version": _package_version()}}
+        stamp_bytes = len(json.dumps({"_meta": stamp}, separators=(",", ":")).encode("utf-8")) - 1  # with a comma
+        envelopes = [_wire_bytes(response) + stamp_bytes - response_size(response.structured_content["result"])
                      for response in responses]
         assert all(0 < envelope <= 2 * RESPONSE_ENVELOPE_BYTES for envelope in envelopes), envelopes
-    print(f"widest envelopes (preview, candidate, inspection): {envelopes} of {2 * RESPONSE_ENVELOPE_BYTES} bytes")
+    print(f"widest envelopes (preview, candidate, inspection), with the SDK's {stamp_bytes}-byte serverInfo stamp: "
+          f"{envelopes} of {2 * RESPONSE_ENVELOPE_BYTES} bytes")
 
 
 def test_whole_previews_up_to_the_limit_fit_one_response_on_the_wire(wide_layouts, tmp_path):
