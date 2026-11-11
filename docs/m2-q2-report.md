@@ -135,17 +135,20 @@ Paired differences with the base, with 95% cluster-bootstrap intervals over prob
 
 This analysis ran after the attempt, by the operator, with knowledge of p50c. It is not part of the attempt.
 
-- **Layer choice.** By the strategy's score, p50c's layers rank 10th (layer 15, 0.82) and 17th (layer 19, 0.61) of 24.
-- **Direction.** At those layers, the probe's contrast does carry p50c's direction.
+- **Layer choice.** By the strategy's score, p50c's layers rank 10th (layer 15, 0.81) and 17th (layer 19, 0.60) of 24.
+- **Direction.** At those layers, the probe's contrast is aligned with p50c's direction, though less strongly than a comparison with random directions suggests.
   - Its cosine with p50c's per-layer direction is +0.35 at layer 15 and −0.44 at layer 19. The sign does not matter to `project_out`.
-  - For comparison, 99.9% of random directions in 1,024 dimensions have a cosine below 0.10 in magnitude.
+  - Random directions are the wrong baseline. In 1,024 dimensions their cosine stays below 0.103 in magnitude in 99.9% of draws, but the outputs' activations vary strongly along p50c's direction itself.
+  - The right baseline compares the actual split with arbitrary splits of the same outputs. This run's stored probe keeps only the group means, so the operator ran that check on the sample of the four-step example (README, Section 5): 32 other problems, probed with full context, with the per-output means of `Probe.means`.
+  - There, p50c's direction carries 6.7% (layer 15) and 14.4% (layer 19) of the outputs' variance, against 0.1% for a random direction. Over all 496 ways to set 2 of the 32 outputs apart, the median cosine magnitude is 0.24 and 0.36. The actual split gives 0.37 and 0.45 and ranks 4th and 7th (p = 0.008 and 0.014). In each layer, all 32 outputs' components along the direction have the same sign, and the 2 finished outputs have the smallest in magnitude at layer 15 and two of the three smallest at layer 19.
+  - The actual split also has the largest contrast norm of all 496: the finished outputs differ from the rest in many directions, not only in p50c's (Section 4.4, position confound).
 - **Columns.**
   - With the probe's contrast at those layers, the cosine rule picks 27 (layer 15) and 19 (layer 19) of p50c's 64 columns.
   - With p50c's own direction, it picks 33 and 20.
   - Chance would give about 1.
   - Even with the exact direction, the column rule recovers at most about half of p50c's columns.
 
-The miss is first a layer-selection miss: the signal was present at p50c's layers, and the score did not rank them high. The score has two known weaknesses:
+The miss is first a layer-selection miss: at p50c's layers the contrast was aligned with p50c's direction, and the score did not rank those layers high. The score has two known weaknesses:
 
 - it ignores the spread within each group (review C6);
 - group b has only 2 outputs.
@@ -238,6 +241,19 @@ The smoke check found one bug. The parameter counts counted the tied embedding t
 ### 6.2 Reproducibility of a generation pass
 
 Section 3 and Section 4 each ran a base pass in a separate experiment, about 1.5 hours apart. The two passes produced the same 32 outputs, token for token: 253,567 generated tokens in all. Only the experiment and job IDs in the output records differ.
+
+The four-step example (README, Section 5) ran in full twice, in separate processes, with the library code of b3534a4.
+
+- **The runs.** The two comparisons started 2 h 38 min apart. The second run started from a fresh download of the model and the data into new directories.
+- **What changed between them.** Only the example script:
+  - a guard that skips step 2 when either group is empty (both groups were non-empty);
+  - the sign convention of the recovered direction. It flips the printed cosine at layer 19 from +0.45 to −0.45 and leaves the edit bit-identical, because negating a direction is exact;
+  - comments.
+- **What matched.**
+  - Both records hold the same weights hashes for the base and the edited model, and the same data and profile hashes.
+  - The 64 outputs of the comparison are the same, token for token, with the same answers.
+  - Only the random checkpoint IDs and the creation times differ.
+- **A third process.** The rerun behind the permutation check of Section 4.3 reproduced the 32 base outputs token for token as well.
 
 On this machine, a pass with a fixed suite, profile, seed, and batch size is reproducible to the token.
 
