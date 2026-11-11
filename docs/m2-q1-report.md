@@ -223,9 +223,9 @@ Running the block again:
 After an interruption, run the same block again. `W` and `OUT` must lie outside the repository.
 
 ```bash
-cd /Users/xai/Desktop/weight-space-engineering
+# from the repository root
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
-M=/Users/xai/Desktop/wse-models
+M=~/Desktop/wse-models
 W=/path/outside/the/repository/q1-workspace
 OUT=/path/outside/the/repository/q1-math500-25-seed0
 field() { uv run --no-sync python -c "import json, sys; print(json.load(sys.stdin)['$1'])"; }
@@ -241,7 +241,7 @@ uv run --no-sync wse --workspace "$W" compare-generation --base "$BASE" --candid
 
 Progress goes to `$OUT.log`, one line per finished (checkpoint, problem). Results are written to `$OUT/summary.json`.
 
-The run used `W=/Users/xai/Desktop/wse-models/workspaces/q1` and `OUT=/Users/xai/Desktop/wse-models/runs/q1-math500-25-seed0`, under `caffeinate -is` so that the Mac did not sleep. It ran as one process, from 2026-11-10T00:31:07Z to 06:36:17Z, with no interruption or restart.
+The run used `W=~/Desktop/wse-models/workspaces/q1` and `OUT=~/Desktop/wse-models/runs/q1-math500-25-seed0`, under `caffeinate -is` so that the Mac did not sleep. It ran as one process, from 2026-11-10T00:31:07Z to 06:36:17Z, with no interruption or restart.
 
 **Expected duration: about 5.5 hours (range 4.5–6.5 hours).** The estimate:
 
