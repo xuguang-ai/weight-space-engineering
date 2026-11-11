@@ -60,7 +60,9 @@ class Architecture(BaseModel):
 
     @property
     def parameter_count(self) -> int:
-        return sum(info.element_count for info in self.tensors)
+        """Distinct parameters: an alias group (one shared object, such as tied embeddings) counts once."""
+        aliases = {name for group in self.alias_groups for name in sorted(group)[1:]}
+        return sum(info.element_count for info in self.tensors if info.name not in aliases)
 
 
 @runtime_checkable

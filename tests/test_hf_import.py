@@ -439,6 +439,14 @@ def test_checkpoints_named_like_their_modules_import_without_a_name_map(snapshot
         assert torch.equal(stored[tensor_name].reshape(-1).view(torch.uint8), tensor.reshape(-1).view(torch.uint8))
 
 
+@pytest.mark.parametrize("name", ["llama_tied", "gemma3", "qwen3_5", "llama_untied"])
+def test_an_alias_group_counts_once_in_every_parameter_count(snapshots, engine, name):
+    manifest = _import(engine, snapshots[name])
+    handle = engine.open_checkpoint(manifest.checkpoint_id)
+    # The tied input and output embeddings are one parameter: manifests, handles, and previews agree.
+    assert handle.parameter_count == handle.architecture.parameter_count == manifest.parameter_count
+
+
 def test_the_stored_configuration_is_the_snapshots_config_json(snapshots, engine, tmp_path):
     """transformers fills defaults into nested dicts (Llama's rope_scaling gains rope_theta); the import must not."""
     snapshot = tmp_path / "llama_rope"
