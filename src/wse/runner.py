@@ -13,7 +13,9 @@ drives one trial on an operator-prepared workspace:
      description as its first observation (read task and budget), then
      proposes one action at a time; the runner executes each through the
      run-bound Engine, the same service the MCP tools call, and records it.
-     The runner owns the evaluation worker for these runs.
+     The runner owns the evaluation worker for these runs: it starts one
+     whenever the policy grants jobs (evaluation batches, generation passes,
+     or probes).
    * An SDK-backed agent (``AgentConfig``, the OpenAI Agents SDK adapter in
      M1) runs its own complete tool loop against ``wse serve`` bound to the
      run grant. That server process is the sole job-scheduler owner; the
@@ -21,13 +23,15 @@ drives one trial on an operator-prepared workspace:
      normalized events, persists them, and checks stop conditions.
 
 3. **Stop conditions** are read from authoritative WSE state after every
-   operation: a budget error (insufficient budget for the next operation),
-   the selected checkpoint's full development evaluation meeting the task's
-   target, 3 consecutive evaluated candidates without improvement, or 3
-   consecutive policy denials (bounded_eval); the single permitted candidate
-   committed and selected (weights_only, which uses no development-score
-   threshold); and the controller stopping voluntarily. A met condition
-   cancels the controller.
+   operation: a budget error (insufficient budget for the next operation,
+   including no candidate commits left while no development evaluation, by
+   evaluation batches or generation passes, remains), the selected
+   checkpoint's full development evaluation meeting the task's target, 3
+   consecutive evaluated candidates without improvement, or 3 consecutive
+   policy denials (bounded_eval); the single permitted candidate committed
+   and selected (weights_only, which uses no development-score threshold);
+   and the controller stopping voluntarily. A met condition cancels the
+   controller.
 4. **Finalize after the controller exits.** The runner cancels and settles
    every outstanding job (recovering jobs whose worker was lost), then
    freezes the selected checkpoint, while an SDK adapter's MCP server stays
@@ -96,7 +100,9 @@ from wse.strategies.base import STRATEGY_TOOLS, Action, Observation
 
 __all__ = [
     "EVALUATION_TOOLS",
+    "JOB_TOOLS",
     "OPERATOR_INTERRUPT",
+    "PROBE_TOOLS",
     "TEST_DOUBLE_PREFIX",
     "ExperimentExecutor",
     "ReferenceRunner",
@@ -104,7 +110,9 @@ __all__ = [
     "StrategyConfig",
     "allowed_tools",
     "initial_message",
+    "jobs_available",
     "parse_controller_config",
+    "probes_available",
     "render_instructions",
     "render_trials_markdown",
     "run_experiment",
@@ -115,6 +123,8 @@ __all__ = [
 logger = logging.getLogger("wse.runner")
 
 EVALUATION_TOOLS = ("wse_submit_evaluation", "wse_get_job", "wse_cancel_job", "wse_compare")
+PROBE_TOOLS = ("wse_probe",)
+JOB_TOOLS = ("wse_get_job", "wse_cancel_job")  # evaluations and probes are both jobs
 NO_IMPROVEMENT_PATIENCE = 3
 POLICY_DENIAL_LIMIT = 3
 TEST_DOUBLE_PREFIX = "wse-test-double:"
@@ -155,10 +165,33 @@ def parse_controller_config(value: Any) -> StrategyConfig | AgentConfig:
 # ---------------------------------------------------------------------------
 
 
+def probes_available(policy: ExperimentPolicy) -> bool:
+    """Whether runs of ``policy`` may probe activations: a ``bounded_eval`` policy that grants probe calls."""
+    return policy.mode == "bounded_eval" and policy.budget.limit("probe_calls") > 0
+
+
+def jobs_available(policy: ExperimentPolicy) -> bool:
+    """Whether runs of ``policy`` submit jobs (evaluations, generation passes, or probes), which a worker runs."""
+    return policy.evaluation_available or probes_available(policy)
+
+
 def allowed_tools(policy: ExperimentPolicy) -> list[str]:
-    """The WSE tools a controller of this policy may use; evaluation tools only when evaluation is permitted."""
-    evaluation = policy.mode == "bounded_eval" and policy.budget.evaluation_batches > 0
-    return [tool for tool in STRATEGY_TOOLS if evaluation or tool not in EVALUATION_TOOLS]
+    """The WSE tools a controller of this policy may use, in ``STRATEGY_TOOLS`` order.
+
+    Evaluation tools when the policy permits development evaluations
+    (evaluation batches or generation passes, ``evaluation_available``),
+    ``wse_probe`` when it grants probes, and the job tools for either.
+    """
+    evaluation, probes = policy.evaluation_available, probes_available(policy)
+
+    def permitted(tool: str) -> bool:
+        if tool in PROBE_TOOLS:
+            return probes
+        if tool in JOB_TOOLS:
+            return evaluation or probes
+        return evaluation or tool not in EVALUATION_TOOLS
+
+    return [tool for tool in STRATEGY_TOOLS if permitted(tool)]
 
 
 def _gate_text(gate: Any) -> str:
@@ -173,7 +206,11 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
                         tools: Sequence[str]) -> str:
     """Agent instructions built only from the task definition, the policy, and the run's IDs and tools."""
     budget, operations = policy.budget, policy.operations
-    evaluation = policy.mode == "bounded_eval" and budget.evaluation_batches > 0
+    bounded = policy.mode == "bounded_eval"
+    batches = bounded and budget.evaluation_batches > 0
+    passes = bounded and budget.limit("generation_passes") > 0
+    probes = probes_available(policy)
+    evaluation = batches or passes
     lines = [
         "You control one managed weight-space engineering experiment through the WSE tools listed below. They are "
         "your only tools: you cannot run code, read files, or use the network.",
@@ -197,9 +234,17 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
               f"- patch previews: {budget.patch_previews}",
               f"- tensor analyses: {budget.analysis_calls}",
               f"- tensor reads: {budget.tensor_read_calls}"]
-    if evaluation:
+    if batches:
         lines += [f"- development evaluation batches: {budget.evaluation_batches}, at most "
                   f"{budget.examples_per_batch} examples each and {budget.evaluated_examples} examples in total"]
+    if passes:
+        lines += [f"- generation passes: {budget.generation_passes}, each at most "
+                  f"{budget.problems_per_generation_pass} problems and {budget.new_tokens_per_output} new tokens per "
+                  f"output; {budget.generated_tokens} generated tokens in total"]
+    if probes:
+        lines += [f"- probe calls: {budget.probe_calls}, each at most {budget.texts_per_probe_call} texts of at most "
+                  f"{budget.tokens_per_probe_text} tokens; {budget.teacher_forced_tokens} teacher-forced tokens in "
+                  "total"]
     lines += [f"- computation time: {budget.compute_seconds:g} s in total, at most {budget.seconds_per_operation:g} s "
               "per operation",
               "Consumed allowance is never refunded; every result reports usage and the remaining budget.",
@@ -208,26 +253,40 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
               f"{operations.limits.max_read_elements} elements; a patch has at most "
               f"{operations.limits.max_patch_operations} operations.",
               "",
-              "How to work:",
-              "1. Call wse_get_experiment with the experiment ID for the task, budget, permitted operations, "
-              "development suites, and checkpoints.",
-              "2. Gather evidence with wse_inspect_model, wse_read_tensor, and wse_analyze on the experiment's "
-              "checkpoints.",
-              "3. Propose an edit with wse_preview_patch (base_checkpoint_id, a hypothesis of one or two sentences "
-              "stating the observable evidence, and the operations), then create a candidate with wse_apply_patch "
-              "by patch_id."]
+              "How to work:"]
+    steps = ["Call wse_get_experiment with the experiment ID for the task, budget, permitted operations, development "
+             "suites, and checkpoints.",
+             "Gather evidence with wse_inspect_model, wse_read_tensor, and wse_analyze on the experiment's "
+             "checkpoints."]
+    if probes:
+        steps.append("Probe activations with wse_probe: texts (outputs of your generation passes by their output_uri, "
+                     "strings, or items of a development suite), sites (residual:<i>, <module path>:input or :output, "
+                     "or a role site such as {\"role\": \"mlp.down\", \"layer\": 0, \"point\": \"input\"}), "
+                     "and optionally two groups of text indices for a contrast; wait for its job with wse_get_job. "
+                     "Its vectors are references (<result_uri>#/sites/<i>/contrast/direction) that wse_analyze and "
+                     "wse_preview_patch accept.")
+    steps.append("Propose an edit with wse_preview_patch (base_checkpoint_id, a hypothesis of one or two sentences "
+                 "stating the observable evidence, and the operations), then create a candidate with wse_apply_patch "
+                 "by patch_id.")
     if evaluation:
-        lines.append("4. Evaluate checkpoints with wse_submit_evaluation on a development suite with a preregistered "
-                     "eval_config (sample_count, seed), wait with wse_get_job (wait_seconds up to 10), and compare "
-                     "two reports with wse_compare.")
-    else:
-        lines.append("4. Development evaluation is not available in this mode: no forward pass of the model is "
+        text = ("Evaluate checkpoints with wse_submit_evaluation on a development suite with a preregistered "
+                "eval_config (sample_count, seed), wait with wse_get_job (wait_seconds up to 10), and compare two "
+                "reports with wse_compare.")
+        if passes:
+            text += (" A generation suite's report gives every output's grade, length, whether it reached the token "
+                     "limit, the end of its text, and its output_uri.")
+        steps.append(text)
+    elif policy.mode == "weights_only":
+        steps.append("Development evaluation is not available in this mode: no forward pass of the model is "
                      f"permitted, and the policy allows {budget.candidate_commits} candidate commit(s).")
-    lines += ["5. Select a checkpoint with wse_select_checkpoint, passing the currently selected ID as "
+    else:
+        steps.append("Development evaluation is not available: the policy grants no evaluation batches or "
+                     "generation passes.")
+    steps += ["Select a checkpoint with wse_select_checkpoint, passing the currently selected ID as "
               "expected_selected_id; selecting an earlier checkpoint rolls back.",
-              "6. When you are done, reply with a short final message and no tool call. The selected checkpoint is "
-              "then frozen for a separate final evaluation that you cannot see.",
-              ""]
+              "When you are done, reply with a short final message and no tool call. The selected checkpoint is "
+              "then frozen for a separate final evaluation that you cannot see."]
+    lines += [f"{number}. {step}" for number, step in enumerate(steps, start=1)] + [""]
     if evaluation:
         lines.append(f"The run also ends automatically once a full development evaluation of the selected checkpoint "
                      f"meets the target, after {NO_IMPROVEMENT_PATIENCE} consecutive evaluated candidates without "
@@ -291,8 +350,10 @@ class ExperimentExecutor:
                                                                                               checkpoint_id),
             "wse_read_tensor": lambda experiment_id, checkpoint_id, tensor, selection: e.read_model_tensor(
                 experiment_id, checkpoint_id, tensor, selection),
-            "wse_analyze": lambda experiment_id, checkpoint_id, kind, tensor, selection, k=None: e.analyze_model(
-                experiment_id, checkpoint_id, kind, tensor, selection, k),
+            "wse_analyze": lambda experiment_id, checkpoint_id, kind, tensor, selection, k=None, parameters=None:
+                e.analyze_model(experiment_id, checkpoint_id, kind, tensor, selection, k, parameters=parameters),
+            "wse_probe": lambda experiment_id, checkpoint_id, texts, sites, idempotency_key, groups=None, top=None:
+                e.submit_probe(experiment_id, checkpoint_id, texts, sites, idempotency_key, groups=groups, top=top),
             "wse_preview_patch": lambda experiment_id, patch_spec, idempotency_key: e.preview_patch(
                 experiment_id, patch_spec, idempotency_key),
             "wse_apply_patch": lambda experiment_id, patch_id, idempotency_key: e.apply_patch(
@@ -364,8 +425,9 @@ class StopMonitor:
                     experiment.selected_checkpoint_id != experiment.base_checkpoint_id:
                 return "candidate_committed: the single permitted candidate is committed and selected"
             return None
-        if budget["candidate_commits"].remaining <= 0 and budget["evaluation_batches"].remaining <= 0:
-            return "insufficient_budget: no candidate commits or evaluation batches remain"
+        if budget["candidate_commits"].remaining <= 0 and not self._evaluations_remain(budget):
+            return ("insufficient_budget: no candidate commits remain, and no development evaluation (evaluation "
+                    "batches or generation passes)")
         reports = self._full_development_reports()
         if any(r.checkpoint_id == experiment.selected_checkpoint_id and r.target_met for r in reports):
             return "target_met: a full development evaluation of the selected checkpoint meets the target"
@@ -373,6 +435,14 @@ class StopMonitor:
         if streak >= NO_IMPROVEMENT_PATIENCE:
             return f"no_improvement: {streak} consecutive evaluated candidates showed no improvement"
         return None
+
+    @staticmethod
+    def _evaluations_remain(budget: Mapping[str, BudgetEntry]) -> bool:
+        """Whether a development evaluation remains: an evaluation batch, or a generation pass with tokens."""
+        if budget["evaluation_batches"].remaining > 0:
+            return True
+        passes, tokens = budget.get("generation_passes"), budget.get("generated_tokens")
+        return passes is not None and tokens is not None and passes.remaining > 0 and tokens.remaining > 0
 
     def _full_development_reports(self) -> list[Any]:
         task = self.task
@@ -402,8 +472,16 @@ class StopMonitor:
         return streak
 
 
-def _action_shortfall(action: Action, budget: Mapping[str, BudgetEntry]) -> str | None:
-    """The counter the next action cannot afford, from the remaining budget (or ``None``)."""
+def _action_shortfall(action: Action, budget: Mapping[str, BudgetEntry], *, generation: bool = False,
+                      tokens_per_probe_text: int | None = None) -> str | None:
+    """The counter the next action cannot afford, from the remaining budget (or ``None``).
+
+    ``generation`` marks a ``wse_submit_evaluation`` of a generation suite,
+    which needs a generation pass and generated tokens instead of evaluation
+    batches and examples. A probe needs a probe call and, with
+    ``tokens_per_probe_text`` (the policy's), the teacher-forced tokens its
+    texts reserve.
+    """
     needs: dict[str, float] = {}
     arguments = action.arguments
     if action.tool == "wse_preview_patch":
@@ -414,13 +492,21 @@ def _action_shortfall(action: Action, budget: Mapping[str, BudgetEntry]) -> str 
         needs["tensor_read_calls"] = 1
     elif action.tool == "wse_analyze":
         needs["analysis_calls"] = 1
+    elif action.tool == "wse_submit_evaluation" and generation:
+        needs["generation_passes"] = 1
+        needs["generated_tokens"] = 1
     elif action.tool == "wse_submit_evaluation":
         config = arguments.get("eval_config") if isinstance(arguments.get("eval_config"), Mapping) else {}
         needs["evaluation_batches"] = 1
         needs["evaluated_examples"] = config.get("sample_count", 1) if isinstance(config.get("sample_count"),
                                                                                     int) else 1
+    elif action.tool == "wse_probe":
+        texts = arguments.get("texts")
+        count = len(texts) if isinstance(texts, list) and texts else 1
+        needs["probe_calls"] = 1
+        needs["teacher_forced_tokens"] = count * (tokens_per_probe_text or 1)
     if action.tool in ("wse_inspect_model", "wse_read_tensor", "wse_analyze", "wse_preview_patch", "wse_apply_patch",
-                       "wse_submit_evaluation"):
+                       "wse_submit_evaluation", "wse_probe"):
         needs["compute_seconds"] = 1e-9
     for counter, amount in needs.items():
         entry = budget.get(counter)
@@ -428,6 +514,25 @@ def _action_shortfall(action: Action, budget: Mapping[str, BudgetEntry]) -> str 
             return (f"insufficient_budget: {action.tool} needs {counter}, which has {entry.remaining:g} "
                     "remaining")
     return None
+
+
+def _generation_submission(engine: Engine, action: Action) -> bool:
+    """Whether ``action`` submits an evaluation of a generation suite the run may see (a generation pass)."""
+    if action.tool != "wse_submit_evaluation":
+        return False
+    try:
+        return engine.jobs.generates_text(engine.get_suite(action.arguments.get("suite_id")))
+    except WSEError:
+        return False  # the submission itself reports the suite's error
+
+
+def _probe_tokens(policy: ExperimentPolicy | None) -> int | None:
+    """The teacher-forced tokens a probe reserves per text under ``policy``."""
+    from wse.probes import MAX_PROBE_TOKENS
+
+    if policy is None or not probes_available(policy):
+        return None
+    return min(policy.budget.limit("tokens_per_probe_text"), MAX_PROBE_TOKENS)
 
 
 # ---------------------------------------------------------------------------
@@ -650,13 +755,13 @@ class ReferenceRunner:
                                tracing={"sdk_tracing": "not applicable: no agent SDK runs"})
             monitor = StopMonitor(operator, eid, task)
             trace = _Trace(operator, eid)
-            if policy.mode == "bounded_eval" and policy.budget.evaluation_batches > 0:
+            if jobs_available(policy):
                 worker_args = [arg for spec in self.setup for arg in ("--setup", spec)] + list(self.worker_args)
                 supervisor = WorkerSupervisor(self.workspace, extra_args=worker_args).start()
             try:
                 try:
                     result, stop = self._strategy_loop(strategy, eid, task, config, tools, monitor, trace, run_id,
-                                                       interrupt)
+                                                       interrupt, policy)
                 except Exception as exc:  # noqa: BLE001 - a failure inside the runner still settles and freezes
                     logger.exception("strategy run failed")
                     result, stop = AgentRunResult(status="error", reason=describe_exception(exc)), None
@@ -672,7 +777,8 @@ class ReferenceRunner:
 
     def _strategy_loop(self, strategy: Any, eid: str, task: TaskDefinition, config: StrategyConfig,
                        tools: Sequence[str], monitor: StopMonitor, trace: _Trace, run_id: str,
-                       interrupt: _OperatorInterrupt) -> tuple[AgentRunResult, str | None]:
+                       interrupt: _OperatorInterrupt, policy: ExperimentPolicy | None = None
+                       ) -> tuple[AgentRunResult, str | None]:
         started = time.monotonic()
         trace.emit("run_started", details={"strategy": f"{strategy.strategy_id}@{strategy.version}",
                                            "max_steps": config.max_steps,
@@ -721,7 +827,8 @@ class ReferenceRunner:
                     status, reason = "completed", f"the strategy stopped: {action.reason}"
                     trace.emit("message", output=action.reason)
                     break
-                shortfall = _action_shortfall(action, budget)
+                shortfall = _action_shortfall(action, budget, generation=_generation_submission(bound, action),
+                                              tokens_per_probe_text=_probe_tokens(policy))
                 if shortfall is not None:
                     status, reason = "stopped", shortfall
                     stop = shortfall

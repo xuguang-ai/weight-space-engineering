@@ -20,6 +20,22 @@ Rules implemented here (Sections 3, 4.1, 4.3, 6.2, and 7.2 of the plan):
   settles the tokens it generated. A pass's size comes from the suite's
   parameters and the model's profile, so submission never reads the
   problems, which stay in evaluator storage.
+* ``submit_probe`` queues a probe (M2 plan Section 5.3; ``wse.probes``,
+  **Managed probes**) of a checkpoint the experiment owns. It needs an OPEN
+  ``bounded_eval`` experiment whose policy grants probes, a checkpoint whose
+  adapter declares ``probe.hidden_states``, at most
+  ``texts_per_probe_call`` texts, sites that resolve against the
+  checkpoint's manifest (residual boundaries, canonical module paths, and
+  role sites through the family descriptor), and an inline summary that
+  can fit the policy's response limit. Text sources are checked before
+  anything is reserved: an output URI must name a generation output that
+  this experiment owns (any other URI fails exactly like one that does not
+  exist), and a suite item must be an item of a development generation
+  suite of the run's task (a final suite is refused as its evaluation is).
+  It reserves one ``probe_calls``, texts x ``tokens_per_probe_text``
+  ``teacher_forced_tokens`` (the most its forwards can read), and its
+  compute seconds; the worker settles the forward lengths it read. Retries
+  and conflicts follow the same idempotency rules as evaluations.
 * ``get_job`` can hold the call for up to 10 seconds until the job is
   terminal, so polling does not consume agent turns.
 * ``cancel_job`` releases a queued job's whole reservation. For a running job
@@ -32,9 +48,9 @@ Rules implemented here (Sections 3, 4.1, 4.3, 6.2, and 7.2 of the plan):
   reservation charged and is never rerun automatically. Lost jobs are settled
   when an engine opens, before a worker claims work, and before new jobs are
   accepted.
-* Settled usage leaves no field silently empty: counters an evaluation job
-  never uses are 0, and a field that cannot be measured is ``None`` with the
-  reason in ``Usage.unavailable``.
+* Settled usage leaves no field silently empty: counters a job never uses
+  are 0, and a field that cannot be measured is ``None`` with the reason in
+  ``Usage.unavailable``.
 """
 
 from __future__ import annotations
@@ -55,6 +71,7 @@ from wse.budget import budget_error
 from wse.database import utc_now
 from wse.experiments import _check_key, _hashable
 from wse.schemas import (
+    MAX_PROBE_STRING_CHARACTERS,
     OBJECT_ID_PATTERNS,
     TERMINAL_JOB_STATES,
     DomainError,
@@ -62,8 +79,15 @@ from wse.schemas import (
     EvalConfig,
     EvaluationReport,
     EvaluationSuite,
+    GenerationOutput,
     Job,
     JobProgress,
+    ModelManifest,
+    ProbeGroups,
+    ProbeOutputText,
+    ProbeRoleSite,
+    ProbeStringText,
+    ProbeSuiteText,
     TextDatasetManifest,
     TextSuiteData,
     Usage,
@@ -91,25 +115,31 @@ def _wait_seconds(value: Any) -> float:
     return float(value)
 
 
+# The ledger counters that jobs charge: evaluations, generation passes, and probes, each 0 unless the job uses it.
+JOB_COUNTERS = ("evaluation_batches", "evaluated_examples", "model_forward_calls", "generation_passes",
+                "generated_tokens", "probe_calls", "teacher_forced_tokens")
+
+
+def job_counters() -> dict[str, int]:
+    """Zero for every ledger counter a job may charge (``JOB_COUNTERS``)."""
+    return dict.fromkeys(JOB_COUNTERS, 0)
+
+
 def unused_counters() -> dict[str, int]:
-    """Zero for the ledger counters that no evaluation job charges: synchronous operations' and probes'."""
-    return {"analysis_calls": 0, "tensor_read_calls": 0, "candidate_commits": 0, "patch_previews": 0,
-            "probe_calls": 0, "teacher_forced_tokens": 0}
+    """Zero for the ledger counters that no job charges: those of synchronous operations."""
+    return {"analysis_calls": 0, "tensor_read_calls": 0, "candidate_commits": 0, "patch_previews": 0}
 
 
 def queued_cancel_usage() -> Usage:
     """Usage of a job cancelled before any worker started it."""
-    return Usage(evaluation_batches=0, evaluated_examples=0, model_forward_calls=0, compute_seconds=0.0,
-                 generation_passes=0, generated_tokens=0, **unused_counters(), artifact_bytes=0,
-                 peak_memory_bytes=None,
+    return Usage(**job_counters(), compute_seconds=0.0, **unused_counters(), artifact_bytes=0, peak_memory_bytes=None,
                  unavailable={"peak_memory_bytes": "no worker executed this job, so no memory was measured"})
 
 
 def lost_job_usage(requested: Mapping[str, Any]) -> Usage:
     """Usage charged for a lost job: its whole reservation, with unmeasured fields explained."""
     return Usage.model_validate({
-        "evaluation_batches": 0, "evaluated_examples": 0, "model_forward_calls": 0, "compute_seconds": 0.0,
-        "generation_passes": 0, "generated_tokens": 0,
+        **job_counters(), "compute_seconds": 0.0,
         **requested,
         **unused_counters(), "artifact_bytes": 0,
         "peak_memory_bytes": None,
@@ -139,8 +169,122 @@ def lost_job_error() -> WSEError:
     )
 
 
+def _text_source(text: Mapping[str, Any]) -> str:
+    """The kind of a stored probe text: ``output``, ``text``, or ``suite_item``."""
+    return "output" if "output_uri" in text else ("text" if "text" in text else "suite_item")
+
+
+def _decoder_layer_count(manifest: ModelManifest, registry: Any) -> int | None:
+    """The number of decoder layers in the manifest's configuration, or ``None`` when it does not say."""
+    from wse.adapters.families import model_family
+
+    config = manifest.config.get("model_config")
+    if not isinstance(config, Mapping):
+        return None
+    family = model_family(manifest, registry=registry)
+    if family is not None and family.text_config_key and isinstance(config.get(family.text_config_key), Mapping):
+        config = config[family.text_config_key]
+    for key in ("num_hidden_layers", "n_layer"):
+        value = config.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 1:
+            return value
+    return None
+
+
+def _probe_sites(manifest: ModelManifest, sites: Any, registry: Any, limit: int) -> list[dict[str, Any]]:
+    """Each requested site with the canonical site name it resolves to against the manifest (no weight is read).
+
+    Names follow ``wse.probes``; a role site ``{"role", "layer", "point"}``
+    names the input or output of the module that holds the role
+    (``TensorRole.site``). The worker checks again what each site captures.
+    """
+    import difflib
+    import re
+
+    from wse.adapters.families import role_tensor
+    from wse.probes import CAPTURE_POINTS, MAX_SITE_CANDIDATES, canonical_module_paths
+
+    if isinstance(sites, (str, bytes, Mapping)) or not isinstance(sites, (list, tuple)) or not sites:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, "sites must be a non-empty list of site names ('residual:<i>', "
+                       "'<canonical module path>:input' or ':output') or role sites {\"role\", \"layer\", \"point\"}")
+    if len(sites) > limit:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, f"a probe reads at most {limit} sites, not {len(sites)}",
+                       details={"sites": len(sites)})
+    layers = _decoder_layer_count(manifest, registry)
+    paths: dict[str, str] | None = None
+    resolved = []
+    for index, site in enumerate(sites):
+        if isinstance(site, Mapping):
+            try:
+                role = ProbeRoleSite.model_validate(dict(site))
+            except (ValidationError, TypeError, ValueError):
+                raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                               f"site {index} must be a name or a role site {{\"role\": \"mlp.down\", \"layer\": "
+                               "15, \"point\": \"input\" or \"output\"}} (no layer for embed, lm_head, and "
+                               "final_norm)", details={"site": index}) from None
+            name = f"{role_tensor(manifest, role.role, role.layer, registry=registry).site}:{role.point}"
+            resolved.append({"site": name, "requested": role.model_dump(mode="json")})
+            continue
+        if not isinstance(site, str) or not site:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, f"site {index} must be a site name or a role site",
+                           details={"site": index})
+        residual = re.fullmatch(r"residual:(0|[1-9][0-9]*)", site)
+        if residual:
+            if layers is not None and int(residual.group(1)) > layers:
+                raise WSEError(ErrorCode.NOT_FOUND,
+                               f"site {site!r} does not exist: the model has {layers} decoder layers, so residual "
+                               f"sites run from residual:0 to residual:{layers}",
+                               details={"site": site, "candidates": [f"residual:{layers}"]})
+            resolved.append({"site": site, "requested": site})
+            continue
+        path, colon, point = site.rpartition(":")
+        if not colon or not path or point not in CAPTURE_POINTS:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                           f"site {site[:200]!r} is neither 'residual:<layer boundary>' nor '<canonical module "
+                           "path>:input' or ':output'", details={"site": index})
+        paths = paths if paths is not None else canonical_module_paths(manifest.tensors)
+        if path not in paths:
+            candidates = difflib.get_close_matches(path, list(paths), n=MAX_SITE_CANDIDATES, cutoff=0.0)
+            raise WSEError(ErrorCode.NOT_FOUND,
+                           f"site {site[:200]!r} names no module: a module path is a dotted prefix of canonical "
+                           f"tensor names; the closest are {candidates[:3]}",
+                           details={"site": index, "candidates": candidates})
+        resolved.append({"site": site, "requested": site})
+    names = [site["site"] for site in resolved]
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, f"sites {repeated[:10]} are requested more than once",
+                       details={"sites": repeated[:10]})
+    return resolved
+
+
+def _probe_groups(groups: Any, count: int) -> dict[str, list[int]] | None:
+    """Checked groups of text indices: disjoint, non-empty, within the texts, and at least three texts together."""
+    if groups is None:
+        return None
+    try:
+        parsed = ProbeGroups.model_validate(dict(groups)) if isinstance(groups, Mapping) else None
+    except (ValidationError, TypeError, ValueError):
+        parsed = None
+    if parsed is None:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, "groups must be {\"a\": [text indices], \"b\": [text indices]}, "
+                       "two non-empty lists of integers")
+    for name, indices in (("a", parsed.a), ("b", parsed.b)):
+        if any(not 0 <= index < count for index in indices) or len(set(indices)) != len(indices):
+            raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                           f"group {name} must list distinct text indices in [0, {count})", details={"group": name})
+    shared = sorted(set(parsed.a) & set(parsed.b))
+    if shared:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, f"the groups share texts {shared[:10]}; a contrast compares "
+                       "disjoint groups", details={"shared": shared[:10]})
+    if len(parsed.a) + len(parsed.b) < 3:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, "the groups need at least three texts together, so that the pooled "
+                       "standard deviation of a contrast has a degree of freedom")
+    return {"a": list(parsed.a), "b": list(parsed.b)}
+
+
 class JobService:
-    """Evaluation jobs of an ``Engine``, scoped like its experiment service."""
+    """Evaluation and probe jobs of an ``Engine``, scoped like its experiment service."""
 
     def __init__(self, engine: Engine) -> None:
         self.engine = engine
@@ -296,7 +440,8 @@ class JobService:
             raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"stored suite {suite_id} does not match its hash")
         return suite
 
-    def _development_suite(self, suite_id: Any, task_id: str) -> EvaluationSuite:
+    def _development_suite(self, suite_id: Any, task_id: str, *,
+                           use: str = "agents may evaluate development suites only") -> EvaluationSuite:
         try:
             suite = self._read_suite(suite_id)
         except WSEError as exc:
@@ -310,8 +455,8 @@ class JobService:
         if suite.split != "development":
             raise WSEError(
                 ErrorCode.POLICY_DENIED,
-                f"suite {suite.suite_id} is not a development suite; agents may evaluate development suites only, "
-                "and final evaluation is an operator action after freezing",
+                f"suite {suite.suite_id} is not a development suite; {use}, and final evaluation is an operator "
+                "action after freezing",
                 details={"suite_id": suite.suite_id},
             )
         return suite
@@ -460,6 +605,190 @@ class JobService:
         return ({"generation_passes": 1, "generated_tokens": size.max_generated_tokens},
                 -(-size.outputs // DEFAULT_BATCH_SIZE))
 
+    # -- probes -------------------------------------------------------------------
+
+    def submit_probe(self, experiment_id: str, checkpoint_id: str, texts: Any, sites: Any, key: str, *,
+                     groups: Any = None, top: Any = None) -> Job:
+        """Queue a probe of a checkpoint the experiment owns and return the job immediately (module docstring).
+
+        ``texts`` are ``{"output_uri": ..., "last": n (optional)}``,
+        ``{"text": ...}``, or ``{"suite_id": ..., "item": i}``; ``sites`` are
+        site names (``residual:<i>``, ``<canonical module path>:input`` or
+        ``:output``) or role sites ``{"role", "layer", "point"}``;
+        ``groups`` ``{"a": [...], "b": [...]}`` gives a contrast per site;
+        ``top`` (1-64, default 8) the top standardized dimensions per site in
+        the inline summary. The job's result is that summary
+        (``wse.probes``).
+        """
+        _check_key(key)
+        self.experiments._experiment_row(experiment_id)
+        request_hash = json_hash({"operation": "submit_probe", "checkpoint_id": _hashable(checkpoint_id),
+                                  "texts": _hashable(texts), "sites": _hashable(sites), "groups": _hashable(groups),
+                                  "top": _hashable(top)})
+        recorded = self.experiments._lookup(self.db.conn, experiment_id, key, "submit_probe", request_hash)
+        if recorded is not None:
+            return self._job(experiment_id, json.loads(recorded)["job_id"])
+        return self.experiments._guarded(
+            "job.submit", experiment_id, request_hash, None,
+            lambda: self._submit_probe(experiment_id, checkpoint_id, texts, sites, groups, top, key, request_hash),
+        )
+
+    def _submit_probe(self, experiment_id: str, checkpoint_id: Any, texts: Any, sites: Any, groups: Any, top: Any,
+                      key: str, request_hash: str) -> Job:
+        from wse.adapters.base import CAP_PROBE_HIDDEN_STATES
+
+        self.recover_lost_jobs()
+        row = self.experiments._experiment_row(experiment_id)
+        self.experiments._require_open(row)
+        if row["mode"] != "bounded_eval":
+            raise WSEError(ErrorCode.POLICY_DENIED,
+                           f"probes are unavailable in {row['mode']} mode: the experiment's policy permits no forward "
+                           "passes of the target network", details={"mode": row["mode"]})
+        self.experiments._owned_checkpoint(self.db.conn, experiment_id, checkpoint_id)
+        policy = self.experiments.experiment_policy(experiment_id)
+        if policy.budget.limit("probe_calls") < 1:
+            raise WSEError(ErrorCode.POLICY_DENIED,
+                           f"the experiment's policy {policy.policy_id} permits no probes",
+                           details={"policy_id": policy.policy_id})
+        manifest = self.engine.store.load_manifest(checkpoint_id)
+        if not self.engine._capabilities(manifest).supports(CAP_PROBE_HIDDEN_STATES):
+            raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY,
+                           f"checkpoint {checkpoint_id} ({manifest.adapter}) cannot be probed: its adapter does not "
+                           f"support {CAP_PROBE_HIDDEN_STATES}",
+                           details={"checkpoint_id": checkpoint_id, "adapter": str(manifest.adapter),
+                                    "missing_capabilities": [CAP_PROBE_HIDDEN_STATES]})
+        request = self.probe_request(experiment_id, row["task_id"], manifest, policy, texts, sites, groups, top)
+        count = len(request["texts"])
+        planned = {"probe_calls": 1, "teacher_forced_tokens": count * request["tokens_per_text"]}
+        job_id = _new_id("job")
+        with self.db.transaction() as conn:
+            again = self.experiments._lookup(conn, experiment_id, key, "submit_probe", request_hash)
+            if again is not None:
+                job_id = json.loads(again)["job_id"]
+            else:
+                self.experiments._require_open(self.experiments._experiment_row(experiment_id, conn))
+                compute = min(policy.budget.seconds_per_operation,
+                              self.ledger.remaining(conn, experiment_id, "compute_seconds"))
+                if compute <= 0:
+                    raise budget_error(conn, experiment_id, "compute_seconds", policy.budget.seconds_per_operation)
+                reservation = self.ledger.reserve(experiment_id, job_id, {**planned, "compute_seconds": compute},
+                                                  conn=conn)
+                conn.execute(
+                    "INSERT INTO jobs (job_id, experiment_id, kind, checkpoint_id, suite_id, config_json, state, "
+                    "reservation_id, progress_json, created_at) VALUES (?, ?, 'probe', ?, NULL, ?, 'queued', ?, ?, ?)",
+                    (job_id, experiment_id, checkpoint_id, canonical_json(request), reservation.reservation_id,
+                     JobProgress(batches_total=count).canonical_json(), utc_now()),
+                )
+                record_event(conn, "job.submitted", job_id,
+                             {"kind": "probe", "checkpoint_id": checkpoint_id, "texts": count,
+                              "sources": sorted({_text_source(text) for text in request["texts"]}),
+                              "sites": [site["site"] for site in request["sites"]],
+                              "groups": None if request["groups"] is None else
+                              {name: len(indices) for name, indices in request["groups"].items()},
+                              "reservation_id": reservation.reservation_id, "requested": reservation.requested},
+                             experiment_id=experiment_id)
+                self.experiments._remember(conn, experiment_id, key, "submit_probe", request_hash,
+                                           canonical_json({"job_id": job_id}))
+        return self._job(experiment_id, job_id)
+
+    def probe_request(self, experiment_id: str, task_id: str, manifest: ModelManifest, policy: Any, texts: Any,
+                      sites: Any, groups: Any, top: Any) -> dict[str, Any]:
+        """The checked, normalized request of a probe: its texts, resolved sites, groups, summary size, and limit.
+
+        Every check that needs no forward runs here, before anything is
+        reserved; the worker checks again what it reads.
+        """
+        from wse.probes import DEFAULT_SUMMARY_TOP, MAX_PROBE_SITES, MAX_PROBE_TOKENS, MAX_SUMMARY_TOP, \
+            PROBE_JOB_BYTES, summary_size_bound
+
+        budget = policy.budget
+        if isinstance(texts, (str, bytes, Mapping)) or not isinstance(texts, (list, tuple)) or not texts:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, "texts must be a non-empty list of texts, each "
+                           "{\"output_uri\": ...}, {\"text\": ...}, or {\"suite_id\": ..., \"item\": ...}")
+        cap = budget.limit("texts_per_probe_call")
+        if len(texts) > cap:
+            raise WSEError(ErrorCode.POLICY_DENIED,
+                           f"a probe teacher-forces at most {cap} texts under the experiment's policy, not {len(texts)}",
+                           details={"texts_per_probe_call": cap, "texts": len(texts)})
+        parsed = [self._probe_text(experiment_id, task_id, index, text) for index, text in enumerate(texts)]
+        resolved = _probe_sites(manifest, sites, self.engine.registry, MAX_PROBE_SITES)
+        shown_groups = _probe_groups(groups, len(parsed))
+        if top is None:
+            top = DEFAULT_SUMMARY_TOP
+        elif isinstance(top, bool) or not isinstance(top, int) or not 1 <= top <= MAX_SUMMARY_TOP:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, f"top must be an integer from 1 to {MAX_SUMMARY_TOP}")
+        tokens_per_text = min(budget.limit("tokens_per_probe_text"), MAX_PROBE_TOKENS)
+        if tokens_per_text < 2:
+            raise WSEError(ErrorCode.POLICY_DENIED, "the experiment's policy permits probe texts of fewer than 2 "
+                           "tokens, which hold no scored window", details={"tokens_per_probe_text": tokens_per_text})
+        limit = policy.operations.limits.max_result_json_bytes - PROBE_JOB_BYTES
+        bounds = summary_size_bound(texts=len(parsed), sites=[site["site"] for site in resolved],
+                                    grouped=shown_groups is not None, tokens_per_text=tokens_per_text)
+        if bounds[-1] > limit:
+            fitting = max([count for count, size in enumerate(bounds) if size <= limit], default=0)
+            raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                           f"the inline summary of {len(parsed)} texts at {len(resolved)} sites could exceed the "
+                           f"{limit}-byte inline-result limit of the experiment's policy; probe at most {fitting} "
+                           "such sites, or fewer texts",
+                           details={"limit_bytes": limit, "texts": len(parsed), "sites": len(resolved),
+                                    "max_sites": fitting})
+        return {"texts": parsed, "sites": resolved, "groups": shown_groups, "top": top,
+                "tokens_per_text": tokens_per_text}
+
+    def _probe_text(self, experiment_id: str, task_id: str, index: int, text: Any) -> dict[str, Any]:
+        """One checked probe text, as stored in the request."""
+        models = (ProbeOutputText, ProbeStringText, ProbeSuiteText)
+        parsed = None
+        if isinstance(text, Mapping):
+            for model in models:
+                try:
+                    parsed = model.model_validate(dict(text))
+                    break
+                except (ValidationError, TypeError, ValueError):
+                    continue
+        if parsed is None:
+            raise WSEError(
+                ErrorCode.INVALID_ARGUMENT,
+                f"text {index} must be exactly one of {{\"output_uri\": \"wse://analyses/<sha256>\", \"last\": n}} (an "
+                "output of this run's generation passes), {\"text\": \"...\"} (1 to "
+                f"{MAX_PROBE_STRING_CHARACTERS} characters), or "
+                "{\"suite_id\": \"...\", \"item\": i} (an item of a development suite of this run's task)",
+                details={"text": index})
+        if isinstance(parsed, ProbeOutputText):
+            output = self.probe_output(experiment_id, parsed.output_uri, index)
+            del output  # checked here; the worker reads it again
+        elif isinstance(parsed, ProbeSuiteText):
+            suite = self._development_suite(parsed.suite_id, task_id,
+                                            use="probes read items of development suites only")
+            if not self.generates_text(suite):
+                raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                               f"text {index}: suite {suite.suite_id} is not a generation suite; a suite item is probed "
+                               "as the prompt a generation pass renders", details={"text": index})
+            if parsed.item >= suite.example_count:
+                raise WSEError(ErrorCode.NOT_FOUND,
+                               f"text {index}: suite {suite.suite_id} has {suite.example_count} items, so item "
+                               f"{parsed.item} does not exist", details={"text": index, "items": suite.example_count})
+        return parsed.model_dump(mode="json", exclude_none=True)
+
+    def probe_output(self, experiment_id: str, uri: str, index: int) -> GenerationOutput:
+        """The generation output ``uri`` names, which ``experiment_id`` must own; others fail like missing ones."""
+        try:
+            document = self.experiments.experiment_results(experiment_id)(uri)
+        except WSEError as exc:
+            if exc.code != ErrorCode.NOT_FOUND:
+                raise
+            raise WSEError(ErrorCode.NOT_FOUND, f"text {index}: {exc.message}",
+                           details={"text": index, "uri": uri}) from None
+        if not isinstance(document, Mapping) or document.get("kind") != "generation_output":
+            raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                           f"text {index}: {uri} is a stored result of this run but not a generation output; give "
+                           "the output_uri of a sample of a generation pass's report", details={"text": index})
+        output = GenerationOutput.model_validate(document)
+        if output.experiment_id != experiment_id:
+            raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"text {index}: generation output {uri} names another "
+                           "experiment", details={"text": index})
+        return output
+
     # -- reading ----------------------------------------------------------------
 
     def _job_row(self, conn: sqlite3.Connection, experiment_id: str, job_id: Any) -> sqlite3.Row:
@@ -473,13 +802,14 @@ class JobService:
         return row
 
     def job_from_row(self, row: sqlite3.Row, conn: sqlite3.Connection | None = None) -> Job:
+        """A job from its row; a probe's ``config_json`` holds its request, which the job does not repeat."""
         return Job(
             job_id=row["job_id"],
             experiment_id=row["experiment_id"],
             kind=row["kind"],
             checkpoint_id=row["checkpoint_id"],
             suite_id=row["suite_id"],
-            config=EvalConfig.model_validate_json(row["config_json"]),
+            config=EvalConfig.model_validate_json(row["config_json"]) if row["kind"] == "evaluation" else None,
             state=row["state"],
             cancel_requested=row["cancel_requested_at"] is not None,
             reservation=self.ledger.get(row["reservation_id"], conn),

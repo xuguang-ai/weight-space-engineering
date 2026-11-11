@@ -26,7 +26,14 @@ Rules implemented here (Sections 4.1, 5.1-5.3, and 6.2 of the plan):
   analyses resolve references the same way. Under a policy that sets
   ``refuse_whole_tensor_scaling``, a preview whose net effect scales a
   changed tensor of the experiment's base checkpoint by one constant is
-  refused (``wse.policy.require_no_whole_tensor_scaling``).
+  refused (``_refuse_net_whole_tensor_scaling``). A tensor is checked only
+  when at least two of its elements changed and the changed elements cover
+  its nonzero elements, as a scaling by a constant other than 1 does, so a
+  small change of a few elements is never taken for a scaling. Such a
+  refusal comes after the patch was materialized against the base, and its
+  outcome depends on the base's weights, so it is charged as a preview (one
+  ``patch_previews`` and its compute seconds), stores nothing, and names no
+  factor.
 * ``apply_patch`` accepts only a ``patch_id``, replays the stored materialized
   patch (no editing operator runs), and commits the candidate, its ownership,
   the candidate-commit charge, the idempotent result, and audit events in one
@@ -79,7 +86,7 @@ from wse.policy import (
     LEDGER_COUNTERS,
     ExperimentPolicy,
     builtin_experiment_policies,
-    require_no_whole_tensor_scaling,
+    constant_factor_bounds,
 )
 from wse.schemas import (
     CHECKPOINT_ID_PATTERN,
@@ -156,6 +163,16 @@ def _hashable(value: Any) -> Any:
 
 def _number(value: Any) -> int | float:
     return int(value) if float(value).is_integer() else float(value)
+
+
+def _changes_every_nonzero_element(original: Any, candidate: Any) -> bool:
+    """Whether at least two elements of ``candidate`` differ from ``original`` in their stored bits, and every
+    nonzero element of ``original`` is among them (a scaling by a constant other than 1 changes them all)."""
+    import torch
+
+    width = {1: torch.int8, 2: torch.int16, 4: torch.int32, 8: torch.int64}[original.element_size()]
+    changed = original.contiguous().view(width) != candidate.contiguous().view(width)
+    return int(changed.sum()) >= 2 and bool(changed[original != 0].all())
 
 
 def _candidate_tensor_infos(
@@ -815,7 +832,12 @@ class ExperimentService:
             managed=True,
         )
         if policy.operations.refuse_whole_tensor_scaling:
-            self._refuse_net_whole_tensor_scaling(row, parsed.base_checkpoint_id, base, edit, policy)
+            try:
+                self._refuse_net_whole_tensor_scaling(row, parsed.base_checkpoint_id, base, edit, policy)
+            except WSEError as exc:
+                if exc.code == ErrorCode.POLICY_DENIED:
+                    self._charge_refused_preview(experiment_id, time.perf_counter() - start)
+                raise
         frozen = FrozenPatchSpec(
             base_checkpoint_id=parsed.base_checkpoint_id,
             base_weights_hash=base.weights_hash,
@@ -900,8 +922,11 @@ class ExperimentService:
 
         Each tensor the patch changes is compared with the same tensor of the
         experiment's base checkpoint, not of the patch's base, so that a later
-        candidate cannot complete a scaling that an earlier one began
-        (``require_no_whole_tensor_scaling``).
+        candidate cannot complete a scaling that an earlier one began. A tensor
+        is a scaling candidate only when at least two elements changed and the
+        changed elements cover its nonzero elements; ``constant_factor_bounds``
+        then decides whether one constant other than 1 reproduces it. The
+        refusal names no factor, which the base's weights determine.
         """
         origin = row["base_checkpoint_id"]
         for diff in edit.diff:
@@ -913,7 +938,34 @@ class ExperimentService:
             else:
                 original = self.store.read_slice(origin, diff.tensor,
                                                  tuple(slice(0, size) for size in candidate.shape))
-            require_no_whole_tensor_scaling(policy.operations, diff.tensor, original, candidate)
+            if not _changes_every_nonzero_element(original, candidate):
+                continue
+            bounds = constant_factor_bounds(original, candidate)
+            if bounds is None or bounds[0] <= 1.0 <= bounds[1]:
+                continue
+            raise WSEError(
+                ErrorCode.POLICY_DENIED,
+                f"the patch would leave tensor {diff.tensor!r} {list(candidate.shape)} equal to the experiment's base "
+                "tensor scaled by one factor, which this experiment's operation policy refuses "
+                "(refuse_whole_tensor_scaling): it changes only the tensor's overall scale, whether one operation or "
+                "several, in this patch or with earlier candidates, have that effect. Change a proper part of the "
+                "tensor in a way that is not the same scaling of the whole. The refused preview is charged as a "
+                "preview, because its outcome depends on the base's weights.",
+                details={"tensor": diff.tensor, "shape": list(candidate.shape),
+                         "policy_option": "refuse_whole_tensor_scaling",
+                         "permitted_operations": sorted(policy.operations.edits), "charged": {"patch_previews": 1}},
+            )
+
+    def _charge_refused_preview(self, experiment_id: str, seconds: float) -> None:
+        """Charge a preview refused after it was materialized against the base: one preview and its compute seconds.
+
+        It stores nothing. Without a preview left the charge fails with
+        ``BUDGET_EXCEEDED``, which then replaces the refusal.
+        """
+        with self.db.transaction() as conn:
+            self._require_open(self._experiment_row(experiment_id, conn))
+            self.ledger.charge(conn, experiment_id, "patch_previews", 1)
+            self.ledger.charge_compute(conn, experiment_id, seconds)
 
     def apply_patch(self, experiment_id: str, patch_id: str, key: str) -> ModelManifest:
         """Create a READY candidate from a validated preview, charging one candidate commit."""

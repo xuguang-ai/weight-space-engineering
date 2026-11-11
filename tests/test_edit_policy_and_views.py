@@ -8,6 +8,10 @@
   the inline-result limit; the stored patch keeps the values.
 * An operation policy may refuse edits that scale a whole tensor by one
   constant (``refuse_whole_tensor_scaling``); the option is off by default.
+
+``project_out`` and ``add_low_rank`` need ``weights.direction_edit``, which
+M1's MLP adapter lacks, so the signed-sum weights go through the test adapter
+of ``tests/test_direction_ops.py`` that declares it.
 """
 
 from __future__ import annotations
@@ -18,6 +22,8 @@ import numpy as np
 import pytest
 import torch
 from mcp.server.mcpserver.exceptions import ToolError
+
+from test_direction_ops import TEST_ADAPTER, _registry
 
 from wse.api import Engine, apply_operator
 from wse.mcp_server import WSEMCPServer
@@ -62,7 +68,7 @@ def _consumed(engine, experiment_id, counter):
 def task_model(signed_sum):
     from wse.api import load_model
 
-    return load_model(signed_sum.task_tensors(), "mlp@1", signed_sum.CONFIG)
+    return load_model(signed_sum.task_tensors(), TEST_ADAPTER, signed_sum.CONFIG, registry=_registry())
 
 
 # -- exact references in managed previews ---------------------------------------------------------------------------
@@ -75,9 +81,11 @@ REQUESTS = {
 }
 
 
-def test_managed_previews_run_only_the_edit_operators_their_policy_lists(workspace, bundles, task_model):
-    with Engine(workspace) as operator:
-        base = operator.import_bundle(bundles["task"]).checkpoint_id
+def test_managed_previews_run_only_the_edit_operators_their_policy_lists(workspace, signed_sum, task_model):
+    registry = _registry()
+    with Engine(workspace, registry=registry) as operator:
+        base = operator.import_model({"adapter": TEST_ADAPTER, "config": signed_sum.CONFIG},
+                                     signed_sum.task_tensors()).checkpoint_id
         operator.register_policy(ExperimentPolicy(policy_id="m2_edits_v1", mode="weights_only", operations=EDITS,
                                                   budget={"candidate_commits": 1, **NO_INFERENCE}))
         grants = {policy: operator.grant_run(TASK, policy, base) for policy in (SMALL_MODEL_POLICY_ID, "m2_edits_v1")}
@@ -89,7 +97,7 @@ def test_managed_previews_run_only_the_edit_operators_their_policy_lists(workspa
     # small_model_v1 lists set_slice and scale_slice. An exact reference to any other edit operator is refused like
     # an alias the policy does not list, through the Python SDK and through MCP, and nothing is created or charged.
     grant = grants[SMALL_MODEL_POLICY_ID]
-    with Engine(workspace, run_id=grant.run_id) as bound:
+    with Engine(workspace, run_id=grant.run_id, registry=registry) as bound:
         eid = bound.create_experiment(grant.run_id, TASK, SMALL_MODEL_POLICY_ID, "c").experiment_id
         server = WSEMCPServer(bound)
         for name, request in REQUESTS.items():
@@ -119,7 +127,7 @@ def test_managed_previews_run_only_the_edit_operators_their_policy_lists(workspa
         assert str(listed.operations[0].operator) == "scale_slice@1"
     # A policy that grants the operators accepts their aliases and their exact references alike.
     grant = grants["m2_edits_v1"]
-    with Engine(workspace, run_id=grant.run_id) as bound:
+    with Engine(workspace, run_id=grant.run_id, registry=registry) as bound:
         eid = bound.create_experiment(grant.run_id, TASK, "m2_edits_v1", "c").experiment_id
         for name, request in REQUESTS.items():
             by_alias = bound.preview_patch(eid, spec(name, request), f"alias-{name}")
@@ -156,16 +164,18 @@ def test_patch_views_echo_inline_vectors_by_length_and_hash_within_the_inline_li
     column = [-1.2345678e-05] * rows
     assert len(json.dumps(direction[0])) == len(json.dumps(column[0])) == 14
     weights = torch.from_numpy(np.random.default_rng(0).normal(0.0, 0.02, size=(rows, 2)).astype(np.float32))
-    with Engine(workspace) as operator:
-        base = operator.import_model({"adapter": "mlp@1", "config": {"layer_sizes": [2, rows], "activation": "relu",
-                                                                     "bias": False}}, {W0: weights}).checkpoint_id
+    registry = _registry()
+    with Engine(workspace, registry=registry) as operator:
+        base = operator.import_model({"adapter": TEST_ADAPTER, "config": {"layer_sizes": [2, rows],
+                                                                          "activation": "relu", "bias": False}},
+                                     {W0: weights}).checkpoint_id
         operator.register_policy(ExperimentPolicy(
             policy_id="views_v1", mode="weights_only", operations=EDITS.with_analysis("svd_top_k", "svd_top_k@1"),
             budget={"candidate_commits": 1, **NO_INFERENCE}))
         grant = operator.grant_run("views_task", "views_v1", base)
     full = _sel((0, rows), (0, 2))
     views = {}
-    with Engine(workspace, run_id=grant.run_id) as bound:
+    with Engine(workspace, run_id=grant.run_id, registry=registry) as bound:
         eid = bound.create_experiment(grant.run_id, "views_task", "views_v1", "c").experiment_id
         svd = bound.analyze_model(eid, base, "svd_top_k", W0, full, parameters={"k": 2})
         stored = bound.read_analysis_result(svd.result_uri)
@@ -198,7 +208,7 @@ def test_patch_views_echo_inline_vectors_by_length_and_hash_within_the_inline_li
                                         "v": [summary([0.5, -0.25]), record("/right_vectors/0", right)],
                                         "alpha": 0.5}
     # The stored patch, which only the operator reads whole, keeps every value in its frozen spec and its steps.
-    with Engine(workspace) as operator:
+    with Engine(workspace, registry=registry) as operator:
         artifact = operator.read_patch(eid, views["project_out"][0])
         assert artifact.spec.operations[0].parameters["direction"] == direction
         assert artifact.patch.steps[0].parameters["direction"] == direction

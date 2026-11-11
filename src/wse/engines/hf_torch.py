@@ -17,7 +17,18 @@
   position of a batch of token IDs. ``next_token_logprobs`` is a
   teacher-forced read of one sequence: the log-probability of each of its own
   next tokens, reduced on the device in chunks of ``LOGPROB_CHUNK`` positions,
-  so that only one chunk of the float32 log-softmax exists at a time.
+  so that only one chunk of the float32 log-softmax exists at a time. Where
+  the module accepts ``logits_to_keep`` (every causal LM of the pinned
+  ``transformers`` that WSE tests), it computes the output head only for the
+  positions that score a token, so a read from ``start`` holds ``n - start``
+  rows of vocabulary logits instead of ``n``; while the output head carries
+  forward hooks (a probe site on it), every position is computed, so that the
+  hooks see the head's whole input and output.
+* **One forward at a time.** A runtime serializes its forward passes with a
+  reentrant lock (``exclusive``): ``logits``, ``next_token_logprobs``, and a
+  whole ``generate`` call hold it, and an activation probe
+  (``wse.probes.probe``) holds it from registering its hooks to removing them,
+  so that its hooks never see another thread's forward on the same module.
 * **Positions.** Position IDs come from the attention mask, as
   ``transformers``' ``generate`` derives them: the cumulative sum of the mask
   minus one, with masked positions set to 0, at prefill (and in ``logits``),
@@ -41,7 +52,9 @@ lazily, so this module imports without the ``models-hf`` extra.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping, Sequence
+import threading
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -201,6 +214,7 @@ class HFTorchModel:
     device: torch.device
     _vocab_size: int = field(init=False)
     _logits_to_keep: bool = field(init=False)
+    _lock: Any = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         import inspect
@@ -209,6 +223,26 @@ class HFTorchModel:
         parameters = inspect.signature(self.module.forward).parameters
         self._logits_to_keep = "logits_to_keep" in parameters
         self._position_ids = "position_ids" in parameters
+        self._lock = threading.RLock()
+
+    @property
+    def _forward_lock(self) -> Any:
+        """The runtime's reentrant forward lock; a runtime built without ``__post_init__`` gets one on first use."""
+        lock = self.__dict__.get("_lock")
+        if lock is None:
+            lock = self.__dict__.setdefault("_lock", threading.RLock())
+        return lock
+
+    @contextmanager
+    def exclusive(self) -> Iterator[None]:
+        """Hold the runtime's forward lock (reentrant): no other thread runs a forward on this module meanwhile."""
+        with self._forward_lock:
+            yield
+
+    def _head_hooked(self) -> bool:
+        """Whether the output head carries forward hooks, which must then see every position."""
+        head = self.module.get_output_embeddings()
+        return head is not None and bool(head._forward_hooks or head._forward_pre_hooks)
 
     @property
     def max_positions(self) -> int | None:
@@ -246,7 +280,9 @@ class HFTorchModel:
         return input_ids.cpu(), None if attention_mask is None else attention_mask.cpu()
 
     def _forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None, *, last_only: bool,
-                 position_ids: torch.Tensor | None = None, cache: Any = None, use_cache: bool = False) -> Any:
+                 position_ids: torch.Tensor | None = None, cache: Any = None, use_cache: bool = False,
+                 keep: int | None = None) -> Any:
+        """One forward; ``keep`` computes the output head for the last ``keep`` positions only, where supported."""
         kwargs: dict[str, Any] = {"input_ids": input_ids.to(self.device), "use_cache": use_cache}
         if attention_mask is not None:
             kwargs["attention_mask"] = attention_mask.to(self.device)
@@ -254,8 +290,11 @@ class HFTorchModel:
             kwargs["position_ids"] = position_ids.to(self.device)
         if cache is not None:
             kwargs["past_key_values"] = cache
-        if last_only and self._logits_to_keep:
-            kwargs["logits_to_keep"] = 1
+        if last_only:  # generation: the last position's logits, exactly as before window reads existed
+            if self._logits_to_keep:
+                kwargs["logits_to_keep"] = 1
+        elif keep is not None and self._logits_to_keep and keep < input_ids.shape[1] and not self._head_hooked():
+            kwargs["logits_to_keep"] = keep
         return self.module(**kwargs, return_dict=True)
 
     # -- forward --------------------------------------------------------------
@@ -264,7 +303,7 @@ class HFTorchModel:
         """Float32 logits ``[batch, sequence, vocab]`` on the CPU."""
         input_ids, attention_mask = self._check(input_ids, attention_mask)
         positions = None if attention_mask is None else positions_from_mask(attention_mask)
-        with torch.inference_mode():
+        with self._forward_lock, torch.inference_mode():
             output = self._forward(input_ids, attention_mask, last_only=False, position_ids=positions)
             return output.logits.to(device="cpu", dtype=torch.float32, copy=True)
 
@@ -274,12 +313,17 @@ class HFTorchModel:
         ``input_ids`` is one unpadded sequence ``[1, n]``. Element ``k`` is
         ``log p(input_ids[0, t + 1] | input_ids[0, :t + 1])`` at ``t = start + k``,
         for ``start <= t < n - 1``: the ``log_softmax`` of position ``t``'s
-        logits widened to float32, the values ``logits`` returns, so the two
-        agree bitwise on one device. The forward covers all ``n`` positions
-        once, without a cache, under inference mode; forward hooks registered
-        on ``module`` (activation probes, ``wse.probes``) see exactly this
-        forward. The logits stay on the device in the module's dtype and are
-        reduced in chunks of ``LOGPROB_CHUNK`` positions.
+        logits widened to float32, the values ``logits`` returns: bitwise on
+        the CPU fixtures of the test suite, while on MPS the output head's
+        kernel on ``n - start`` rows instead of ``n`` can round differently
+        (up to 2.2e-4 in a log-probability of Qwen3.5-0.8B, measured). The
+        forward covers all ``n`` positions once, without a cache, under
+        inference mode, and computes the output head only for positions
+        ``start`` to ``n - 1`` where the module accepts ``logits_to_keep`` and
+        its head carries no hooks; forward hooks registered on ``module``
+        (activation probes, ``wse.probes``) see exactly this forward. The
+        logits stay on the device in the module's dtype and are reduced in
+        chunks of ``LOGPROB_CHUNK`` positions.
         """
         input_ids, _ = self._check(input_ids, None)
         if input_ids.shape[0] != 1:
@@ -287,13 +331,14 @@ class HFTorchModel:
         length = int(input_ids.shape[1])
         if isinstance(start, bool) or not isinstance(start, int) or not 0 <= start < length:
             raise _invalid_argument(f"start must be an integer in [0, {length})", start=str(start))
-        with torch.inference_mode():
-            logits = self._forward(input_ids, None, last_only=False).logits[0]
+        with self._forward_lock, torch.inference_mode():
+            logits = self._forward(input_ids, None, last_only=False, keep=length - start).logits[0]
+            first = length - int(logits.shape[0])  # the position of the first row: start, or 0 for every position
             targets = input_ids[0, start + 1:].to(logits.device)
             pieces = [torch.empty(0, dtype=torch.float32, device=logits.device)]
             for low in range(start, length - 1, LOGPROB_CHUNK):
                 high = min(low + LOGPROB_CHUNK, length - 1)
-                rows = torch.log_softmax(logits[low:high].to(torch.float32), dim=-1)
+                rows = torch.log_softmax(logits[low - first:high - first].to(torch.float32), dim=-1)
                 pieces.append(rows.gather(1, targets[low - start:high - start, None])[:, 0])
             return torch.cat(pieces).to(device="cpu", dtype=torch.float32, copy=True)
 
@@ -348,7 +393,7 @@ class HFTorchModel:
         finished = [False] * batch
         step_ids, cache = input_ids, None
         positions = positions_from_mask(mask)  # the prompt's positions at prefill; then one per step
-        with torch.inference_mode():
+        with self._forward_lock, torch.inference_mode():
             for _ in range(max_new_tokens):
                 output = self._forward(step_ids, mask, last_only=True, position_ids=positions, cache=cache,
                                        use_cache=True)

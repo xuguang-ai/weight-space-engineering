@@ -353,19 +353,22 @@ def test_whole_tensor_scaling_is_refused_by_its_net_effect_on_the_experiments_ba
         def refused(parent: str, key: str, *operations: dict) -> WSEError:
             error = _expect(ErrorCode.POLICY_DENIED, bound.preview_patch, eid, spec(parent, *operations), key)
             assert "refuse_whole_tensor_scaling" in error.message and error.details["tensor"] == down.tensor
+            assert "factor" not in error.details  # the factor is a property of the base's weights
             return error
 
         # Complementary halves with one factor scale the whole tensor, whatever the factor (0.7 is not a power of
         # two, so the factor cannot be read back exactly from any one element).
         for factor in (0.5, 0.7, -1.0, 3.0):
-            error = refused(base, f"halves-{factor}", *halves(factor))
-            assert abs(error.details["factor"] - factor) <= 0.01 * abs(factor)
+            refused(base, f"halves-{factor}", *halves(factor))
         # So do set_slice with c * W, which needs the values of a read, and a whole fill with 0 (c = 0).
         halved = (weights.float() * 0.5).tolist()
         refused(base, "set", {"op": "set_slice", "values": halved, "selection": part(0, rows)})
-        assert refused(base, "zero", {"op": "fill_slice", "value": 0.0, "selection": part(0, rows)}).details[
-            "factor"] == 0
-        assert _budget(bound, eid) == before  # refused previews charge nothing
+        refused(base, "zero", {"op": "fill_slice", "value": 0.0, "selection": part(0, rows)})
+        # Each of these six refusals was materialized against the base, so each is charged as a preview.
+        charged = _budget(bound, eid)
+        assert charged["patch_previews"][1] == before["patch_previews"][1] + 6
+        assert {name: value for name, value in charged.items() if name not in ("patch_previews", "compute_seconds")} \
+            == {name: value for name, value in before.items() if name not in ("patch_previews", "compute_seconds")}
         # Partial scaling is legitimate, and so are different factors on the halves or a constant fill.
         half = bound.preview_patch(eid, spec(base, halves(0.5)[0]), "half")
         assert half.changed_elements == 8 * columns
@@ -414,7 +417,7 @@ def _assert_backfilled(workspace: Path, before: list[tuple], limits: dict[str, d
     from wse.database import LATEST_SCHEMA_VERSION
 
     with Engine(workspace) as engine:
-        assert engine.store.db.schema_version() == LATEST_SCHEMA_VERSION == 10
+        assert engine.store.db.schema_version() == LATEST_SCHEMA_VERSION == 11  # migration 11 rebuilt the jobs table
         after = _ledger_rows(workspace)
         added = sorted(set(after) - set(before))
         assert sorted(set(before) - set(after)) == []
@@ -520,7 +523,7 @@ def test_migration_10_on_a_workspace_written_by_schema_9_code(workspace, bundles
 # ---------------------------------------------------------------------------
 
 
-def test_generation_usage_is_reserved_and_settled_in_tokens(lm):
+def test_probe_and_generation_usage_is_reserved_and_settled_in_tokens(lm):
     from wse.worker import Worker  # noqa: F401 - the worker module must import
 
     run_id, eid = _open_run(lm.workspace, lm.base)
@@ -563,6 +566,50 @@ def test_generation_usage_is_reserved_and_settled_in_tokens(lm):
                      "teacher_forced_tokens"):
             assert after[name] == before[name]
         assert job.job_id in json.dumps([e["subject_id"] for e in bound.audit_log(eid)])
+
+        # A probe of the pass's outputs reserves one probe call and texts x tokens_per_probe_text (1,024)
+        # teacher-forced tokens, the most its forwards can read, and its compute seconds; nothing else.
+        samples = _samples(report)
+        texts = [{"output_uri": sample.output_uri} for sample in samples]
+        probe = bound.submit_probe(eid, lm.base, texts, ["residual:1"], "p1")
+        assert probe.kind == "probe" and probe.state == "queued" and probe.progress.batches_total == 8
+        assert probe.reservation.requested == {"probe_calls": 1, "teacher_forced_tokens": 8 * 1024,
+                                               "compute_seconds": 7200}
+        held = _budget(bound, eid)
+        assert held["probe_calls"] == (25, 0, 1) and held["teacher_forced_tokens"] == (25 * 64 * 1024, 0, 8 * 1024)
+        assert {name: held[name] for name in held if name not in ("probe_calls", "teacher_forced_tokens",
+                                                                  "compute_seconds")} == \
+            {name: after[name] for name in after if name not in ("probe_calls", "teacher_forced_tokens",
+                                                                 "compute_seconds")}
+        assert bound.submit_probe(eid, lm.base, texts, ["residual:1"], "p1") == probe
+        assert _budget(bound, eid) == held
+    with _worker(lm.workspace) as worker:
+        assert worker.run_once() == probe.job_id
+    with Engine(lm.workspace, run_id=run_id) as bound:
+        probed = bound.get_job(eid, probe.job_id)
+        assert probed.state == "succeeded", probed.error
+        document = bound.read_analysis_result(probed.result["result_uri"])
+        # Each output is read after its prompt, whose positions are not averaged; a finished output's stop token
+        # is left out. The settled tokens are the forward lengths.
+        for record, sample in zip(document["texts"], samples, strict=True):
+            body = sample.generated_tokens - (1 if sample.finished and sample.generated_tokens > 1 else 0)
+            assert record["window_stop"] - record["window_start"] == body and record["dropped_tokens"] == 0
+            assert record["forward_tokens"] == record["window_stop"] > record["window_start"] > 0
+        forwards = sum(record["forward_tokens"] for record in document["texts"])
+        assert probed.reservation.charged == {"probe_calls": 1, "teacher_forced_tokens": forwards,
+                                              "compute_seconds": probed.usage.compute_seconds}
+        assert {name: getattr(probed.usage, name) for name in LEDGER_COUNTERS} == \
+            {name: probed.reservation.charged.get(name, 0) for name in LEDGER_COUNTERS}
+        assert probed.usage.artifact_bytes == probed.result["result_bytes"] > 0
+        assert probed.usage.peak_memory_bytes > 0 and 0 < probed.usage.compute_seconds < 7200
+        settled = _budget(bound, eid)
+        assert settled["probe_calls"] == (25, 1, 0)
+        assert settled["teacher_forced_tokens"] == (25 * 64 * 1024, forwards, 0)
+        assert settled["compute_seconds"][2] == 0
+        for name in ("generation_passes", "generated_tokens", "evaluation_batches", "evaluated_examples",
+                     "model_forward_calls", "analysis_calls", "tensor_read_calls"):
+            assert settled[name] == after[name]
+        assert probe.job_id in json.dumps([e["subject_id"] for e in bound.audit_log(eid)])
 
 
 def test_generation_passes_are_checked_against_the_policy_before_anything_is_reserved(lm):
@@ -813,7 +860,9 @@ def test_the_worker_reuses_a_loaded_model_across_jobs(lm, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_final_suite_is_unreachable_through_generation_passes(lm):
+def test_final_suite_is_unreachable_through_probe_and_generation_tools(lm):
+    with Engine(lm.workspace) as engine:  # a development suite of another task, which this run cannot use either
+        engine.register_suite(_suite("elsewhere", lm.practice, task_id="another_task"))
     run_id, eid = _open_run(lm.workspace, lm.base)
     with Engine(lm.workspace, run_id=run_id) as bound:
         before = _budget(bound, eid)
@@ -822,20 +871,44 @@ def test_final_suite_is_unreachable_through_generation_passes(lm):
         denied = _expect(ErrorCode.POLICY_DENIED, bound.submit_evaluation, eid, lm.base, "final",
                          {"sample_count": 3, "seed": 0}, "final")
         assert "development" in denied.message
+        # Probes read items of the run's development suites only: a final suite's items are refused as its
+        # evaluation is, and another task's suite is reported like a missing one.
+        denied = _expect(ErrorCode.POLICY_DENIED, bound.submit_probe, eid, lm.base,
+                         [{"suite_id": "final", "item": 0}, {"text": "abc"}], ["residual:1"], "final-item")
+        assert "development" in denied.message
+        missing = _expect(ErrorCode.NOT_FOUND, bound.submit_probe, eid, lm.base, [{"suite_id": "nowhere", "item": 0}],
+                          ["residual:1"], "missing-item").message
+        other = _expect(ErrorCode.NOT_FOUND, bound.submit_probe, eid, lm.base, [{"suite_id": "elsewhere", "item": 0}],
+                        ["residual:1"], "other-task-item").message
+        assert other.replace("elsewhere", "nowhere") == missing
         _expect(ErrorCode.POLICY_DENIED, bound.evaluate_generation, lm.base, "final", {"sample_count": 3, "seed": 0})
         _expect(ErrorCode.POLICY_DENIED, bound.final_evaluate, eid)
         assert bound.list_jobs(eid) == [] and _budget(bound, eid) == before
         assert [suite.suite_id for suite in bound.describe_experiment(eid).suites] == ["practice"]
         job = bound.submit_evaluation(eid, lm.base, "practice", {"sample_count": 4, "seed": 0}, "practice")
     with Engine(lm.workspace) as engine:
-        # Not even the operator queues a final suite as a development evaluation.
+        # Not even the operator queues a final suite as a development evaluation or probes its items.
         _expect(ErrorCode.POLICY_DENIED, engine.submit_evaluation, eid, lm.base, "final",
                 {"sample_count": 3, "seed": 0}, "operator-final")
+        _expect(ErrorCode.POLICY_DENIED, engine.submit_probe, eid, lm.base, [{"suite_id": "final", "item": 0}],
+                ["residual:1"], "operator-final-item")
     with _worker(lm.workspace) as worker:
         assert worker.run_once() == job.job_id
     with Engine(lm.workspace) as engine:
         artifacts = engine.store.db.conn.execute("SELECT uri FROM analysis_results ORDER BY uri").fetchall()
         assert len(artifacts) == 8  # the practice pass's outputs
+    # A probe of the practice outputs and items stores one more run-scoped artifact, which holds no text.
+    with Engine(lm.workspace, run_id=run_id) as bound:
+        samples = _samples(bound.get_report(eid, bound.get_job(eid, job.job_id).report_id))
+        probe = bound.submit_probe(eid, lm.base, [{"output_uri": samples[0].output_uri},
+                                                  {"suite_id": "practice", "item": 1}, {"text": "abc"}],
+                                   ["residual:1"], "practice-probe", groups={"a": [0], "b": [1, 2]})
+    with _worker(lm.workspace) as worker:
+        assert worker.run_once() == probe.job_id
+    with Engine(lm.workspace) as engine:
+        assert engine.get_job(eid, probe.job_id).state == "succeeded"
+        artifacts = engine.store.db.conn.execute("SELECT uri FROM analysis_results ORDER BY uri").fetchall()
+        assert len(artifacts) == 9
         engine.freeze(eid, lm.base)
         final = engine.final_evaluate(eid)  # on the host's engine device, mps when available
         assert final.same_checkpoint and engine.get_experiment(eid).state == "CLOSED"
@@ -882,3 +955,54 @@ def test_development_text_suites_overlapping_a_final_suite_are_refused(lm):
                                split="final", task_id="third_task"))
         assert error.details["overlapping_items"] == ["fresh"] and error.details["development_suite_id"] == "inline_ok"
         assert "final_two" not in [suite.suite_id for suite in engine.jobs.list_suites("third_task")]
+
+
+def test_net_effect_scaling_checks_have_no_false_positives_and_are_charged_like_previews(hf_snapshots, tmp_path):
+    """A one-step change of one element is no scaling; a refused scaling costs a preview and names no factor."""
+    from wse.adapters.families import role_tensor
+
+    workspace = tmp_path / "workspace"
+    with Engine(workspace) as engine:
+        manifest = engine.import_hf_snapshot(hf_snapshots["qwen3_5"], repo="example-org/Qwen3.5-tiny",
+                                             revision=REVISION)
+        down = role_tensor(manifest, "mlp.down", 0)
+        weights = engine.open_checkpoint(manifest.checkpoint_id).tensor(down.tensor)  # BF16 [16, 32]
+    base, (rows, columns) = manifest.checkpoint_id, down.shape
+    # One element that is a power of two moved by one BF16 step towards zero (for example -0.015625 to -0.015564),
+    # half the spacing above it: its ratio (about 0.998) is a factor that every unchanged element also admits up to
+    # rounding, but no whole-tensor scaling changes only one element.
+    flat = weights.float().reshape(-1)
+    mantissa, _ = torch.frexp(flat)
+    i, j = divmod(int(torch.nonzero((mantissa.abs() == 0.5) & (flat != 0))[0]), columns)
+    step = (weights[i, j].view(torch.int16) - 1).view(torch.bfloat16)
+    one = {"op": "set_slice", "values": [[step.float().item()]],
+           "selection": [{"start": i, "stop": i + 1, "step": 1}, {"start": j, "stop": j + 1, "step": 1}]}
+    halves = [{"op": "scale_slice", "factor": 0.5, "selection": [{"start": 0, "stop": 8, "step": 1},
+                                                                 {"start": 0, "stop": columns, "step": 1}]},
+              {"op": "scale_slice", "factor": 0.5, "selection": [{"start": 8, "stop": rows, "step": 1},
+                                                                 {"start": 0, "stop": columns, "step": 1}]}]
+
+    def spec(*operations: dict) -> dict:
+        return {"base_checkpoint_id": base, "hypothesis": "Changing this projection changes the outputs.",
+                "operations": [{"tensor": down.tensor, **operation} for operation in operations]}
+
+    run_id, eid = _open_run(workspace, base)
+    with Engine(workspace, run_id=run_id) as bound:
+        preview = bound.preview_patch(eid, spec(one), "one-step")
+        assert preview.changed_elements == 1
+        # A refused scaling is materialized against the base before it is refused, so it is charged as a preview,
+        # with its compute seconds, and its error does not name the factor, which the base's weights determine.
+        before = _budget(bound, eid)
+        error = _expect(ErrorCode.POLICY_DENIED, bound.preview_patch, eid, spec(*halves), "halves")
+        assert "refuse_whole_tensor_scaling" in error.message and "factor" not in error.details
+        assert "0.5" not in error.message and "about" not in error.message
+        after = _budget(bound, eid)
+        assert after["patch_previews"][1] == before["patch_previews"][1] + 1
+        assert after["compute_seconds"][1] > before["compute_seconds"][1]
+        # A retry is a new attempt and is charged again; the key records no result.
+        _expect(ErrorCode.POLICY_DENIED, bound.preview_patch, eid, spec(*halves), "halves")
+        assert _budget(bound, eid)["patch_previews"][1] == before["patch_previews"][1] + 2
+        failures = [event for event in bound.audit_log(eid) if event["event_type"] == "patch.preview.failed"]
+        assert len(failures) == 2
+        assert all("factor" not in event["payload"]["details"] and "0.5" not in json.dumps(event["payload"])
+                   for event in failures)

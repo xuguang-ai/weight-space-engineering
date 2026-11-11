@@ -23,11 +23,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from wse.schemas import ErrorCode, ImportManifest, IOSpec, ModelManifest, TensorInfo, WSEError
 from wse.tensors import dtype_name
 
-# Capability names advertised by adapters and required by operators.
+# Capability names advertised by adapters and required by operators. ``weights.direction_edit`` (the direction and
+# low-rank edits ``project_out@1`` and ``add_low_rank@1``) and ``probe.hidden_states`` (activation probes) are the
+# Level 0 capabilities of open-weight language models (M2 plan Section 2.1); M1's MLP adapter has neither.
 CAP_WEIGHTS_READ = "weights.read"
 CAP_WEIGHTS_SLICE_EDIT = "weights.slice_edit"
+CAP_WEIGHTS_DIRECTION_EDIT = "weights.direction_edit"
 CAP_FORWARD_LOGITS = "forward.logits"
 CAP_GENERATE_TEXT = "generate.text"
+CAP_PROBE_HIDDEN_STATES = "probe.hidden_states"
 
 
 class AdapterCapabilities(BaseModel):

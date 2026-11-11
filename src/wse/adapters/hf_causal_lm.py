@@ -55,6 +55,8 @@ from pydantic import ValidationError
 from wse.adapters.base import (
     CAP_FORWARD_LOGITS,
     CAP_GENERATE_TEXT,
+    CAP_PROBE_HIDDEN_STATES,
+    CAP_WEIGHTS_DIRECTION_EDIT,
     CAP_WEIGHTS_READ,
     CAP_WEIGHTS_SLICE_EDIT,
     AdapterCapabilities,
@@ -481,8 +483,10 @@ class HFCausalLMAdapter:
         self._registry = registry
 
     def capabilities(self) -> AdapterCapabilities:
+        """The Level 0 capabilities (M2 plan Section 2.1): reads, slice and direction edits, logits, text, probes."""
         return AdapterCapabilities(
-            capabilities=frozenset({CAP_WEIGHTS_READ, CAP_WEIGHTS_SLICE_EDIT, CAP_FORWARD_LOGITS, CAP_GENERATE_TEXT}),
+            capabilities=frozenset({CAP_WEIGHTS_READ, CAP_WEIGHTS_SLICE_EDIT, CAP_WEIGHTS_DIRECTION_EDIT,
+                                    CAP_FORWARD_LOGITS, CAP_GENERATE_TEXT, CAP_PROBE_HIDDEN_STATES}),
             shared_parameters=True,
         )
 

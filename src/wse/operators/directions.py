@@ -1,6 +1,11 @@
 """Built-in M2 edit operators (plan Section 5.1): ``project_out@1``, ``add_low_rank@1``, and ``fill_slice@1``.
 
 Each requires a two-dimensional tensor with known axes (no ``unknown`` axis).
+``project_out`` and ``add_low_rank`` also require the adapter capability
+``weights.direction_edit`` (M2 plan Section 2.1), which ``hf_causal_lm@1``
+declares and M1's MLP adapter does not, so on an M1 model they fail with
+``UNSUPPORTED_CAPABILITY``; ``fill_slice`` is a slice edit and needs only
+``weights.slice_edit``.
 Like every edit, the result is written back to the stored dtype (BF16, F16,
 or F32) by the patch engine with round-to-nearest-even, only inside the
 selection; changed elements are those whose stored bits differ. No operator
@@ -78,7 +83,7 @@ from typing import Annotated, Any
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from wse.adapters.base import CAP_WEIGHTS_READ, CAP_WEIGHTS_SLICE_EDIT
+from wse.adapters.base import CAP_WEIGHTS_DIRECTION_EDIT, CAP_WEIGHTS_READ, CAP_WEIGHTS_SLICE_EDIT
 from wse.operators.base import (
     BaseEditOperator,
     OperatorParameters,
@@ -125,6 +130,7 @@ UNKNOWN_AXIS = "unknown"
 
 _EDIT_USAGE = UsageContract(counter="candidate_commits", units_per_call=1, model_forward_calls=0)
 _EDIT_CAPABILITIES = [CAP_WEIGHTS_READ, CAP_WEIGHTS_SLICE_EDIT]
+_DIRECTION_EDIT_CAPABILITIES = [*_EDIT_CAPABILITIES, CAP_WEIGHTS_DIRECTION_EDIT]
 # Magnitudes at or above this round to infinity in float32: the largest float32 plus half its spacing.
 _FLOAT32_OVERFLOW = 2.0 ** 128 - 2.0 ** 103
 # Low-rank sums are formed over row blocks of about this many elements, which bounds their memory.
@@ -276,7 +282,7 @@ class ProjectOutOperator(BaseEditOperator):
         "(d^T d). The selection must cover every row; columns of the selection outside C are unchanged. "
         "d is inline or a reference to a vector of a stored analysis result of this run. Sums are "
         "exact-product, correctly rounded float64 sums, so the result is the same on every platform.",
-        required_capabilities=_EDIT_CAPABILITIES,
+        required_capabilities=_DIRECTION_EDIT_CAPABILITIES,
         parameters_model=ProjectOutParameters,
         result_model=PatchStep,
         usage=_EDIT_USAGE,
@@ -458,7 +464,7 @@ class AddLowRankOperator(BaseEditOperator):
         "is inline or a reference to a vector of a stored analysis result of this run. Each entry's sum of exact "
         "float64 products is correctly rounded, so the result is the same on every platform and for every order of "
         "the factor columns; entries whose update is zero keep their bytes.",
-        required_capabilities=_EDIT_CAPABILITIES,
+        required_capabilities=_DIRECTION_EDIT_CAPABILITIES,
         parameters_model=AddLowRankParameters,
         result_model=PatchStep,
         usage=_EDIT_USAGE,

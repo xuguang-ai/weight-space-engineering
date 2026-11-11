@@ -63,7 +63,9 @@ def test_builtin_edits_are_registered_through_operator_specs():
     for ref in ("set_slice@1", "scale_slice@1", "project_out@1", "fill_slice@1", "add_low_rank@1"):
         spec = registry.resolve_ref("operator", ref).spec
         assert spec.effect == "edit"
-        assert spec.required_capabilities == sorted([CAP_WEIGHTS_READ, "weights.slice_edit"])
+        # The direction and low-rank edits also need weights.direction_edit, which M1's MLP adapter lacks.
+        direction = ["weights.direction_edit"] if ref in ("project_out@1", "add_low_rank@1") else []
+        assert spec.required_capabilities == sorted([CAP_WEIGHTS_READ, "weights.slice_edit", *direction])
         assert spec.usage == UsageContract(counter="candidate_commits", units_per_call=1, model_forward_calls=0)
         assert spec.output_schema == PatchStep.model_json_schema()
 

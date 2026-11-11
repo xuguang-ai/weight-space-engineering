@@ -10,9 +10,12 @@
   ``r`` columns of one value per selected column.
 
 Directions and factor columns may be inline or vector references to stored
-analysis results of the run. The in-memory model is the signed-sum fixture;
-BF16, F16, and F32 open-weight tensors come from the tiny offline fixtures of
-``tests/hf_fixtures.py``.
+analysis results of the run. ``project_out`` and ``add_low_rank`` need the
+capability ``weights.direction_edit``, which M1's MLP adapter lacks
+(``tests/test_probe_jobs.py``); their exact small-matrix values use the
+signed-sum weights through a test adapter that declares it
+(``DirectionTestAdapter``). BF16, F16, and F32 open-weight tensors come from
+the tiny offline fixtures of ``tests/hf_fixtures.py``.
 """
 
 from __future__ import annotations
@@ -25,7 +28,9 @@ import numpy as np
 import pytest
 import torch
 
+from wse.adapters.base import CAP_WEIGHTS_DIRECTION_EDIT, AdapterCapabilities
 from wse.adapters.families import model_family, role_tensor
+from wse.adapters.mlp import MLPAdapter
 from wse.api import Engine, apply_operator, load_model
 from wse.experiments import ExperimentService
 from wse.operators.base import TensorRegion
@@ -50,6 +55,24 @@ W1 = "layers.0.weight"  # [4, 2] in the signed-sum model
 POLICY = default_operation_policy().with_edit("project_out", "project_out@1")
 EDITS = POLICY.with_edit("fill_slice", "fill_slice@1").with_edit("add_low_rank", "add_low_rank@1")
 TASK = "tiny_lm_v1"
+TEST_ADAPTER = "mlp_direction_test@1"
+
+
+class DirectionTestAdapter(MLPAdapter):
+    """M1's F32 MLP adapter with ``weights.direction_edit``, so the direction edits run on small exact matrices."""
+
+    adapter_id = "mlp_direction_test"
+
+    def capabilities(self) -> AdapterCapabilities:
+        base = super().capabilities()
+        return AdapterCapabilities(capabilities=base.capabilities | {CAP_WEIGHTS_DIRECTION_EDIT},
+                                   shared_parameters=base.shared_parameters)
+
+
+def _registry():
+    registry = builtin_registry()
+    registry.register("adapter", "mlp_direction_test", "1", DirectionTestAdapter())
+    return registry
 
 
 def _sel(*ranges):
@@ -93,7 +116,7 @@ def _consumed(engine, experiment_id, counter):
 
 @pytest.fixture
 def task_model(signed_sum):
-    return load_model(signed_sum.task_tensors(), "mlp@1", signed_sum.CONFIG)
+    return load_model(signed_sum.task_tensors(), TEST_ADAPTER, signed_sum.CONFIG, registry=_registry())
 
 
 @pytest.fixture
@@ -157,7 +180,7 @@ def _reference(weights: np.ndarray, direction: list[float], columns: list[int], 
 def test_project_out_is_a_registered_builtin_edit_operator():
     spec = builtin_registry().resolve_ref("operator", "project_out@1").spec
     assert spec.effect == "edit"
-    assert spec.required_capabilities == sorted(["weights.read", "weights.slice_edit"])
+    assert spec.required_capabilities == sorted(["weights.read", "weights.slice_edit", "weights.direction_edit"])
     assert spec.usage == UsageContract(counter="candidate_commits", units_per_call=1, model_forward_calls=0)
     assert spec.output_schema == PatchStep.model_json_schema()
     assert sorted(spec.input_schema["properties"]) == ["alpha", "columns", "direction"]
@@ -167,11 +190,13 @@ def test_project_out_is_a_registered_builtin_edit_operator():
 def test_fill_slice_and_add_low_rank_are_registered_builtin_edit_operators():
     registry = builtin_registry()
     expected = {"fill_slice@1": ["value"], "add_low_rank@1": ["alpha", "u", "v"]}
+    capabilities = {"fill_slice@1": ["weights.read", "weights.slice_edit"],
+                    "add_low_rank@1": ["weights.direction_edit", "weights.read", "weights.slice_edit"]}
     for ref, properties in expected.items():
         operator = registry.resolve_ref("operator", ref)
         spec = operator.spec
         assert spec.effect == "edit"
-        assert spec.required_capabilities == sorted(["weights.read", "weights.slice_edit"])
+        assert spec.required_capabilities == capabilities[ref]
         assert spec.usage == UsageContract(counter="candidate_commits", units_per_call=1, model_forward_calls=0)
         assert spec.output_schema == PatchStep.model_json_schema()
         assert sorted(spec.input_schema["properties"]) == properties
@@ -456,14 +481,14 @@ def test_re_executing_the_same_call_gives_the_same_patch(bf16_model):
     assert dict(first.blocks) == dict(second.blocks)
 
 
-def test_project_out_runs_through_a_managed_policy(workspace, bundles, task_model):
-    with Engine(workspace) as engine:
+def test_project_out_runs_through_a_managed_policy(workspace, signed_sum, task_model):
+    with Engine(workspace, registry=_registry()) as engine:
         policy = ExperimentPolicy(policy_id="project_out_policy_v1", mode="weights_only",
                                   budget={"candidate_commits": 1, "evaluation_batches": 0, "examples_per_batch": 0,
                                           "evaluated_examples": 0, "model_forward_calls": 0},
                                   operations=POLICY)
         engine.register_policy(policy)
-        base = engine.import_bundle(bundles["task"])
+        base = engine.import_model({"adapter": TEST_ADAPTER, "config": signed_sum.CONFIG}, signed_sum.task_tensors())
         grant = engine.grant_run("signed_sum_v1", "project_out_policy_v1", base.checkpoint_id)
         experiment = engine.create_experiment(grant.run_id, "signed_sum_v1", "project_out_policy_v1", "create-1")
         operation = {"op": "project_out", "tensor": "layers.1.weight", "selection": _sel((0, 2), (0, 4)),
@@ -697,8 +722,8 @@ def test_low_rank_rank_and_shape_limits(task_model, handles):
                     v=[[1.0]])
     assert "two-dimensional" in error.message
     # Inline factor columns hold at most MAX_INLINE_FACTOR_VALUES values in all; longer ones go by reference.
-    wide = load_model({W1: torch.zeros(2, 4096)}, "mlp@1", {"layer_sizes": [4096, 2], "activation": "relu",
-                                                           "bias": False})
+    wide = load_model({W1: torch.zeros(2, 4096)}, TEST_ADAPTER, {"layer_sizes": [4096, 2], "activation": "relu",
+                                                                 "bias": False}, registry=_registry())
     at_bound = _low_rank(wide, W1, _sel((0, 2), (0, 4094)), u=[[1.0, 1.0]] * 4, v=[[0.5] * 4094] * 4)
     assert at_bound.patch.steps[0].changed_elements == 2 * 4094  # 8 + 16,376 = 16,384 inline values
     error = _expect(ErrorCode.INVALID_ARGUMENT, _low_rank, wide, W1, _sel((0, 2), (0, 4096)), u=[[1.0, 1.0]] * 4,
@@ -783,13 +808,13 @@ def test_fill_and_low_rank_patches_replay_hash_exact_without_the_operators(count
         assert replayed.weights_hash == result.candidate.weights_hash == result.patch.result_weights_hash
 
 
-def test_fill_slice_and_add_low_rank_run_through_a_managed_policy(workspace, bundles, task_model):
-    with Engine(workspace) as engine:
+def test_fill_slice_and_add_low_rank_run_through_a_managed_policy(workspace, signed_sum, task_model):
+    with Engine(workspace, registry=_registry()) as engine:
         engine.register_policy(ExperimentPolicy(
             policy_id="new_edits_v1", mode="weights_only", operations=EDITS,
             budget={"candidate_commits": 1, "evaluation_batches": 0, "examples_per_batch": 0, "evaluated_examples": 0,
                     "model_forward_calls": 0}))
-        base = engine.import_bundle(bundles["task"])
+        base = engine.import_model({"adapter": TEST_ADAPTER, "config": signed_sum.CONFIG}, signed_sum.task_tensors())
         grant = engine.grant_run("signed_sum_v1", "new_edits_v1", base.checkpoint_id)
         experiment = engine.create_experiment(grant.run_id, "signed_sum_v1", "new_edits_v1", "create-1")
         operations = [

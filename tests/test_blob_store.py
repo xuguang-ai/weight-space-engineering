@@ -300,10 +300,25 @@ def _rows(conn: sqlite3.Connection, table: str) -> list[tuple]:
 M2_COUNTERS = ("generation_passes", "generated_tokens", "probe_calls", "teacher_forced_tokens")
 
 
+def _restore_m1_jobs_table(conn: sqlite3.Connection) -> None:
+    """Undo migration 11: rebuild ``jobs`` with the definition that migrations 3-5 gave it, keeping its rows."""
+    create = next(statement for statement in MIGRATIONS[2][1] if "CREATE TABLE jobs" in statement)
+    later = [statement for _, statements in MIGRATIONS[3:5] for statement in statements
+             if statement.startswith("ALTER TABLE jobs")]
+    indexes = [statement for statement in MIGRATIONS[2][1] if statement.startswith("CREATE INDEX jobs_")]
+    conn.execute("CREATE TABLE jobs_m1_copy AS SELECT * FROM jobs")
+    conn.execute("DROP TABLE jobs")
+    for statement in [create, *later, *indexes]:
+        conn.execute(statement)
+    conn.execute("INSERT INTO jobs SELECT * FROM jobs_m1_copy")
+    conn.execute("DROP TABLE jobs_m1_copy")
+
+
 def _downgrade_to_m1(workspace: Path) -> None:
-    """Remove every object of migrations 8-10 so the workspace is exactly what M1 (schema 7) wrote."""
+    """Remove every object of migrations 8-11 so the workspace is exactly what M1 (schema 7) wrote."""
     conn = sqlite3.connect(workspace / "metadata.sqlite")
     try:
+        _restore_m1_jobs_table(conn)  # migration 11
         conn.execute(f"DELETE FROM budget_ledger WHERE counter IN ({', '.join('?' * len(M2_COUNTERS))})",
                      M2_COUNTERS)  # migration 10
         conn.execute("DROP TABLE imported_patches")  # migration 9

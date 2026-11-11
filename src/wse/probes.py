@@ -5,7 +5,10 @@
 per text and site, the mean activation over a window of positions, and the
 mean log-probability of the text's own next tokens over that window.
 ``ProbeResult.contrast`` compares two groups of texts. This is the in-memory
-core: budgets, policy, and the managed tool are not part of this module.
+core; the managed probe (``Engine.submit_probe``, a worker job metered by
+policy and budget) builds on it, and the end of this module holds its pure
+parts: the cutting rule of its texts, its result artifact, and its inline
+summary (**Managed probes** below).
 
 * **Texts.** A ``ProbeText`` holds the token IDs to teacher-force (for example
   a prompt followed by an output) and the window ``[start, stop)`` of
@@ -62,8 +65,12 @@ core: budgets, policy, and the managed tool are not part of this module.
   shifted by its first text (``x_0 + mean(x - x_0)``), so a group of identical
   texts has exactly that text's mean and zero variance. Log-probabilities
   are the engine's float32 ``log_softmax`` values
-  (``HFTorchModel.next_token_logprobs``), averaged in float64. Results are
-  bitwise reproducible within one device and library version. On
+  (``HFTorchModel.next_token_logprobs``), averaged in float64; the output
+  head runs on the scored positions only, so on MPS they can differ in their
+  last digits from ``log_softmax`` of the full sequence's logits (by at most
+  2.2e-4 over a 512-token Qwen3.5-0.8B output, measured), and on the CPU
+  fixtures they agree bitwise. Results are bitwise reproducible within one
+  device and library version. On
   Qwen3.5-0.8B on MPS, over a 3,600-position window, the float32 sums
   differed from float64 sums of the same activations by at most 1.2e-7 of
   each dimension's mean magnitude; activations themselves differ between MPS
@@ -75,14 +82,17 @@ core: budgets, policy, and the managed tool are not part of this module.
   window over an output therefore scores every output token.
 * **Limits.** ``max_tokens`` (default ``DEFAULT_MAX_PROBE_TOKENS``, at most
   ``MAX_PROBE_TOKENS``) bounds each text's forward length ``stop``, and so
-  does the model's context (``max_positions``). Cost grows with ``stop``,
-  whatever the window: the forward holds the logits of every position in the
+  does the model's context (``max_positions``). Cost grows with ``stop``:
+  every position runs through the decoder. The output head runs only on the
+  positions that score the window's tokens (the window and the position
+  before it, through ``logits_to_keep``), unless a site reads the output
+  head, which then sees every position; those logits are held in the
   module's dtype (on Qwen3.5-0.8B, with its 248,320-token vocabulary in
-  BF16, 0.5 MB per position: 2 GB at 4,096 positions and 8 GB at 16,384).
-  Measured on the operator's Mac (MPS), one probe of Qwen3.5-0.8B took 1.7 s
-  at 4,000 positions and 8.6 s at 16,384, with about 5 GB and 13 GB of MPS
-  driver memory (2.1 GB of it the model). A probe reads at most
-  ``MAX_PROBE_SITES`` distinct sites.
+  BF16, 0.5 MB per position: 2 GB for 4,096 positions and 8 GB for 16,384).
+  Measured on the operator's Mac (MPS) with every position's logits, one
+  probe of Qwen3.5-0.8B took 1.7 s at 4,000 positions and 8.6 s at 16,384,
+  with about 5 GB and 13 GB of MPS driver memory (2.1 GB of it the model). A
+  probe reads at most ``MAX_PROBE_SITES`` distinct sites.
 * **Contrasts.** ``ProbeResult.contrast(site, a, b)`` treats each text's mean
   as one observation, so texts weigh equally whatever their token counts.
   ``direction`` is the mean over group ``a`` minus the mean over group ``b``,
@@ -96,18 +106,77 @@ core: budgets, policy, and the managed tool are not part of this module.
   rejects. The groups must be disjoint and non-empty and hold at least three
   texts together, so that ``s`` has a degree of freedom.
 
+* **Capability.** A model is probed only when its adapter declares
+  ``probe.hidden_states`` (``hf_causal_lm@1``); others, such as M1's MLP
+  adapter, are refused with ``UNSUPPORTED_CAPABILITY``.
+
 The probe never changes weights: its hooks only read, and they are removed
-when the call returns or raises. A probe must not run concurrently with
-another forward on the same runtime, whose hooks would see both. This module
-does not import ``transformers``.
+when the call returns or raises. It holds the runtime's forward lock
+(``HFTorchModel.exclusive``) from registering its hooks to removing them, so
+no other thread's forward on the same runtime runs meanwhile, and its hooks
+see only its own forwards. ``on_forward`` is called before each text's
+forward with the text's index and forward length; it may raise to stop the
+probe (the managed worker meters and stops probes through it).
+
+**Managed probes** (``Engine.submit_probe``; M2 plan Section 5.3). A probe job
+teacher-forces texts of three kinds, each built by the worker:
+
+* an *output* of one of the run's generation passes, by its output URI (one
+  URI names one sample): its prompt, rendered as the pass rendered it, then
+  its generated tokens, with a finished output's stop token left out (unless
+  it is the only token) so that finished and limit-hit windows hold the same
+  kind of tokens; the window is the output, or its last ``last`` tokens;
+* a *string*, encoded as the tokenizer encodes plain text (Llama's tokenizer
+  prepends its BOS token; no chat template); the window is every token after
+  the first;
+* an *item* of a development suite of the run's task: its prompt as a pass
+  renders it; the window is every token after the first.
+
+**Cutting.** A text longer than ``limit`` positions (the policy's
+``tokens_per_probe_text``, bounded by ``MAX_PROBE_TOKENS`` and the model's
+context) keeps its last ``limit`` positions: earlier tokens, the prompt first,
+are dropped, which removes their context (``cut_text``). The window keeps the
+positions of its own tokens that remain, but never the first kept position,
+which has no context once the text is cut. So no window holds position 0 of a
+forward: every window token is scored from a prefix (``mean_logprobs``), and
+attention-sink activations at the first position, which many models have,
+stay out of the means.
+
+**Artifact.** ``probe_document`` is the full result, stored as a run-scoped
+artifact (``wse://analyses/<sha256>``): per text its source, forward length,
+window, dropped tokens, token hash, and mean log-probability; per site its
+mean (no groups) or the means of groups ``a`` and ``b``, their norms, and the
+contrast ``a - b`` with its norm and standardized differences. Its vectors are
+vector references: ``<uri>#/sites/<i>/contrast/direction``,
+``<uri>#/sites/<i>/group_means/a`` (or ``/b``), and ``<uri>#/sites/<i>/mean``,
+with ``i`` the site's position in the request. A non-finite value is written
+as the string ``"inf"``, ``"-inf"``, or ``"nan"`` (canonical JSON has no
+infinities): standardized differences are infinite where both groups are
+constant and differ. A vector holding such a string is not a valid vector
+reference.
+
+**Summary.** The job's inline result (``fit_summary``) gives the artifact's
+URI and size and, per text, its source, forward length, window length,
+dropped tokens, and mean log-probability; per site its features, mean norms,
+contrast norm, and the ``top`` dimensions of largest absolute standardized
+difference (``top_dimensions``: infinities first); numbers to 6 significant
+digits. Every site lists the same number of dimensions (all of them when it
+has fewer): the largest number, at most the requested ``top``, whose summary
+fits the policy's inline-result limit less ``PROBE_JOB_BYTES`` for the job
+around it. Submission refuses a probe whose summary could not fit even
+without top dimensions (``summary_size_bound``).
+
+This module does not import ``transformers``.
 """
 
 from __future__ import annotations
 
+import contextlib
 import difflib
+import math
 import operator
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -115,7 +184,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
-from wse.schemas import ErrorCode, ModelIdentity, WSEError
+from wse.schemas import ErrorCode, ModelIdentity, TensorInfo, WSEError, canonical_json
 
 if TYPE_CHECKING:
     from wse.api import ModelHandle
@@ -130,6 +199,11 @@ MAX_PROBE_SITES = 128
 MAX_SITE_CANDIDATES = 10
 CAPTURE_POINTS = ("input", "output")
 _RESIDUAL = re.compile(r"residual:(0|[1-9][0-9]*)")
+# Managed probes: the inline summary's default and largest number of top standardized dimensions per site, and
+# the allowance for the job's other fields around the summary.
+DEFAULT_SUMMARY_TOP = 8
+MAX_SUMMARY_TOP = 64
+PROBE_JOB_BYTES = 3 * 1024
 
 
 def _invalid(message: str, **details: Any) -> WSEError:
@@ -296,8 +370,13 @@ def module_paths(model: ModelHandle) -> dict[str, str]:
     ``model.layers.15.mlp.down_proj``; at Level 0 every path maps to itself.
     The root module is not a site.
     """
+    return canonical_module_paths(model.architecture.tensors)
+
+
+def canonical_module_paths(tensors: Iterable[TensorInfo]) -> dict[str, str]:
+    """``module_paths`` from a model's tensor entries (a manifest's ``tensors`` suffices; no weight is read)."""
     paths: dict[str, str] = {}
-    for info in model.architecture.tensors:
+    for info in tensors:
         canonical, module = info.name.split("."), (info.module_name or info.name).split(".")
         for size in range(1, min(len(canonical), len(module))):
             if canonical[-size:] != module[-size:]:
@@ -488,20 +567,29 @@ def probe(
     sites: Sequence[str],
     device: str | None = None,
     max_tokens: int = DEFAULT_MAX_PROBE_TOKENS,
+    on_forward: Callable[[int, int], None] | None = None,
 ) -> ProbeResult:
     """Teacher-force each text and average each site's activations over the text's window (module docstring).
 
     ``device`` is the engine device (``mps`` when available, otherwise
     ``cpu``). Arguments are checked before any forward; a site that captures
     something other than ``[1, stop, features]`` is refused during the first
-    forward. Errors: ``UNSUPPORTED_CAPABILITY`` for a model without an engine
-    runtime (M1 models), ``NOT_FOUND`` for an unknown site (with candidate
-    paths), and ``INVALID_ARGUMENT`` for malformed sites, texts, and limits.
+    forward. ``on_forward(index, stop)`` runs before each text's forward and
+    may raise to stop the probe. Errors: ``UNSUPPORTED_CAPABILITY`` for a
+    model whose adapter lacks ``probe.hidden_states`` (M1 models),
+    ``NOT_FOUND`` for an unknown site (with candidate paths), and
+    ``INVALID_ARGUMENT`` for malformed sites, texts, and limits.
     """
+    from wse.adapters.base import CAP_PROBE_HIDDEN_STATES
     from wse.api import ModelHandle
 
     if not isinstance(model, ModelHandle):
         raise _invalid(f"model must be a ModelHandle, not {type(model).__name__}")
+    if not model.adapter.capabilities().supports(CAP_PROBE_HIDDEN_STATES):
+        raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY,
+                       f"adapter {model.adapter_ref} does not support {CAP_PROBE_HIDDEN_STATES}, so its models cannot "
+                       "be probed", details={"adapter": str(model.adapter_ref),
+                                             "missing_capabilities": [CAP_PROBE_HIDDEN_STATES]})
     runtime = model.runtime(device)
     limit = _integer(max_tokens)
     if limit is None or not 1 <= limit <= MAX_PROBE_TOKENS:
@@ -513,22 +601,26 @@ def probe(
     totals: dict[str, list[torch.Tensor]] = {capture.site.name: [] for capture in captures}
     logprobs: list[float | None] = []
     hooks = []
-    try:
-        for capture in captures:
-            module = capture.site.module
-            hooks.append(module.register_forward_pre_hook(capture.pre_hook) if capture.site.point == "input"
-                         else module.register_forward_hook(capture.hook))
-        for ids, start, stop in windows:
+    exclusive = getattr(runtime, "exclusive", None)
+    with exclusive() if callable(exclusive) else contextlib.nullcontext():
+        try:
             for capture in captures:
-                capture.begin(start, stop)
-            # The window's tokens are scored from the positions before them; position 0 has no prefix.
-            values = runtime.next_token_logprobs(ids, start=max(start, 1) - 1)
-            for capture in captures:
-                totals[capture.site.name].append(capture.finish())
-            logprobs.append(float(values.to(torch.float64).mean()) if values.numel() else None)
-    finally:
-        for hook in hooks:
-            hook.remove()
+                module = capture.site.module
+                hooks.append(module.register_forward_pre_hook(capture.pre_hook) if capture.site.point == "input"
+                             else module.register_forward_hook(capture.hook))
+            for index, (ids, start, stop) in enumerate(windows):
+                if on_forward is not None:
+                    on_forward(index, stop)
+                for capture in captures:
+                    capture.begin(start, stop)
+                # The window's tokens are scored from the positions before them; position 0 has no prefix.
+                values = runtime.next_token_logprobs(ids, start=max(start, 1) - 1)
+                for capture in captures:
+                    totals[capture.site.name].append(capture.finish())
+                logprobs.append(float(values.to(torch.float64).mean()) if values.numel() else None)
+        finally:
+            for hook in hooks:
+                hook.remove()
 
     counts = tuple(stop - start for _, start, stop in windows)
     divisor = torch.tensor(counts, dtype=torch.float64)[:, None]
@@ -539,3 +631,201 @@ def probe(
         means[name] = array
     return ProbeResult(sites=tuple(totals), means=means, token_counts=counts, mean_logprobs=tuple(logprobs),
                        model=model.identity, runtime=runtime.info())
+
+
+# ---------------------------------------------------------------------------
+# Managed probes: cutting, result documents, and summaries (module docstring, **Managed probes**)
+# ---------------------------------------------------------------------------
+
+# How the summary names the stored vectors: a JSON pointer per vector, with <i> the site's index in the request.
+VECTOR_POINTERS = ("<result_uri>#/sites/<i>/contrast/direction, #/sites/<i>/group_means/a and /b, or "
+                   "#/sites/<i>/mean without groups; <i> is the site's index in the request")
+
+
+@dataclass(frozen=True)
+class CutText:
+    """A managed probe's text after cutting: the forward's tokens, its window ``[start, stop)``, and the tokens dropped."""
+
+    tokens: tuple[int, ...]
+    start: int
+    stop: int
+    dropped: int
+
+    def probe_text(self) -> ProbeText:
+        return ProbeText(self.tokens, start=self.start, stop=self.stop)
+
+
+def cut_text(tokens: Sequence[int], start: int, stop: int, limit: int) -> CutText:
+    """Keep the last ``limit`` positions of ``tokens``; the window ``[start, stop)`` keeps its remaining positions.
+
+    The window never holds the first kept position of a cut text, which has
+    no context. Raises ``INVALID_ARGUMENT`` when no window position remains
+    (a window that lies before the kept positions).
+    """
+    tokens = tuple(int(token) for token in tokens)
+    if not 0 <= start < stop <= len(tokens) or limit < 2:
+        raise _invalid(f"a window [{start}, {stop}) of {len(tokens)} tokens, cut to {limit} positions, is not valid")
+    dropped = max(0, len(tokens) - limit)
+    first = max(start - dropped, 1 if dropped else 0)
+    last = stop - dropped
+    if first >= last:
+        raise _invalid(f"the text's window [{start}, {stop}) lies before its last {limit} positions, which a probe "
+                       "reads", start=start, stop=stop, limit=limit)
+    return CutText(tokens=tokens[dropped:], start=first, stop=last, dropped=dropped)
+
+
+def json_number(value: Any) -> float | str:
+    """``value`` as a float for canonical JSON, or ``"inf"``, ``"-inf"``, or ``"nan"`` when it is not finite."""
+    number = float(value)
+    if math.isfinite(number):
+        return number
+    return "nan" if math.isnan(number) else ("inf" if number > 0 else "-inf")
+
+
+def json_vector(values: Any) -> list[float | str]:
+    """A vector for canonical JSON: its float64 values, with non-finite entries as ``json_number`` writes them."""
+    array = np.asarray(values, dtype=np.float64)
+    if bool(np.isfinite(array).all()):
+        return array.tolist()
+    return [json_number(value) for value in array.tolist()]
+
+
+def decode_vector(values: Sequence[float | str]) -> np.ndarray:
+    """The float64 array of a stored vector, ``"inf"``, ``"-inf"``, and ``"nan"`` decoded."""
+    special = {"inf": math.inf, "-inf": -math.inf, "nan": math.nan}
+    return np.array([special[value] if isinstance(value, str) else value for value in values], dtype=np.float64)
+
+
+def _short(value: Any) -> float | str | None:
+    """A summary number: 6 significant digits, or the string of a non-finite value."""
+    if value is None:
+        return None
+    number = json_number(value)
+    return float(f"{number:.6g}") if isinstance(number, float) else number
+
+
+def probe_document(result: ProbeResult, *, texts: Sequence[Mapping[str, Any]], sites: Sequence[Any],
+                   groups: Mapping[str, Sequence[int]] | None, header: Mapping[str, Any]) -> dict[str, Any]:
+    """The full result of a managed probe, stored as its artifact (module docstring, **Artifact**).
+
+    ``texts`` holds one record per text (source, references, forward length,
+    window, dropped tokens, token hash), to which its mean log-probability is
+    added; ``sites`` the requested form of each site of ``result.sites``;
+    ``header`` the identifying fields (experiment, job, checkpoint, model,
+    runtime, and tokens per text). Every vector is float64.
+    """
+    if len(texts) != len(result.token_counts) or len(sites) != len(result.sites):
+        raise ValueError("one text record per text and one requested site per site are needed")
+    records = [{**record, "mean_logprob": None if logprob is None else json_number(logprob)}
+               for record, logprob in zip(texts, result.mean_logprobs, strict=True)]
+    everything = list(range(len(records)))
+    entries = []
+    for site, requested in zip(result.sites, sites, strict=True):
+        entry: dict[str, Any] = {"site": site, "requested": requested, "features": int(result.means[site].shape[1])}
+        if groups is None:
+            mean = result.group_mean(site, everything)
+            entry.update(mean=json_vector(mean), mean_norm=json_number(np.linalg.norm(mean)))
+        else:
+            mean_a, mean_b = result.group_mean(site, groups["a"]), result.group_mean(site, groups["b"])
+            contrast = result.contrast(site, groups["a"], groups["b"])
+            entry.update(
+                group_means={"a": json_vector(mean_a), "b": json_vector(mean_b)},
+                group_mean_norms={"a": json_number(np.linalg.norm(mean_a)), "b": json_number(np.linalg.norm(mean_b))},
+                contrast={"direction": json_vector(contrast.direction), "norm": json_number(contrast.norm),
+                          "standardized": json_vector(contrast.standardized),
+                          "nonfinite_standardized": int(np.count_nonzero(~np.isfinite(contrast.standardized))),
+                          "sizes": list(contrast.sizes)})
+        entries.append(entry)
+    shown_groups = None if groups is None else {"a": list(groups["a"]), "b": list(groups["b"])}
+    return {"schema_version": "1", "kind": "probe_result", **dict(header), "groups": shown_groups,
+            "texts": records, "sites": entries}
+
+
+def top_dimensions(standardized: Any, count: int) -> list[list[Any]]:
+    """The ``count`` dimensions of largest absolute standardized difference, as ``[dimension, value]``.
+
+    Infinities come first, then finite values by descending magnitude, then
+    NaN; ties go to the lower dimension.
+    """
+    values = np.asarray(standardized, dtype=np.float64)
+    finite, missing = np.isfinite(values), np.isnan(values)
+    rank = np.where(missing, 2, np.where(finite, 1, 0))
+    magnitude = np.where(finite, -np.abs(np.where(finite, values, 0.0)), 0.0)
+    order = np.lexsort((np.arange(values.size), magnitude, rank))[:max(count, 0)]
+    return [[int(dimension), _short(values[dimension])] for dimension in order]
+
+
+def _summary(document: Mapping[str, Any], tops: Sequence[Sequence[list[Any]] | None], top: int, uri: str,
+             size: int) -> dict[str, Any]:
+    texts = [{"source": record["source"], "tokens": record["forward_tokens"],
+              "window": record["window_stop"] - record["window_start"], "dropped": record["dropped_tokens"],
+              "logprob": _short(record["mean_logprob"])} for record in document["texts"]]
+    sites = []
+    for entry, ranked in zip(document["sites"], tops, strict=True):
+        item: dict[str, Any] = {"site": entry["site"], "features": entry["features"]}
+        if ranked is None:
+            item["mean_norm"] = _short(entry["mean_norm"])
+        else:
+            norms = entry["group_mean_norms"]
+            item.update(group_mean_norms=[_short(norms["a"]), _short(norms["b"])],
+                        contrast_norm=_short(entry["contrast"]["norm"]), top=[list(pair) for pair in ranked[:top]])
+        sites.append(item)
+    groups = document["groups"]
+    return {"result_uri": uri, "result_bytes": size, "checkpoint_id": document["checkpoint_id"],
+            "tokens_per_text": document["tokens_per_text"],
+            "teacher_forced_tokens": sum(record["forward_tokens"] for record in document["texts"]),
+            "groups": None if groups is None else {"a": len(groups["a"]), "b": len(groups["b"])},
+            "top": top if groups is not None else 0, "texts": texts, "sites": sites, "vectors": VECTOR_POINTERS}
+
+
+def _json_bytes(value: Any) -> int:
+    return len(canonical_json(value).encode("utf-8"))
+
+
+def fit_summary(document: Mapping[str, Any], *, uri: str, size: int, top: int, limit: int) -> dict[str, Any]:
+    """The inline summary of a probe's ``document`` with at most ``top`` entries per site, within ``limit`` bytes.
+
+    Every site lists the same number of top dimensions: the largest number,
+    at most ``top``, whose summary fits ``limit`` bytes of canonical JSON.
+    """
+    tops: list[list[list[Any]] | None] = []
+    for entry in document["sites"]:
+        contrast = entry.get("contrast")
+        tops.append(None if contrast is None else top_dimensions(decode_vector(contrast["standardized"]), top))
+    low, high = 0, max(0, top)
+    if _json_bytes(_summary(document, tops, low, uri, size)) > limit:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                       f"the probe's inline summary exceeds the {limit}-byte limit even without top dimensions; "
+                       "probe fewer texts or sites", details={"limit_bytes": limit})
+    while low < high:  # the largest count that fits
+        middle = (low + high + 1) // 2
+        if _json_bytes(_summary(document, tops, middle, uri, size)) <= limit:
+            low = middle
+        else:
+            high = middle - 1
+    return _summary(document, tops, low, uri, size)
+
+
+def summary_size_bound(*, texts: int, sites: Sequence[str], grouped: bool, tokens_per_text: int) -> list[int]:
+    """Upper bounds on the bytes of a summary without top dimensions: the total for each prefix of ``sites``.
+
+    Element ``k`` bounds the summary of ``texts`` texts and the first ``k``
+    sites (so the list has ``len(sites) + 1`` entries); numbers take their
+    widest forms. Submission refuses a probe whose bound exceeds the limit,
+    so the worker's ``fit_summary`` never fails.
+    """
+    wide = 1.23456e-300  # the widest 6-digit float: 12 characters
+    record = {"source": "suite_item", "forward_tokens": tokens_per_text, "window_start": 0,
+              "window_stop": tokens_per_text, "dropped_tokens": 10 ** 9, "mean_logprob": -wide}
+    entry: dict[str, Any] = {"group_mean_norms": {"a": wide, "b": wide}, "contrast": {"norm": wide}} if grouped \
+        else {"mean_norm": wide}
+    document = {"checkpoint_id": "ckpt_" + "0" * 32, "tokens_per_text": tokens_per_text,
+                "texts": [record] * texts, "groups": {"a": [0], "b": [0]} if grouped else None, "sites": []}
+    base = _json_bytes(_summary(document, [], 0, "wse://analyses/" + "0" * 64, 10 ** 12))
+    base += len(str(texts * tokens_per_text)) + 8  # teacher_forced_tokens and the group sizes at their widest
+    bounds = [base]
+    for site in sites:
+        item = _summary({**document, "texts": [], "sites": [{"site": site, "features": 10 ** 9, **entry}]},
+                        [[] if grouped else None], 0, "", 0)["sites"][0]
+        bounds.append(bounds[-1] + _json_bytes(item) + 1)  # and its separating comma
+    return bounds

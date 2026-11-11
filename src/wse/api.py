@@ -1431,6 +1431,28 @@ class Engine:
         """
         return self.jobs.submit_evaluation(experiment_id, checkpoint_id, suite_id, config, key)
 
+    def submit_probe(self, experiment_id: str, checkpoint_id: str, texts: Sequence[Mapping[str, Any]],
+                     sites: Sequence[str | Mapping[str, Any]], key: str, *,
+                     groups: Mapping[str, Sequence[int]] | None = None, top: int | None = None) -> Job:
+        """Queue an activation probe of a checkpoint the experiment owns; returns the job immediately (worker only).
+
+        ``texts`` (at most the policy's ``texts_per_probe_call``) are outputs
+        of this run's generation passes (``{"output_uri": ..., "last": n}``,
+        ``last`` optional), strings (``{"text": ...}``), or items of a
+        development suite of the run's task (``{"suite_id": ..., "item":
+        i}``); each is cut to its last ``tokens_per_probe_text`` positions.
+        ``sites`` are ``residual:<i>``, ``<canonical module path>:input`` or
+        ``:output``, or role sites ``{"role": "mlp.down", "layer": 15,
+        "point": "input"}``. ``groups`` (``{"a": [...], "b": [...]}``, text
+        indices) adds each site's contrast ``a - b``; ``top`` (1-64, default
+        8) is the number of top standardized dimensions per site in the
+        summary. It reserves one probe call and texts x
+        ``tokens_per_probe_text`` teacher-forced tokens; the job's result is
+        the inline summary, whose ``result_uri`` is the run-scoped artifact of
+        every vector (``wse.probes``, **Managed probes**).
+        """
+        return self.jobs.submit_probe(experiment_id, checkpoint_id, texts, sites, key, groups=groups, top=top)
+
     def get_job(self, experiment_id: str, job_id: str, wait_seconds: float = 0) -> Job:
         """A job's state; ``wait_seconds`` (0-10) waits for a terminal state."""
         return self.jobs.get_job(experiment_id, job_id, wait_seconds)

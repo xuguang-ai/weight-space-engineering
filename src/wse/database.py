@@ -411,6 +411,61 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             """,
         ],
     ),
+    (
+        11,
+        [
+            # Probe jobs (M2 plan Section 5.3): the jobs table accepts kind 'probe', whose job names no suite
+            # (suite_id NULL; config_json holds the probe request), and keeps requiring a suite of every
+            # evaluation. SQLite cannot change a CHECK or NOT NULL constraint in place, so the table is rebuilt
+            # with its columns in their order, its rows, and its indexes. Foreign keys are deferred to the commit:
+            # dropping the table deletes the parents of the reports that reference jobs, and re-inserting the
+            # rows restores them, so the commit fails, and nothing changes, unless every reference resolves again.
+            "PRAGMA defer_foreign_keys = ON",
+            "CREATE TABLE jobs_v10 AS SELECT * FROM jobs ORDER BY rowid",
+            "DROP TABLE jobs",
+            """
+            CREATE TABLE jobs (
+                job_id               TEXT PRIMARY KEY,
+                experiment_id        TEXT NOT NULL REFERENCES experiments (experiment_id),
+                kind                 TEXT NOT NULL CHECK (kind IN ('evaluation', 'probe')),
+                checkpoint_id        TEXT NOT NULL REFERENCES checkpoints (checkpoint_id),
+                suite_id             TEXT REFERENCES suites (suite_id),
+                config_json          TEXT NOT NULL,
+                state                TEXT NOT NULL
+                                     CHECK (state IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+                reservation_id       TEXT NOT NULL UNIQUE REFERENCES reservations (reservation_id),
+                cancel_requested_at  TEXT,
+                progress_json        TEXT NOT NULL,
+                usage_json           TEXT,
+                result_json          TEXT,
+                error_json           TEXT,
+                lease_owner          TEXT,
+                lease_expires_at     REAL,
+                heartbeat_at         TEXT,
+                attempts             INTEGER NOT NULL DEFAULT 0,
+                created_at           TEXT NOT NULL,
+                started_at           TEXT,
+                finished_at          TEXT,
+                lease_pid            INTEGER,
+                report_id            TEXT REFERENCES reports (report_id),
+                CHECK ((kind = 'evaluation') = (suite_id IS NOT NULL))
+            )
+            """,
+            """
+            INSERT INTO jobs (job_id, experiment_id, kind, checkpoint_id, suite_id, config_json, state,
+                              reservation_id, cancel_requested_at, progress_json, usage_json, result_json, error_json,
+                              lease_owner, lease_expires_at, heartbeat_at, attempts, created_at, started_at,
+                              finished_at, lease_pid, report_id)
+            SELECT job_id, experiment_id, kind, checkpoint_id, suite_id, config_json, state, reservation_id,
+                   cancel_requested_at, progress_json, usage_json, result_json, error_json, lease_owner,
+                   lease_expires_at, heartbeat_at, attempts, created_at, started_at, finished_at, lease_pid, report_id
+            FROM jobs_v10 ORDER BY rowid
+            """,
+            "DROP TABLE jobs_v10",
+            "CREATE INDEX jobs_state ON jobs (state, created_at)",
+            "CREATE INDEX jobs_experiment ON jobs (experiment_id, created_at)",
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

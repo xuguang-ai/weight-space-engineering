@@ -1352,23 +1352,29 @@ class JobProgress(_Frozen):
     examples_started: int = 0
 
 
+JobKind = Literal["evaluation", "probe"]
+
+
 class Job(_Frozen):
-    """An asynchronous evaluation job: a forward-batch evaluation, or a generation pass of a generation suite.
+    """An asynchronous job: an evaluation (forward-batch or a generation pass of a generation suite) or a probe.
 
     ``usage`` is the settled usage once the job is terminal and ``None``
-    before. ``result`` carries the report summary (metrics, sample count,
-    errors) inline; ``report_id`` references a persisted report once
-    evaluation reports exist. ``cancel_requested`` is set when a running job
-    was asked to stop; computation already performed remains charged.
+    before. For an evaluation, ``result`` carries the report summary
+    (metrics, sample count, errors) inline and ``report_id`` references the
+    persisted report. A probe (``kind`` ``probe``, M2 plan Section 5.3) names
+    no suite or ``eval_config`` (both ``None``); its ``result`` is the probe's
+    inline summary, whose ``result_uri`` references the full result
+    (``wse.probes``). ``cancel_requested`` is set when a running job was asked
+    to stop; computation already performed remains charged.
     """
 
     schema_version: Literal["1"] = SCHEMA_VERSION
     job_id: str
     experiment_id: str
-    kind: Literal["evaluation"]
+    kind: JobKind
     checkpoint_id: str
-    suite_id: str
-    config: EvalConfig
+    suite_id: str | None
+    config: EvalConfig | None
     state: JobState
     cancel_requested: bool
     reservation: Reservation
@@ -1385,6 +1391,57 @@ class Job(_Frozen):
     @property
     def terminal(self) -> bool:
         return self.state in TERMINAL_JOB_STATES
+
+
+# ---------------------------------------------------------------------------
+# Probe requests (M2 plan Section 5.3; wse.probes, Engine.submit_probe)
+# ---------------------------------------------------------------------------
+
+# The longest string a probe text may be (characters); its tokens are then cut to the policy's limit.
+MAX_PROBE_STRING_CHARACTERS = 8192
+ANALYSIS_URI_PATTERN = r"^wse://analyses/[0-9a-f]{64}$"
+
+
+class ProbeOutputText(_Frozen):
+    """An output of one of the run's generation passes: its ``SampleResult.output_uri``, which names one sample.
+
+    The window is the output (its stop token left out), or its last
+    ``last`` tokens.
+    """
+
+    output_uri: str = Field(pattern=ANALYSIS_URI_PATTERN)
+    last: StrictInt | None = Field(default=None, ge=1)
+
+
+class ProbeStringText(_Frozen):
+    """A string, encoded as the tokenizer encodes plain text; the window is every token after the first."""
+
+    text: str = Field(min_length=1, max_length=MAX_PROBE_STRING_CHARACTERS)
+
+
+class ProbeSuiteText(_Frozen):
+    """Item ``item`` of a development suite of the run's task: its prompt as a generation pass renders it."""
+
+    suite_id: str = Field(pattern=LABEL_PATTERN)
+    item: StrictInt = Field(ge=0)
+
+
+ProbeTextSpec = ProbeOutputText | ProbeStringText | ProbeSuiteText
+
+
+class ProbeRoleSite(_Frozen):
+    """A role site: the input or output of the module that holds ``role`` (in ``layer``), from the family descriptor."""
+
+    role: str = Field(min_length=1, max_length=64)
+    layer: StrictInt | None = Field(default=None, ge=0)
+    point: Literal["input", "output"]
+
+
+class ProbeGroups(_Frozen):
+    """Two disjoint groups of text indices; each site's contrast is the mean of ``a`` minus the mean of ``b``."""
+
+    a: list[StrictInt] = Field(min_length=1)
+    b: list[StrictInt] = Field(min_length=1)
 
 
 # ---------------------------------------------------------------------------

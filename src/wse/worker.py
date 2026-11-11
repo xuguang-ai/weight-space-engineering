@@ -49,10 +49,25 @@ code: it runs registered evaluators over registered adapters only.
   in the settling transaction); the report carries every sample's grade,
   length, limit hit, a tail excerpt of its text, and its artifact's URI,
   within the policy's inline-result limit (``report_with_tails``).
-* **Model cache.** Generation passes load their checkpoint through
-  ``ModelCache``, keyed by checkpoint ID, so consecutive jobs on a checkpoint
-  load it once; see ``ModelCache`` for its bound and memory. M1 jobs load
-  their (small) models per job, as before.
+* **Probes** (M2 plan Section 5.3). A job of kind ``probe`` runs
+  ``wse.probes.probe`` on the cached model of its checkpoint, on the worker's
+  device, holding the runtime's forward lock while its hooks are registered.
+  The worker builds every text before the first forward (``wse.probes``,
+  **Managed probes**): an output is read back from its run-scoped artifact,
+  after its prompt, which is rendered again from the development suite and
+  must hash to the output's recorded prompt; a suite item is read from
+  evaluator storage, only for a development suite of the run's task. Each
+  text is cut to its last ``tokens_per_probe_text`` positions (and the
+  model's context). The ``ProbeMeter`` checks for cancellation and the time
+  limit before each text's forward and counts its forward length; settlement
+  charges one probe call (once a forward started), those tokens, and the
+  compute seconds. The full result is a run-scoped artifact
+  (``wse://analyses/<sha256>``), readable once the job has succeeded; the job
+  carries its inline summary.
+* **Model cache.** Generation passes and probes load their checkpoint
+  through ``ModelCache``, keyed by checkpoint ID, so consecutive jobs on a
+  checkpoint load it once; see ``ModelCache`` for its bound and memory. M1
+  jobs load their (small) models per job, as before.
 """
 
 from __future__ import annotations
@@ -61,6 +76,7 @@ import argparse
 import dataclasses
 import gc
 import importlib
+import json
 import os
 import resource
 import secrets
@@ -81,8 +97,8 @@ import torch
 from wse.api import evaluate_candidate
 from wse.audit import record_event
 from wse.database import Database, utc_now
-from wse.jobs import queued_cancel_usage, unused_counters
-from wse.schemas import ErrorCode, EvalConfig, GenerationOutput, JobProgress, Usage, WSEError
+from wse.jobs import job_counters, queued_cancel_usage, unused_counters
+from wse.schemas import ErrorCode, EvalConfig, GenerationOutput, JobProgress, Usage, WSEError, canonical_json
 
 if TYPE_CHECKING:
     from wse.api import EvaluationResult, ModelHandle
@@ -163,8 +179,8 @@ class ForwardMeter:
 
     def counts(self) -> dict[str, int]:
         """The counters this job charges: the forward calls and examples it started."""
-        return {"evaluation_batches": self.started_calls, "evaluated_examples": self.started_examples,
-                "model_forward_calls": self.started_calls, "generation_passes": 0, "generated_tokens": 0}
+        return {**job_counters(), "evaluation_batches": self.started_calls,
+                "evaluated_examples": self.started_examples, "model_forward_calls": self.started_calls}
 
 
 class GenerationMeter:
@@ -228,8 +244,64 @@ class GenerationMeter:
         with self._lock:
             tokens = min(self.max_tokens, self.completed_tokens + self._rows * self._steps)
             passes = 1 if self.batches_started else 0
-        return {"evaluation_batches": 0, "evaluated_examples": 0, "model_forward_calls": 0,
-                "generation_passes": passes, "generated_tokens": tokens}
+        return {**job_counters(), "generation_passes": passes, "generated_tokens": tokens}
+
+
+class ProbeMeter:
+    """The meter of a probe: its texts, its teacher-forced tokens, and its stops.
+
+    ``before_forward`` is ``wse.probes.probe``'s ``on_forward``: before each
+    text's forward it checks for cancellation and the time limit, then counts
+    the text and its forward length. A forward runs whole, so a text is
+    charged once its forward started; the probe counts once its first forward
+    started. The count never exceeds the reserved tokens. The monitor thread
+    reads the counts while the job runs, so they change under a lock.
+    """
+
+    def __init__(self, *, permitted: bool, max_tokens: int, deadline: float) -> None:
+        self.permitted = permitted
+        self.max_tokens = max_tokens
+        self.max_texts: int | None = None  # set from the request once it is read
+        self.deadline = deadline
+        self.stop_reason: str | None = None
+        self._lock = threading.Lock()
+        self.texts_started = 0
+        self.texts_completed = 0
+        self.tokens = 0
+
+    def check(self) -> None:
+        if self.stop_reason is None and time.monotonic() > self.deadline:
+            self.stop_reason = "timeout"
+        if self.stop_reason is not None:
+            raise JobStopped(self.stop_reason)
+
+    def before_forward(self, index: int, length: int) -> None:
+        self.check()
+        with self._lock:
+            if (self.max_texts is not None and self.texts_started + 1 > self.max_texts) \
+                    or self.tokens + length > self.max_tokens:
+                raise WSEError(ErrorCode.BUDGET_EXCEEDED,
+                               f"the probe needs more than the {self.max_tokens} teacher-forced tokens reserved for "
+                               "this job", details={"reserved_teacher_forced_tokens": self.max_tokens})
+            self.texts_completed = self.texts_started
+            self.texts_started += 1
+            self.tokens += length
+
+    def finished(self) -> None:
+        with self._lock:
+            self.texts_completed = self.texts_started
+
+    def progress(self, batches_total: int) -> JobProgress:
+        """Texts as batches: planned, started (charged if the job stops), and completed."""
+        with self._lock:
+            return JobProgress(batches_total=batches_total, batches_started=self.texts_started,
+                               batches_completed=self.texts_completed, examples_started=self.texts_started)
+
+    def counts(self) -> dict[str, int]:
+        """The counters this probe charges: the probe, once started, and the forward lengths started."""
+        with self._lock:
+            return {**job_counters(), "probe_calls": 1 if self.texts_started else 0,
+                    "teacher_forced_tokens": self.tokens}
 
 
 @dataclass(frozen=True)
@@ -245,9 +317,13 @@ class LoadedModel:
     text_model: TextModel
 
 
-def _release_device_memory(entry: LoadedModel) -> None:
+def _device_type(entry: LoadedModel) -> str | None:
+    return getattr(getattr(entry.text_model.runtime, "device", None), "type", None)
+
+
+def _release_device_memory(device: str | None) -> None:
+    """Collect dropped models and return MPS's cached blocks; call it once nothing references them any more."""
     gc.collect()
-    device = getattr(getattr(entry.text_model.runtime, "device", None), "type", None)
     if device == "mps":
         torch.mps.empty_cache()
 
@@ -262,7 +338,9 @@ class ModelCache:
     is dropped before a new model loads, so a load never holds one model more.
     The default of 2 keeps a base and a candidate, which an experiment's loop
     alternates: about 6 GB for Qwen3.5-0.8B on MPS. ``capacity`` 0 disables
-    the cache: each job loads its model and releases it when it ends.
+    the cache: each job loads its model and releases it when it ends. An
+    evicted entry is unreferenced (and collected, its device memory returned)
+    before the next model loads.
 
     Checkpoints are immutable and verified against their hashes when loaded,
     so an entry never goes stale; the worker still refuses a checkpoint marked
@@ -290,7 +368,9 @@ class ModelCache:
             return entry
         while self._entries and len(self._entries) >= self.capacity:
             _, evicted = self._entries.popitem(last=False)
-            _release_device_memory(evicted)
+            device = _device_type(evicted)
+            del evicted  # the last reference: the model is collectable before the next one loads
+            _release_device_memory(device)
         loaded = self._load(checkpoint_id)
         if self.capacity > 0:
             self._entries[checkpoint_id] = loaded
@@ -299,12 +379,16 @@ class ModelCache:
     def discard(self, checkpoint_id: str) -> None:
         evicted = self._entries.pop(checkpoint_id, None)
         if evicted is not None:
-            _release_device_memory(evicted)
+            device = _device_type(evicted)
+            del evicted
+            _release_device_memory(device)
 
     def clear(self) -> None:
         while self._entries:
             _, evicted = self._entries.popitem(last=False)
-            _release_device_memory(evicted)
+            device = _device_type(evicted)
+            del evicted
+            _release_device_memory(device)
 
 
 @dataclass(frozen=True)
@@ -313,6 +397,13 @@ class GenerationPass:
 
     result: EvaluationResult
     texts: Mapping[tuple[int, int], str]
+
+
+@dataclass(frozen=True)
+class ProbeOutcome:
+    """A finished probe: its inline summary, whose ``result_uri`` is its stored artifact."""
+
+    summary: Mapping[str, Any]
 
 
 def _stop_error(reason: str, limit: float) -> WSEError:
@@ -332,11 +423,12 @@ class _Execution:
     """State shared by the main thread and the monitor of one running job.
 
     ``output_uris`` and ``artifact_bytes`` are a generation pass's stored
-    outputs, and ``report_limit`` the policy's inline-result limit for its
-    report.
+    outputs or a probe's stored result, and ``report_limit`` the policy's
+    inline-result limit for its report.
     """
 
-    def __init__(self, job_id: str, meter: ForwardMeter | GenerationMeter, batches_total: int, limit: float) -> None:
+    def __init__(self, job_id: str, meter: ForwardMeter | GenerationMeter | ProbeMeter, batches_total: int,
+                 limit: float) -> None:
         self.job_id = job_id
         self.experiment_id: str | None = None
         self.checkpoint_id: str | None = None
@@ -485,10 +577,16 @@ class Worker:
         requested = reservation.requested if reservation.state == "HELD" else {}
         progress = JobProgress.model_validate_json(row["progress_json"])
         limit = float(requested.get("compute_seconds", 0))
+        probing = row["kind"] == "probe"
         # A generation pass is the job whose reservation holds a pass (jobs.JobService._generation_request).
-        generation = "generation_passes" in requested
-        meter: ForwardMeter | GenerationMeter
-        if generation:
+        generation = not probing and "generation_passes" in requested
+        meter: ForwardMeter | GenerationMeter | ProbeMeter
+        if probing:
+            meter = ProbeMeter(
+                permitted=experiment["mode"] == "bounded_eval" and requested.get("probe_calls", 0) > 0
+                and requested.get("teacher_forced_tokens", 0) > 0,
+                max_tokens=int(requested.get("teacher_forced_tokens", 0)), deadline=time.monotonic() + limit)
+        elif generation:
             meter = GenerationMeter(
                 permitted=experiment["mode"] == "bounded_eval" and requested.get("generated_tokens", 0) > 0,
                 max_tokens=int(requested.get("generated_tokens", 0)), deadline=time.monotonic() + limit)
@@ -516,18 +614,21 @@ class Worker:
             policy = self.engine.experiments.get_policy(experiment["policy_id"])
             if policy.policy_hash != experiment["policy_hash"]:
                 raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"policy of experiment {experiment['experiment_id']} changed")
-            execution.suite = self.jobs.load_suite(row["suite_id"])
-            config = EvalConfig.model_validate_json(row["config_json"])
-            if generation != self.jobs.generates_text(execution.suite):
-                raise WSEError(ErrorCode.WORKER_FAILED,
-                               f"the job's reservation does not match the evaluator of suite {row['suite_id']}, so it "
-                               "was not run", details={"reason": "reservation_mismatch"})
-            if isinstance(meter, GenerationMeter):
-                execution.report_limit = policy.operations.limits.max_result_json_bytes
-                result = self.generate(execution, config, meter, policy)
+            if isinstance(meter, ProbeMeter):
+                result = self.probe(execution, json.loads(row["config_json"]), meter, policy)
             else:
-                meter.batch_size = policy.budget.examples_per_batch
-                result = self.evaluate(row["checkpoint_id"], row["suite_id"], config, meter)
+                execution.suite = self.jobs.load_suite(row["suite_id"])
+                config = EvalConfig.model_validate_json(row["config_json"])
+                if generation != self.jobs.generates_text(execution.suite):
+                    raise WSEError(ErrorCode.WORKER_FAILED,
+                                   f"the job's reservation does not match the evaluator of suite {row['suite_id']}, so "
+                                   "it was not run", details={"reason": "reservation_mismatch"})
+                if isinstance(meter, GenerationMeter):
+                    execution.report_limit = policy.operations.limits.max_result_json_bytes
+                    result = self.generate(execution, config, meter, policy)
+                else:
+                    meter.batch_size = policy.budget.examples_per_batch
+                    result = self.evaluate(row["checkpoint_id"], row["suite_id"], config, meter)
             meter.check()  # a stop requested while the evaluator swallowed it still wins
             if time.monotonic() - execution.started > limit:
                 raise JobStopped("timeout")
@@ -536,7 +637,8 @@ class Worker:
         except WSEError as exc:
             error = exc
         except Exception as exc:  # noqa: BLE001 - any evaluator failure is a job failure
-            error = WSEError(ErrorCode.WORKER_FAILED, f"the evaluation raised {type(exc).__name__}: {exc}")
+            work = "probe" if probing else "evaluation"
+            error = WSEError(ErrorCode.WORKER_FAILED, f"the {work} raised {type(exc).__name__}: {exc}")
         finally:
             execution.done.set()
             monitor.join()
@@ -646,26 +748,141 @@ class Worker:
         return GenerationPass(result=dataclasses.replace(run.result, problems=problems),
                               texts={(output.index, output.sample): output.text for output in run.outputs})
 
+    # -- probes --------------------------------------------------------------------
+
+    def probe(self, execution: _Execution, request: Mapping[str, Any], meter: ProbeMeter, policy: Any
+              ) -> ProbeOutcome:
+        """Run the probe of a job through ``meter`` and store its result (worker-internal only; module docstring).
+
+        The request is checked against the policy and the reservation again,
+        every text is built before the first forward, and the probe runs on
+        the cached model. The full result is stored as an artifact; the run
+        may read it once the job has succeeded.
+        """
+        from wse.adapters.base import CAP_PROBE_HIDDEN_STATES
+        from wse.probes import PROBE_JOB_BYTES, fit_summary, probe, probe_document
+
+        if not meter.permitted:
+            raise WSEError(ErrorCode.POLICY_DENIED,
+                           "this experiment permits no probes; the worker never runs the target network")
+        budget, texts = policy.budget, request["texts"]
+        meter.max_texts = len(texts)
+        if len(texts) > budget.limit("texts_per_probe_call") or \
+                request["tokens_per_text"] > budget.limit("tokens_per_probe_text"):
+            raise WSEError(ErrorCode.POLICY_DENIED, "the probe exceeds the policy's per-probe limits",
+                           details={"texts": len(texts), "tokens_per_text": request["tokens_per_text"]})
+        loaded = self.loaded_model(execution.checkpoint_id)
+        handle = loaded.handle
+        if not handle.adapter.capabilities().supports(CAP_PROBE_HIDDEN_STATES):
+            raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY,
+                           f"checkpoint {execution.checkpoint_id} ({handle.adapter_ref}) cannot be probed")
+        context = handle.runtime(self.device).max_positions
+        limit = request["tokens_per_text"] if context is None else min(request["tokens_per_text"], context)
+        if len(texts) * limit > meter.max_tokens:
+            raise WSEError(ErrorCode.BUDGET_EXCEEDED,
+                           f"the probe may read {len(texts) * limit} tokens, more than the {meter.max_tokens} reserved "
+                           "for this job", details={"reserved_teacher_forced_tokens": meter.max_tokens})
+        cut, records = self._probe_texts(execution, texts, loaded, limit)
+        result = probe(handle, [text.probe_text() for text in cut], sites=[site["site"] for site in request["sites"]],
+                       device=self.device, max_tokens=limit, on_forward=meter.before_forward)
+        meter.finished()
+        header = {"experiment_id": execution.experiment_id, "job_id": execution.job_id,
+                  "checkpoint_id": execution.checkpoint_id, "model": handle.identity.model_dump(mode="json"),
+                  "runtime": dict(result.runtime), "tokens_per_text": limit}
+        document = probe_document(result, texts=records, sites=[site["requested"] for site in request["sites"]],
+                                  groups=request["groups"], header=header)
+        data = canonical_json(document).encode("utf-8")
+        uri = self.engine.store.put_analysis_result(data)
+        execution.output_uris = [uri]
+        execution.artifact_bytes += len(data)
+        summary = fit_summary(document, uri=uri, size=len(data), top=request["top"],
+                              limit=policy.operations.limits.max_result_json_bytes - PROBE_JOB_BYTES)
+        return ProbeOutcome(summary=summary)
+
+    def _probe_texts(self, execution: _Execution, texts: Sequence[Mapping[str, Any]], loaded: LoadedModel,
+                     limit: int) -> tuple[list[Any], list[dict[str, Any]]]:
+        """Every text of a probe, cut to ``limit`` positions, and its record (``wse.probes``, **Managed probes**)."""
+        from wse.evaluators.generation import effective_profile, encode_prompts, suite_parameters, token_hash
+        from wse.probes import cut_text
+
+        task_id = self.engine.experiments._experiment_row(execution.experiment_id)["task_id"]
+        suites: dict[str, tuple[Any, Any]] = {}
+
+        def prompt(suite_id: str, item: int, index: int) -> tuple[list[int], str]:
+            """The prompt of ``item``, as a pass renders it for this model, and the item's ID."""
+            if suite_id not in suites:
+                suite = self.jobs._read_suite(suite_id)
+                if suite.split != "development" or suite.task_id != task_id:  # never a final suite's items
+                    raise WSEError(ErrorCode.POLICY_DENIED, f"text {index}: suite {suite_id} is not a development "
+                                   "suite of the run's task", details={"text": index})
+                if suite.data is None:
+                    suite = suite.resolved(self.engine.datasets.load(suite.dataset))
+                profile = effective_profile(suite_parameters(suite), loaded.handle.source, self.engine.registry)
+                suites[suite_id] = (suite, profile)
+            suite, profile = suites[suite_id]
+            if not 0 <= item < len(suite.data.items):
+                raise WSEError(ErrorCode.NOT_FOUND, f"text {index}: suite {suite_id} has no item {item}",
+                               details={"text": index})
+            ids = encode_prompts(loaded.text_model, profile, suite.data.items, [item])[item]
+            return ids, suite.data.items[item].item_id
+
+        cut, records = [], []
+        for index, text in enumerate(texts):
+            if "output_uri" in text:
+                output = self.jobs.probe_output(execution.experiment_id, text["output_uri"], index)
+                ids, item_id = prompt(output.suite_id, output.index, index)
+                if item_id != output.item_id or token_hash(ids) != output.prompt_sha256:
+                    raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                                   f"text {index}: checkpoint {execution.checkpoint_id} renders the prompt of output "
+                                   f"{text['output_uri']} differently (another tokenizer or chat template), so the "
+                                   "output cannot be read after it", details={"text": index})
+                generated = list(output.tokens)
+                body = generated[:-1] if output.finished and len(generated) > 1 else generated
+                tokens = ids + body
+                window = len(body) if text.get("last") is None else min(int(text["last"]), len(body))
+                start, record = len(tokens) - window, {"source": "output", "output_uri": text["output_uri"],
+                                                       "finished": output.finished, "limit_hit": output.limit_hit}
+            elif "text" in text:
+                tokens = [int(token) for token in loaded.text_model.tokenizer(text["text"])["input_ids"]]
+                if len(tokens) < 2:
+                    raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                                   f"text {index} encodes to {len(tokens)} token(s); a probed string needs at least 2, "
+                                   "since its window starts after its first token", details={"text": index})
+                start, record = 1, {"source": "text"}
+            else:
+                tokens, _ = prompt(text["suite_id"], int(text["item"]), index)
+                start, record = 1, {"source": "suite_item", "suite_id": text["suite_id"], "item": int(text["item"])}
+            kept = cut_text(tokens, start, len(tokens), limit)
+            record.update(forward_tokens=len(kept.tokens), window_start=kept.start, window_stop=kept.stop,
+                          dropped_tokens=kept.dropped, tokens_sha256=token_hash(kept.tokens))
+            cut.append(kept)
+            records.append(record)
+        return cut, records
+
     def _finish(self, db: Database, execution: _Execution, state: str, result: Any,
                 error: WSEError | None) -> bool:
         from wse.evaluators.generation import report_with_tails
 
         usage = execution.usage()
         report = None
-        if result is not None and state == "succeeded":
+        summary: dict[str, Any] | None = None
+        if isinstance(result, ProbeOutcome) and state == "succeeded":
+            summary = dict(result.summary)
+        elif result is not None and state == "succeeded":
             evaluated = result.result if isinstance(result, GenerationPass) else result
             report = self.engine.evaluation.build_report(
                 evaluated, experiment_id=execution.experiment_id, job_id=execution.job_id,
                 checkpoint_id=execution.checkpoint_id, suite=execution.suite, usage=usage, keep_scores=True)
             if isinstance(result, GenerationPass):
                 report = report_with_tails(report, result.texts, limit=execution.report_limit)
+            summary = report.summary()
         with db.transaction() as conn:
-            finished = self.jobs.finish(conn, execution.job_id, state, usage,
-                                        result=report.summary() if report is not None else None, error=error,
+            finished = self.jobs.finish(conn, execution.job_id, state, usage, result=summary, error=error,
                                         progress=execution.meter.progress(execution.batches_total),
                                         lease_owner=self.worker_id, report=report)
-            if finished and report is not None:
-                # The run may read its pass's outputs from now on, as it reads its own analysis results.
+            if finished and summary is not None:
+                # The run may read its pass's outputs, or its probe's result, from now on, as it reads its own
+                # analysis results.
                 for uri in execution.output_uris:
                     conn.execute("INSERT OR IGNORE INTO analysis_results (uri, experiment_id, created_at) "
                                  "VALUES (?, ?, ?)", (uri, execution.experiment_id, utc_now()))
@@ -820,7 +1037,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--parent-pid", type=int, default=None,
                         help="stop (after the current job) once this process is no longer the worker's parent")
     parser.add_argument("--device", choices=("mps", "cpu"), default=None,
-                        help="the engine device of generation passes (default: mps when available, else cpu)")
+                        help="the engine device of generation passes and probes (default: mps when available, else cpu)")
     parser.add_argument("--model-cache-size", type=int, default=DEFAULT_MODEL_CACHE_SIZE,
                         help="models kept loaded across jobs (0 disables the cache; see wse.worker.ModelCache)")
     args = parser.parse_args(argv)
