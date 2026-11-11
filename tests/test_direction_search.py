@@ -360,6 +360,26 @@ def test_the_layer_of_largest_relative_contrast_is_chosen():
     assert _calls(actions, "wse_analyze")[0].arguments["tensor"] == f"{_down(0)}.weight"
 
 
+def test_the_layer_and_the_direction_come_from_the_output_site_not_the_input():
+    """The plan probes 'at the input of mlp.down'; the strategy probes input and output and ranks layers, and takes
+    the direction, at the output (the residual space that project_out on mlp.down needs). Here the two sites rank the
+    layers differently: the input would pick layer 0, the output picks layer 1."""
+    norms = {(0, "input"): (1.0, 1.0, 1.5), (0, "output"): (10.0, 10.0, 1.0),
+             (1, "input"): (1.0, 1.0, 0.1), (1, "output"): (10.0, 10.0, 5.0)}
+    world = World(layers=2, norms=norms)
+    actions = drive(DirectionSearchStrategy(columns=4), world)
+    (probe,) = _calls(actions, "wse_probe")
+    assert [(site["layer"], site["point"]) for site in probe.arguments["sites"]] == [
+        (0, "input"), (0, "output"), (1, "input"), (1, "output")]
+    (analysis,) = _calls(actions, "wse_analyze")
+    reference = "wse://analyses/" + f"{1:064x}" + "#/sites/3/contrast/direction"  # layer 1's output site
+    assert analysis.arguments["tensor"] == f"{_down(1)}.weight"
+    assert analysis.arguments["parameters"]["direction"] == reference
+    assert all(p.arguments["patch_spec"]["operations"][0]["direction"] == reference
+               for p in _calls(actions, "wse_preview_patch"))
+    assert actions[-1].reason.endswith("at layer 1 (limit-hit/accuracy: base 0.5/0.5, a1 0.25/0.5, a6 0/0.25)")
+
+
 def test_helpers_read_tensors_columns_and_metrics():
     manifest = World(layers=2).manifest()
     assert role_tensor_of_site(f"{_down(1)}:output", manifest)["name"] == f"{_down(1)}.weight"
