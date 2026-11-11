@@ -235,7 +235,7 @@ Each (problem, sample) pair gets its own seed, derived from the profile seed, th
 - **The article's protocol** runs MATH-500 with 4 samples per problem, up to 32,768 tokens each. Its independent re-run of the edited model generated 43.4 million tokens in about 51 minutes on an H200 with vLLM. The base model reaches the limit on about 93% of answers, so it generates even more.
 - **Task 7 measures local throughput** and estimates the cost of three protocols: the 25-problem comparison, a 100-problem single-sample final suite, and the full protocol.
 - **The user then decides** whether Q3's final evaluation runs locally on a subset or on a GPU worker. A GPU worker would become its own task, inserted before Task 13.
-- **Q3 is paused** (user decision, 2026-11-10): it follows WSE's open-source release, and this gate waits until then. Q2 continues to its exit.
+- **Q3 is paused** (user decision, 2026-11-10): it follows WSE's open-source release, and this gate waits until then. Q2 reached its exit on 2026-11-11 (`docs/m2-q2-report.md`).
 
 ## 5. Agent-Facing Tools (Q2)
 
@@ -540,44 +540,44 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
 
 **Files:** modify `src/wse/adapters/families.py` and `src/wse/policy.py`; create `tests/test_families.py`.
 
-- [ ] Write failing tests:
+- [x] Write failing tests:
   - `test_every_role_rule_resolves_to_tensors_with_expected_shapes` on the Qwen3.5 and Llama fixtures. For example, `mlp.down` is `[hidden, intermediate]`, and `attn.o`'s head axis has `num_heads × head_dim` entries.
   - `test_head_groups_partition_the_head_axis`;
   - `test_protected_roles_reject_edits_with_an_actionable_policy_error`;
   - `test_a_separately_supplied_descriptor_registers_without_core_changes`, in the spirit of M1's extension tests;
   - `test_descriptors_are_versioned_and_recorded_in_manifests`.
-- [ ] Run the tests; they must fail.
-- [ ] Implement the role and head rules of `qwen3_5@1` and `llama@1` from the fixtures' module names, with `final_norm`, `embed`, and `lm_head` protected.
-- [ ] Run the new tests and the full suite.
-- [ ] Review and commit.
+- [x] Run the tests; they must fail.
+- [x] Implement the role and head rules of `qwen3_5@1` and `llama@1` from the fixtures' module names, with `final_norm`, `embed`, and `lm_head` protected.
+- [x] Run the new tests and the full suite.
+- [x] Review and commit.
 
 ### Task 9: Edit operators `fill_slice`, `project_out`, and `add_low_rank`
 
 **Files:** create `src/wse/operators/directions.py` and `tests/test_direction_ops.py`; modify `src/wse/registry.py` and `src/wse/schemas.py`.
 
-- [ ] Write failing tests:
+- [x] Write failing tests:
   - known-value tests for each operator in FP32 and BF16;
   - `test_project_out_leaves_columns_outside_c_byte_identical`;
   - `test_project_out_removes_d_from_the_selected_columns_in_fp32`: after the edit, `dᵀ W'[:, C]` is about zero when α = 1;
   - `test_directions_by_artifact_uri_must_belong_to_the_run`;
   - `test_low_rank_rank_and_shape_limits`;
   - `test_alias_groups_and_protected_roles_are_refused`.
-- [ ] Run the tests; they must fail.
-- [ ] Implement the three operators through M1's operator contract. Their materialized results use Task 5's binary blocks.
-- [ ] Run the new tests and the full suite.
-- [ ] **(real model)** Separate recipe re-execution from exact replay:
+- [x] Run the tests; they must fail.
+- [x] Implement the three operators through M1's operator contract. Their materialized results use Task 5's binary blocks.
+- [x] Run the new tests and the full suite.
+- [x] **(real model)** Separate recipe re-execution from exact replay:
   1. Recover p50c's direction `d` and scale `α` from the published diff, as the top singular vector of `ΔW[:, C]` in each layer.
   2. Re-execute `project_out` on the base.
   3. Report how many entries differ from the exact p50c tensors, and by how many units in the last place.
 
   Exact replay (Task 5) stays the hash-exact path. The recovered `d` is an operator-only artifact.
-- [ ] Review and commit.
+- [x] Review and commit.
 
 ### Task 10: Analyses for large tensors
 
 **Files:** create `src/wse/operators/linalg.py` and `tests/test_linalg_analyses.py`; modify `src/wse/registry.py`, `src/wse/policy.py`, and `src/wse/schemas.py`.
 
-- [ ] Write failing tests:
+- [x] Write failing tests:
   - `test_tensor_norms_on_a_known_matrix`;
   - `test_svd_top_k_matches_numpy_on_a_small_matrix_up_to_sign`;
   - `test_randomized_svd_is_used_above_the_threshold_and_is_reproducible_with_its_seed`;
@@ -585,16 +585,16 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
   - `test_vector_results_return_a_summary_and_a_run_scoped_uri_within_31_kib`;
   - `test_analyses_never_call_forward`, as in M1;
   - `test_analysis_usage_is_metered`.
-- [ ] Run the tests; they must fail.
-- [ ] Implement the three analyses through M1's operator contract.
-- [ ] Run the new tests and the full suite.
-- [ ] Review and commit.
+- [x] Run the tests; they must fail.
+- [x] Implement the three analyses through M1's operator contract.
+- [x] Run the new tests and the full suite.
+- [x] Review and commit.
 
 ### Task 11: Probes, generation passes, budgets, policy, and MCP tools
 
 **Files:** create `src/wse/probes.py`, `tests/test_probes.py`, and `tests/test_llm_policy_mcp.py`; modify `src/wse/budget.py`, `src/wse/policy.py`, `src/wse/jobs.py`, `src/wse/worker.py`, `src/wse/mcp_server.py`, `src/wse/schemas.py`, `src/wse/database.py` (migration 10), and `docs/protocol.md`.
 
-- [ ] Write failing tests:
+- [x] Write failing tests:
   - `test_probe_hidden_states_match_a_direct_forward_on_the_fixture`;
   - `test_probe_role_sites_capture_the_input_of_mlp_down`;
   - `test_contrast_direction_is_the_difference_of_group_means`;
@@ -607,41 +607,41 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
   - `test_a_run_bound_server_defaults_the_experiment_id`.
 
   The last two are agent-facing items carried over from M1.
-- [ ] Run the tests; they must fail.
-- [ ] Implement:
+- [x] Run the tests; they must fail.
+- [x] Implement:
   - probes in the worker;
   - generation passes as development evaluations;
   - the four ledger counters, with migration 10 backfilling existing experiments (migration 9, from Task 5, added the `imported_patches` table);
   - policy `qwen_loop_v1` from Section 5.5;
   - `wse_probe`, and the extended `wse_analyze`, `wse_preview_patch`, and `wse_submit_evaluation`;
   - a worker-side cache that keeps loaded models across jobs, keyed by checkpoint ID.
-- [ ] Update `docs/protocol.md`. Its examples use Llama-3.2-1B-Instruct and generic tasks, never the Qwen loop task.
-- [ ] Run the new tests and the full suite.
-- [ ] Review and commit.
+- [x] Update `docs/protocol.md`. Its examples use Llama-3.2-1B-Instruct and generic tasks, never the Qwen loop task.
+- [x] Run the new tests and the full suite.
+- [x] Review and commit.
 
 ### Task 12: Q2 exit: expressiveness, scripted discovery, and the smoke matrix
 
 **Files:** create `src/wse/strategies/direction_search.py` (`direction_search@1`), `examples/qwen_loops/check_expressiveness.py` (operator-only), `docs/models.md`, and `docs/m2-q2-report.md`; modify `src/wse/registry.py`.
 
-- [ ] **(real model)** Check expressiveness: a scripted client drives the managed tools through MCP and applies `project_out` with Task 9's recovered direction, as an operator-only artifact, to the same 64 columns of layers 15 and 19. On a fixed practice subset, the development limit-hit rate must fall relative to the base.
-- [ ] **(real model)** Run scripted discovery, which has no oracle and uses only agent-available tools. The strategy:
+- [x] **(real model)** Check expressiveness: a scripted client drives the managed tools through MCP and applies `project_out` with Task 9's recovered direction, as an operator-only artifact, to the same 64 columns of layers 15 and 19. On a fixed practice subset, the development limit-hit rate must fall relative to the base.
+- [x] **(real model)** Run scripted discovery, which has no oracle and uses only agent-available tools. The strategy:
   1. runs a generation pass on practice problems;
   2. probes the outputs that reached the limit against those that finished, at the input of `mlp.down` in every layer;
   3. projects the contrast direction out of the most aligned columns of the layer with the largest separation;
   4. evaluates and selects.
 
   Report the outcome whether or not it improves on the base.
-- [ ] **(real model)** Run the smoke matrix through Level 0 with no new code. For `Qwen/Qwen3-0.6B` (ungated) and `google/gemma-3-1b-it` (gated, so request access first):
+- [x] **(real model)** Run the smoke matrix through Level 0 with no new code. For `Qwen/Qwen3-0.6B` (ungated) and `google/gemma-3-1b-it` (gated, so request access first):
   - import, with the download allow-list of Task 1;
   - check logits parity;
   - replay a patch;
   - run the generic analyses;
   - probe hidden states;
   - run one short generation.
-- [ ] Write `docs/models.md`: the support levels, the boundaries of Global Constraints, how to import a snapshot, how to write a family descriptor, and the models verified so far.
-- [ ] Write `docs/m2-q2-report.md` with the expressiveness check, the scripted discovery outcome, and the smoke matrix.
-- [ ] Run the full suite.
-- [ ] Review and commit. **Q2 exit:** the Section 1 conditions for Q2 hold.
+- [x] Write `docs/models.md`: the support levels, the boundaries of Global Constraints, how to import a snapshot, how to write a family descriptor, and the models verified so far.
+- [x] Write `docs/m2-q2-report.md` with the expressiveness check, the scripted discovery outcome, and the smoke matrix.
+- [x] Run the full suite.
+- [x] Review and commit. **Q2 exit:** the Section 1 conditions for Q2 hold (`docs/m2-q2-report.md`, Section 1). The scripted discovery ran and found no repair (Section 4 of that report).
 
 ### Task 13: Q3 preregistration and leak checks
 
