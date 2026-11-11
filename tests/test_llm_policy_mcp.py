@@ -21,7 +21,8 @@
 
 Models are the tiny offline fixtures of ``tests/hf_fixtures.py``. Scripted
 outputs come from a stand-in runtime installed in place of the worker's text
-model. Part 2 of Task 11 adds the MCP tests to this file.
+model. The MCP tests of Task 11 (part 2) are in ``tests/test_mcp_llm_tools.py``,
+which reuses this file's fixtures and helpers.
 """
 
 from __future__ import annotations
