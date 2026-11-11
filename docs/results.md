@@ -31,10 +31,10 @@ Records: [M2 Q1 report](../dev/m2-q1-report.md), Section 3, and [M2 Q2 report](.
 **Setup:**
 
 - 25 problems chosen by subset seed 0 (`sha256_rank@1`), 1 sample each;
-- the profile `qwen35think@1` at its full limit of 32,768 new tokens, evaluation seed 0, and the grader `math_boxed@1`;
+- the profile `qwen35think@1`, the article's sampling (thinking on, a boxed-answer instruction, temperature 0.6, top-k 20, top-p 0.95, presence penalty 1.5), at its full limit of 32,768 new tokens, evaluation seed 0, and the grader `math_boxed@1`;
 - one process, 6 h 5 min in all.
 
-The recorded run used `wse compare-generation`. The Quick Start's `compare`, with `problems=25`, no `max_new_tokens`, and an `out_dir` (which records every problem and resumes an interrupted run), calls the same runner with the same defaults: subset seed 0, evaluation seed 0, and batch size 8.
+The recorded run used `wse compare-generation`. The README's Python example, `compare` with `problems=25`, no `max_new_tokens`, and an `out_dir` (which records every problem and resumes an interrupted run), calls the same runner with the same defaults: subset seed 0, evaluation seed 0, and batch size 8.
 
 | Metric | Base | p50c | Paired difference, p50c − base (95% cluster bootstrap) | Exact 95% intervals (Clopper–Pearson) |
 | --- | ---: | ---: | --- | --- |
@@ -58,7 +58,83 @@ Record: [M2 Q1 report](../dev/m2-q1-report.md), Section 6.
 
 ## 3. Reconstructing p50c in four steps
 
-This is the README's example, [examples/p50c_four_steps.py](../examples/p50c_four_steps.py). It reconstructs a published intervention; it does not rediscover it. The article's agent, GPT-6 Astra, found p50c itself, by analyzing the weights in a Python kernel and running the model on practice problems. Here, the direction and the columns come from p50c's published change: the columns it changes, and the top singular vector of its change to them, signed so that its largest-magnitude entry is positive.
+An experiment follows four steps, each with its own tools:
+
+| Step | Question | WSE |
+| --- | --- | --- |
+| **Behavioral diagnosis** | How does the model fail? | Generation evaluation: accuracy, the rate of answers cut off at the token limit, and generated tokens, with intervals |
+| **Mechanism investigation** | Where inside the model? | Weight analyses (norms, singular vectors, projections) and activation probes (mean activations over the last tokens of each output, at the residual stream or any module, and contrasts between groups of outputs) |
+| **Weight intervention** | What change fixes it? | Exact patches from registered operators (scale, set, fill, project out a direction, add a low-rank term), or published edits imported with hash checks |
+| **Evaluation** | Did it help, and at what cost? | A paired comparison with the base on the same problems, prompts, and seeds, resumable and recorded |
+
+[examples/p50c_four_steps.py](../examples/p50c_four_steps.py) runs them on Qwen3.5-0.8B. It reconstructs a published intervention; it does not rediscover it. The article's agent, GPT-6 Astra, found p50c itself, by analyzing the weights in a Python kernel and running the model on practice problems. In each of layers 15 and 19, p50c subtracts six times the projection of 64 columns of `mlp.down_proj` onto one direction of that layer. Here, the direction and the columns come from p50c's published change: the columns it changes, and the top singular vector of its change to them, signed so that its largest-magnitude entry is positive. WSE's own `project_out` operator then re-executes the edit.
+
+The script uses the data of the README's Python example, plus GSM8K's training set as practice problems, so that the MATH-500 problems stay unseen:
+
+```bash
+curl -L --create-dirs -o ~/wse-data/gsm8k/train.jsonl \
+  https://raw.githubusercontent.com/openai/grade-school-math/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/data/train.jsonl
+uv run --no-sync python examples/p50c_four_steps.py   # the data directory defaults to ~/wse-data
+```
+
+The four steps, condensed. The script defines `M` (the data directory), `base` (the imported model), and `recover`, which reads p50c's direction and columns from its published change:
+
+```python
+GSM8K = M / "gsm8k/train.jsonl"
+SITE = "layers.15.mlp.down_proj:output"
+
+# 1. Diagnose: which answers run into the token limit?
+run = base.evaluate(
+    GSM8K,
+    format="gsm8k",
+    problems=32,
+    profile="qwen35think@1",
+    max_new_tokens=8192,
+)
+
+# 2. Probe: how do cut-off and finished answers differ at the output of an MLP projection?
+probe = base.probe(run, sites=[SITE], last=1024)
+contrast = probe.contrast(SITE, run.limit_hit(), run.finished())
+
+# 3. Edit: project a direction out of columns of that projection, in layers 15 and 19.
+model = base
+for layer in (15, 19):
+    name, direction, columns = recover(layer)  # p50c's direction and columns, from its published change
+    edit = model.edit(name, "project_out", direction=direction, columns=columns, alpha=6.0)
+    model = edit.save().model
+
+# 4. Evaluate: a paired, recorded comparison on the same problems, prompts, and seeds.
+comparison = base.compare(
+    model,
+    GSM8K,
+    format="gsm8k",
+    problems=32,
+    profile="qwen35think@1",
+    max_new_tokens=8192,
+    out_dir=M / "runs/four-steps",
+)
+print(comparison.table())
+```
+
+The script probes both layers and compares each contrast with p50c's direction. On an M4 Pro it took 1 h 54 min, almost all of it in three generation passes of about 37 minutes each; a generation pass generates one answer to each problem, and `compare` makes two. It printed (timing lines omitted):
+
+```text
+32 problems, 32 samples
+accuracy                     0.062 [0.000, 0.156]
+limit_hit_rate               0.938 [0.844, 1.000]
+mean_generated_tokens       8063.5 [7843.9, 8192.0]
+30 answers cut off at the limit, 2 finished
+layer 15: cosine of the contrast with p50c's direction +0.37
+layer 19: cosine of the contrast with p50c's direction -0.45
+130,134 weights changed
+32 problems, 32 samples per model
+metric                        base   candidate   difference [95% interval]
+accuracy                     0.062       0.312   +0.250 [+0.125, +0.406]
+limit_hit_rate               0.938       0.656   -0.281 [-0.438, -0.125]
+mean_generated_tokens       8063.5      7082.0   -981.5 [-1597.1, -434.7]
+```
+
+Answers cut off at the limit fell from 30 to 21 of 32, and accuracy rose from 2 to 10; all three intervals exclude zero. The probe's contrast leans toward p50c's direction, but with only 2 finished answers it points to where to look; it does not establish a mechanism. The re-executed edit is close to p50c's weights but not identical, because the two round differently. The subsections below take each step in turn.
 
 **Setup:**
 
@@ -145,7 +221,7 @@ Record: [M2 Q2 report](../dev/m2-q2-report.md), Sections 4.3, 6.1, and 6.2.
 
 ## 4. Through the MCP tools, with scripted controllers
 
-Both runs drove a real `wse serve` session under the policy `qwen_loop_v1`, through the OpenAI Agents SDK's tool loop, with a script choosing each call in place of a model.
+Both runs drove a real `wse serve` session under the policy `qwen_loop_v1` (10 generation passes of at most 32 problems and 8,192 new tokens per answer, 25 probe calls, and 6 hours of computation; [all of its budget](experiments.md#budgets)), through the OpenAI Agents SDK's tool loop, with a script choosing each call in place of a model.
 
 Both used another 32 GSM8K training problems, chosen by subset seed 0. Their problem IDs had another prefix, and the subset is chosen by a hash of the IDs, so these problems do not overlap Section 3's.
 
@@ -211,6 +287,8 @@ Record: [M2 Q2 report](../dev/m2-q2-report.md), Sections 3 and 4.
 - Final accuracy was 1.0 on 512 pairs (Clopper–Pearson 95% lower bound 0.9928), against 0.5 for the unedited control.
 - The trials used 9–12 turns and 12–16 tool calls each, and every export replayed to byte-identical weights.
 - An earlier set reached 3 of 5 because of a harness defect, fixed before the acceptance set.
+
+**A single run on 2026-11-11,** the README's first example (`examples/signed_sum/agent_api.py demo/live --model gpt-5.6-luna`, from a fresh clone), also met the target, in 8 turns and 11 tool calls, with 68,681 input and 1,402 output tokens, in about 30 s. Its one edit, `scale_slice` by −1 on `layers.1.weight[1:2, 0:4]`, changed 4 of the 22 parameters and gives the same weights as the acceptance set's fix. Final accuracy was 1.0 on 512 pairs against 0.5 for the control, and the export replayed to byte-identical weights. Of its budget it used 1 of 10 development evaluation batches, 1 of 20 candidate commits, and 4 of 100 tensor reads. Its instructions are in [experiments.md](experiments.md#what-the-agent-is-told).
 
 One small fixture says little about agent capability in general.
 

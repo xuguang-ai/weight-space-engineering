@@ -247,10 +247,14 @@ Agent SDKs are optional extras imported lazily inside the adapter module.
 ## Direct Python use
 
 For open-weight language models, the high-level entry point `wse.WSE`
-wraps the core and the operator `Engine` (see the README). Below it, the
-core works in memory, without a database, service, or MCP. Results are
-labeled `unmanaged` and support no managed-enforcement claim. This toy
-example edits a small MLP:
+wraps the core and the operator `Engine` (see the README's Python example).
+It accepts short names (`layers.15.mlp.down_proj` for
+`model.language_model.layers.15.mlp.down_proj.weight`), NumPy-style indices
+(`[:, :64]`), and roles that name tensors across families
+(`base.role("mlp.down", 15)`); every patch still records full names and
+explicit ranges. Below it, the core works in memory, without a database,
+service, or MCP. Results are labeled `unmanaged` and support no
+managed-enforcement claim. This toy example edits a small MLP:
 
 ```python
 import torch

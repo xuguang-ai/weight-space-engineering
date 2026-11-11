@@ -1,4 +1,4 @@
-"""The four steps of a weight-space experiment on Qwen3.5-0.8B, with the article's p50c edit (README, How WSE Works).
+"""The four steps of a weight-space experiment on Qwen3.5-0.8B, with the article's p50c edit (docs/results.md, Section 3).
 
 1. **Behavioral diagnosis.** A generation pass on 32 GSM8K training problems shows which answers are cut off
    at the token limit.
@@ -13,8 +13,8 @@
 Each layer's direction and columns are recovered from p50c's published change: the columns it changes and
 the top singular vector of its change to them, signed so that its largest-magnitude entry is positive, as
 ``svd_top_k@1`` signs its vectors. They come from the published edit, not from the data: the script shows the
-workflow; it does not discover the edit. The data layout is the README quick start's, plus GSM8K's training set as
-practice problems, so that MATH-500 stays unseen::
+workflow; it does not discover the edit. The data layout is that of the README's Python example, plus GSM8K's
+training set as practice problems, so that MATH-500 stays unseen::
 
     curl -L --create-dirs -o ~/wse-data/gsm8k/train.jsonl \\
         https://raw.githubusercontent.com/openai/grade-school-math/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/data/train.jsonl
