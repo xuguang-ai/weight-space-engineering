@@ -140,6 +140,43 @@ def test_three_evaluated_candidates_without_improvement_stop_the_run(engine, wor
     assert experiment.budget["candidate_commits"].consumed == 3 and experiment.state == "FROZEN"
 
 
+def test_the_scripted_strategy_reads_every_page_of_a_paged_inspection():
+    """On a model whose inspection is paged, the candidates come from the whole manifest, not its first page."""
+    from wse.strategies.base import Observation
+    from wse.strategies.scripted import ScriptedSearchStrategy
+
+    eid, base = "exp_" + "e" * 32, "ckpt_" + "0" * 32
+    tensors = [{"name": f"layers.{i}.weight", "shape": [2, 3]} for i in range(5)]
+    pages = [(0, 2), (2, 4), (4, 5)]
+
+    def page(cursor):
+        number = 0 if cursor is None else [f"tensors:{start}" for start, _ in pages].index(cursor)
+        start, stop = pages[number]
+        following = f"tensors:{stop}" if number + 1 < len(pages) else None
+        return {"manifest": {"tensors": tensors[start:stop]},
+                "tensor_page": {"start": start, "stop": stop, "tensor_count": 5, "page": number,
+                                "page_count": len(pages), "next_cursor": following}}
+
+    description = {"experiment": {"experiment_id": eid, "base_checkpoint_id": base, "selected_checkpoint_id": base,
+                                  "mode": "weights_only"}, "evaluation_available": False, "suites": [], "task": {}}
+    strategy = ScriptedSearchStrategy()
+    observations = [Observation(tool="wse_get_experiment", arguments={}, ok=True, result=description)]
+    budget = {"patch_previews": BudgetEntry(limit=1, consumed=0, remaining=1),
+              "candidate_commits": BudgetEntry(limit=1, consumed=0, remaining=1),
+              "tensor_read_calls": BudgetEntry(limit=1, consumed=0, remaining=1)}
+    cursors = []
+    while True:
+        action = strategy.next_action(None, list(observations), budget)
+        if action.tool != "wse_inspect_model":
+            break
+        cursors.append(action.arguments.get("cursor"))
+        observations.append(Observation(tool=action.tool, arguments=action.arguments, ok=True,
+                                        result=page(action.arguments.get("cursor"))))
+    assert cursors == [None, "tensors:2", "tensors:4"]
+    # The first candidate is the output end of the whole manifest: the last tensor, on the last page.
+    assert action.tool == "wse_read_tensor" and action.arguments["tensor"] == "layers.4.weight"
+
+
 def test_the_stop_monitor_counts_consecutive_candidates_without_improvement():
     class Report:
         def __init__(self, checkpoint_id, accuracy):

@@ -5,7 +5,8 @@ about any particular task or model: it reads the experiment description and
 the base model's manifest through the same operations an agent uses, builds
 an ordered list of candidate edits, and tries them one at a time.
 
-* **Candidates.** For every two-dimensional weight tensor, taken from the
+* **Candidates.** For every two-dimensional weight tensor of the base's
+  manifest (every page of a paged inspection), taken from the
   output end of the manifest towards the input end, and for every output unit
   (row) in ascending order, one ``scale_slice`` of that row by each of the
   configured ``factors`` (default ``[-1.0]``), optionally restricted to the
@@ -137,6 +138,21 @@ class ScriptedSearchStrategy:
             raise _Stop(f"evaluation job {job['job_id']} ended {job['state']}")
         return job
 
+    def _inspect(self, eid: str, base: str) -> Generator[Action, Observation, dict[str, Any]]:
+        """The base's manifest with every tensor: a paged inspection (a model with many tensors) is read to its end."""
+        tensors: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            arguments: dict[str, Any] = {"experiment_id": eid, "checkpoint_id": base}
+            if cursor is not None:
+                arguments["cursor"] = cursor
+            inspection = self._ok((yield Action.call("wse_inspect_model", "Read the architecture.", **arguments)),
+                                  "inspection")
+            tensors += inspection["manifest"]["tensors"]
+            cursor = (inspection.get("tensor_page") or {}).get("next_cursor")
+            if not cursor:
+                return {**inspection["manifest"], "tensors": tensors}
+
     # -- the search ------------------------------------------------------------------------
 
     def _candidates(self, manifest: dict[str, Any]) -> list[tuple[str, int, int, float]]:
@@ -151,9 +167,8 @@ class ScriptedSearchStrategy:
         experiment = description["experiment"]
         eid, base = experiment["experiment_id"], experiment["base_checkpoint_id"]
         selected = experiment["selected_checkpoint_id"]
-        inspection = self._ok((yield Action.call("wse_inspect_model", "Read the architecture.", experiment_id=eid,
-                                                 checkpoint_id=base)), "inspection")
-        candidates = self._candidates(inspection["manifest"])
+        manifest = yield from self._inspect(eid, base)
+        candidates = self._candidates(manifest)
         if not candidates:
             raise _Stop("the model has no two-dimensional weight tensors to edit")
 
