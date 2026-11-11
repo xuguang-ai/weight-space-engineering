@@ -225,7 +225,10 @@ the experiment and returns its job; wait for it with `wse_get_job`.
   `n` tokens); `{"text": "..."}`, 1 to 8,192 characters encoded as plain
   text; or `{"suite_id": ..., "item": i}`, an item of a development suite of
   the run's task, as a pass renders its prompt. Each text is cut to its last
-  `tokens_per_probe_text` tokens.
+  `min(tokens_per_probe_text, 16384)` tokens (16,384 is `MAX_PROBE_TOKENS`,
+  the longest forward of one text), and at most the model's context. A
+  string must encode to at least 2 tokens, since its window starts after
+  its first token.
 - `sites` (1 to 128 distinct sites): `"residual:<i>"`, the residual stream
   entering decoder layer `i` (`residual:<L>` is the last layer's output);
   `"<module path>:input"` or `":output"`, where a module path is a tensor
@@ -239,20 +242,50 @@ the experiment and returns its job; wait for it with `wse_get_job`.
 - `top` (optional, 1-64, default 8): top standardized dimensions per site in
   the summary.
 
-It reserves one `probe_calls`, texts x `tokens_per_probe_text`
-`teacher_forced_tokens`, and the per-operation compute time; the worker
-settles the forward lengths it read. The finished job's `result` is the
+It reserves one `probe_calls`, texts x `min(tokens_per_probe_text, 16384)`
+`teacher_forced_tokens` (the most its forwards can read), and the
+per-operation compute time; the worker settles the forward lengths it read.
+The finished job's `result` is the
 inline summary (per text its tokens, window, dropped tokens, and mean
 log-probability; per site its features, norms, and top dimensions) with
 `result_uri`, the run-scoped artifact of every vector; `wse_get_job` lists
 that URI in `uris`. Its vectors are named `<result_uri>#/sites/<i>/mean`,
 `#/sites/<i>/group_means/a` (or `/b`), and `#/sites/<i>/contrast/direction`,
-with `i` the site's position in `sites`. Errors: `POLICY_DENIED` for a
-final-suite item, more texts than permitted, or a policy without probes;
-`NOT_FOUND` for an output URI this experiment did not produce or a suite of
-another task; `INVALID_ARGUMENT` for malformed texts, sites, or groups, or a
-summary that could not fit the inline limit (fewer sites or texts);
-`UNSUPPORTED_CAPABILITY` for a model whose adapter cannot be probed.
+with `i` the site's position in `sites`.
+
+Errors of the call, before anything is reserved:
+
+- `POLICY_DENIED`: a policy without probes, or an experiment not in
+  `bounded_eval` mode; more texts than `texts_per_probe_call`; a policy
+  whose `tokens_per_probe_text` is below 2; an item of a final suite.
+- `NOT_FOUND`: a checkpoint the experiment does not own; an output URI this
+  experiment did not produce; a suite that does not exist or belongs to
+  another task, and an item beyond its `example_count`; a module path that
+  names no module (`details.candidates`), and a residual boundary beyond
+  the model's layers; a role site on a model without a family descriptor,
+  or in a layer without that role (`details.layers`).
+- `INVALID_ARGUMENT`: malformed texts, sites (a site name longer than 512
+  characters or a layer of more than 9 digits included), groups, or `top`;
+  an unknown role, or a layer given or missing against the role; a site
+  listed twice; a string that encodes to fewer than 2 tokens; a stored
+  result of the run that is not a generation output; an item of a suite
+  that is not a generation suite; a summary that could not fit the
+  inline-result limit (`details.max_sites`: probe fewer sites or texts).
+- `UNSUPPORTED_CAPABILITY`: a model whose adapter cannot be probed.
+- `VERSION_CONFLICT`: an experiment that is not `OPEN`;
+  `BUDGET_EXCEEDED`: too few probe calls, teacher-forced tokens, or compute
+  seconds left for the reservation; `IDEMPOTENCY_CONFLICT`: a key used for
+  another request.
+
+Failures in the worker end the job instead (`wse_get_job` shows its
+`state` and `error`), with the work already done charged: a site whose
+capture is not one vector per position (for example a module that returns
+a tuple, receives its input by keyword, runs more than once, or never runs)
+or residual sites on a model whose decoder layers cannot be found
+(`failed`); an output whose prompt the probed checkpoint renders
+differently (`failed`); the per-operation time limit (`failed`,
+`details.reason` `"timeout"`); a cancellation (`cancelled`); and a lost
+worker (`WORKER_FAILED`).
 
 **Analyses and stored vectors.** `wse_analyze` passes `parameters`, the
 operator's own parameters, to the analysis: `{"axis": "rows"}` for
