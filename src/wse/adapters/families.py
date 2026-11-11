@@ -237,12 +237,12 @@ class FamilyDescriptor(_Data):
 
     family_id: str
     version: str
-    model_types: list[str] = Field(min_length=1)
+    model_types: tuple[str, ...] = Field(min_length=1)
     text_config_key: str | None = None
     causal_lm_class: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
-    name_map: list[PrefixRule] = Field(default_factory=list)
-    roles: list[RoleRule] = Field(default_factory=list)
-    protected_roles: list[str] = Field(default_factory=list)
+    name_map: tuple[PrefixRule, ...] = ()
+    roles: tuple[RoleRule, ...] = ()
+    protected_roles: tuple[str, ...] = ()
 
     @field_validator("family_id")
     @classmethod

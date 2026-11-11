@@ -629,3 +629,22 @@ def test_the_new_result_classes_are_exported():
     import wse
 
     assert {"Evaluation", "Probe", "Comparison", "Edit", "WSE"} <= set(wse.__all__)
+
+
+def test_an_output_of_only_the_stop_token_keeps_it_as_its_window():
+    evaluation = _evaluation([_sample(0, [2], True), _sample(1, [7, 8], False)], {0: (1, 3), 1: (1, 5)})
+    only_stop, looping = evaluation.probe_texts()
+    assert (only_stop.tokens, only_stop.start, only_stop.stop) == ((1, 3, 2), 2, 3)
+    assert (looping.tokens, looping.start, looping.stop) == ((1, 5, 7, 8), 2, 4)
+
+
+def test_save_refuses_an_edit_whose_model_is_not_its_patchs_result(llama):
+    from wse.highlevel import Edit
+
+    edit = llama.edit("layers.0.mlp.down_proj[:, :8]", "scale_slice", factor=0.125)
+    other = llama.edit("layers.0.mlp.down_proj[:, :8]", "scale_slice", factor=8.0)
+    forged = Edit(base=llama, model=other.model, patch=edit.patch, diff=edit.diff, blocks=edit.blocks)
+    before = llama.engine.store.db.conn.execute("SELECT COUNT(*) AS n FROM imported_patches").fetchone()["n"]
+    _expect(ErrorCode.INVALID_ARGUMENT, forged.save)
+    after = llama.engine.store.db.conn.execute("SELECT COUNT(*) AS n FROM imported_patches").fetchone()["n"]
+    assert after == before  # nothing is stored

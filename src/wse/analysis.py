@@ -50,7 +50,7 @@ import numpy as np
 import torch
 from pydantic import BaseModel
 
-from wse.operators.base import VECTOR_REFERENCE_PATTERN, TensorRegion
+from wse.operators.base import MAX_VECTOR_REFERENCE_LENGTH, VECTOR_REFERENCE_PATTERN, TensorRegion
 from wse.operators.tensor import shortest_floats
 from wse.adapters.base import CAP_WEIGHTS_READ
 from wse.policy import (
@@ -319,6 +319,12 @@ def resolve_vector_reference(reference: str, read_result: ReadResult, *, paramet
     list of finite numbers within the float32 range, of at most
     ``max_length`` values.
     """
+    if isinstance(reference, str) and len(reference) > MAX_VECTOR_REFERENCE_LENGTH:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                       f"{parameter} reference is {len(reference)} characters long; a reference has at most "
+                       f"{MAX_VECTOR_REFERENCE_LENGTH} (wse://analyses/<sha256>#/<field>[/<index>])",
+                       details={"parameter": parameter, "length": len(reference),
+                                "max_length": MAX_VECTOR_REFERENCE_LENGTH})
     if not isinstance(reference, str) or not re.fullmatch(VECTOR_REFERENCE_PATTERN, reference):
         raise WSEError(ErrorCode.INVALID_ARGUMENT,
                        f"{parameter} reference {reference!r} must have the form "

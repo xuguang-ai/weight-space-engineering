@@ -80,6 +80,7 @@ __all__ = [
     "OperatorSpec",
     "TensorRegion",
     "UsageContract",
+    "MAX_VECTOR_REFERENCE_LENGTH",
     "VECTOR_REFERENCE_PATTERN",
     "VectorReference",
     "make_spec",
@@ -91,7 +92,11 @@ __all__ = [
 # analysis result, whose segments are field names or list indices without leading zeros, for example
 # ``#/right_vectors/0``.
 VECTOR_REFERENCE_PATTERN = r"^wse://analyses/[0-9a-f]{64}#(?:/(?:[A-Za-z_][A-Za-z0-9_]*|0|[1-9][0-9]*))+$"
-VectorReference = Annotated[str, StringConstraints(pattern=VECTOR_REFERENCE_PATTERN)]
+# A reference is at most this long: the 80-character URI and a pointer of a few short segments. Longer strings are
+# refused before they are matched or echoed, so no error or audit record can grow with them.
+MAX_VECTOR_REFERENCE_LENGTH = 256
+VectorReference = Annotated[str, StringConstraints(max_length=MAX_VECTOR_REFERENCE_LENGTH,
+                                                   pattern=VECTOR_REFERENCE_PATTERN)]
 _VECTOR_REFERENCE = re.compile(VECTOR_REFERENCE_PATTERN)
 
 # A parameter error message lists at most this many problems and counts the rest, so that an invalid long vector

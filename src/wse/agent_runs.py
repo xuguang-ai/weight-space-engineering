@@ -108,7 +108,7 @@ def run_agent_experiment(workspace: str | Path, *, task: str, base: str, policy:
                          max_turns: int | None = None, wall_clock_seconds: float | None = None,
                          out_dir: str | Path | None = None, final_evaluation: bool = False,
                          verify_replay: bool = True) -> AgentRun:
-    """Grant, run, final-evaluate, summarize, export, and replay one experiment (see the module docstring).
+    """Grant and run one experiment, then summarize, export, and replay it (see the module docstring).
 
     ``workspace`` must already hold the task, its suites, the policy, and
     the base checkpoint ``base``. Exactly one of ``model``, ``strategy``, and

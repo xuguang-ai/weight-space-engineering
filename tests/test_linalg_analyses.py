@@ -150,10 +150,12 @@ def test_linalg_analyses_are_registered_through_operator_specs():
         assert not any(operator.result_model.model_fields[name].is_required() for name in operator.artifact_fields)
     assert registry.resolve_ref("operator", "direction_projection@1").reference_parameters == ("direction",)
     assert (MAX_SVD_K, DEFAULT_SVD_K, SVD_EXACT_MAX_ELEMENTS) == (16, 8, 4 * 1024 * 1024)
-    # The built-in policies do not grant them; a policy grants each under a kind of its choice.
+    # M1's built-in policies do not grant them; a policy grants each under a kind of its choice.
+    from wse.policy import SMALL_MODEL_POLICY_ID, WEIGHTS_ONLY_POLICY_ID
+
     assert set(default_operation_policy().analyses) == {"stats", "norm", "top_k"}
-    for policy in builtin_experiment_policies().values():
-        assert not set(KINDS) & set(policy.operations.analyses)
+    for policy_id in (SMALL_MODEL_POLICY_ID, WEIGHTS_ONLY_POLICY_ID):
+        assert not set(KINDS) & set(builtin_experiment_policies()[policy_id].operations.analyses)
 
 
 class _VectorResult(OperatorResult):
@@ -600,3 +602,23 @@ def test_nonfinite_selections_are_refused():
         resolved = operator.resolve_parameters(parameters, region.element_count)
         error = _expect(ErrorCode.INVALID_ARGUMENT, operator.analyze, region, resolved)
         assert "2 nonfinite" in error.message and error.details["nonfinite_count"] == 2
+
+
+def test_an_overlong_reference_is_refused_with_a_bounded_error():
+    from wse.analysis import resolve_vector_reference
+    from wse.operators.base import MAX_VECTOR_REFERENCE_LENGTH
+
+    long = "wse://analyses/" + "0" * 64 + "#/" + "a" * 100_000  # matches the pattern, but far too long
+
+    def never(uri):
+        raise AssertionError("an overlong reference is refused before any stored result is read")
+
+    error = _expect(ErrorCode.INVALID_ARGUMENT, resolve_vector_reference, long, never, parameter="direction",
+                    max_length=2048)
+    assert len(str(error)) < 1000 and len(json.dumps(error.details)) < 1000
+    assert str(MAX_VECTOR_REFERENCE_LENGTH) in str(error)
+    # As an operator parameter, the same reference is refused while parsing, again with a bounded error.
+    model = _matrix(KNOWN)
+    error = _expect(ErrorCode.INVALID_ARGUMENT, _analyze, model, "direction_projection", _full(4, 3), direction=long,
+                    axis="columns")
+    assert len(str(error)) < 2000 and len(json.dumps(error.details, default=str)) < 2000

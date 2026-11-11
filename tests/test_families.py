@@ -290,7 +290,7 @@ def test_protected_roles_reject_edits_with_an_actionable_policy_error(name, hand
     handle = handles[name]
     family = FAMILIES[name]
     descriptor = model_family(handle)
-    assert descriptor.protected_roles == PROTECTED
+    assert list(descriptor.protected_roles) == PROTECTED
     editable = sorted({rule.role for rule in descriptor.roles} - set(PROTECTED))
     projection = default_operation_policy().with_edit("project_out", "project_out@1")
     down = role_tensor(handle, "mlp.down", layer=1)
@@ -457,7 +457,7 @@ def test_descriptor_rules_are_validated_when_constructed():
         HeadGrouping(num_heads_key="num_attention_heads", head_dim_key="head_dim", axis=1, head_dim_factor=0)
     base = dict(family_id="checked", version="1", model_types=["llama"],
                 roles=[RoleRule(pattern=layer, role="mlp.down")])
-    assert FamilyDescriptor(**base, protected_roles=["mlp.down"]).protected_roles == ["mlp.down"]
+    assert FamilyDescriptor(**base, protected_roles=["mlp.down"]).protected_roles == ("mlp.down",)
     for protected in (["final_norm"], ["not_a_role"]):  # a protected role needs a rule
         with pytest.raises(ValidationError):
             FamilyDescriptor(**base, protected_roles=protected)
@@ -522,3 +522,13 @@ def test_role_lookups_accept_numpy_integers(handles):
     assert attention.selection(head=np.int64(2)) == attention.selection(head=2)
     for bad in (True, 1.0, "1"):
         _expect(ErrorCode.INVALID_ARGUMENT, role_tensor, qwen, "attn.o", layer=bad)
+
+
+def test_built_in_descriptors_cannot_be_changed_in_place():
+    from wse.adapters.families import BUILTIN_FAMILIES
+
+    for descriptor in BUILTIN_FAMILIES:
+        for field in ("model_types", "name_map", "roles", "protected_roles"):
+            assert isinstance(getattr(descriptor, field), tuple), field
+        with pytest.raises(AttributeError):
+            descriptor.protected_roles.remove("lm_head")  # type: ignore[attr-defined]

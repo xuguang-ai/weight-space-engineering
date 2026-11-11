@@ -275,13 +275,14 @@ class Edit:
         """
         if self.patch_id is not None and self.model.checkpoint_id is not None:
             return self
+        if self.patch.result_weights_hash != self.model.weights_hash:
+            raise _invalid("this edit's model is not its patch's result, so it is not stored; make edits with "
+                           "WSE.edit or WSE.apply_patch")
         base_id = self.base.checkpoint_id or self.base._stored_checkpoint_id()
         if base_id is None:
             raise _invalid("this edit's base is an edit kept in memory, so it is not stored; save the edit that "
                            "made the base first")
         record = self.base.engine.store_patch(self.patch, self.blocks, base_checkpoint_id=base_id, label=label)
-        if record.result_weights_hash != self.model.weights_hash:  # pragma: no cover - store_patch replays the patch
-            raise WSEError(ErrorCode.ARTIFACT_CORRUPT, "the stored candidate's weights differ from the edit's")
         model = self.base._child(self.model.handle, record.checkpoint_id)
         return Edit(base=self.base, model=model, patch=self.patch, diff=self.diff, blocks=self.blocks,
                     patch_id=record.patch_id)
@@ -359,7 +360,8 @@ class Evaluation:
         """One ``ProbeText`` per output: its prompt and output tokens, averaged over the output.
 
         A finished output's stop token is left out, so that finished and
-        limit-hit windows hold the same kind of tokens. With ``last``, the
+        limit-hit windows hold the same kind of tokens; an output that is
+        only its stop token keeps it, as its one-token window. With ``last``, the
         window is the output's last ``last`` tokens (all of them when it is
         shorter); the forward still reads the whole prompt and output before
         them, so every position has its full context. With ``context``, only
@@ -374,7 +376,8 @@ class Evaluation:
                 raise _invalid(f"{name} must be a positive integer")
         texts = []
         for output in self.outputs:
-            generated = tuple(output.tokens[:-1] if output.finished and output.tokens else output.tokens)
+            drop = output.finished and len(output.tokens) > 1
+            generated = tuple(output.tokens[:-1] if drop else output.tokens)
             tokens = tuple(self.prompts[output.index]) + generated
             size = len(generated) if last is None else min(last, len(generated))
             start = len(tokens) - size
@@ -751,7 +754,9 @@ class WSE:
         keyword arguments are the operator's parameters, for example
         ``factor=0.5`` for ``scale_slice``, ``value=0.0`` for ``fill_slice``,
         ``direction=..., columns=..., alpha=...`` for ``project_out``, or
-        ``u=..., v=..., alpha=...`` (``r`` columns each) for ``add_low_rank``.
+        ``u=..., v=..., alpha=...`` for ``add_low_rank``, where ``u`` and ``v``
+        list the ``r`` columns of ``U`` and ``V`` (arrays of shape
+        ``[r, rows]`` and ``[r, columns]``: the factors transposed).
         NumPy arrays and tensors among them
         become lists, and NumPy scalars Python numbers.
         """
