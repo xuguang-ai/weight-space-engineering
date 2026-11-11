@@ -136,10 +136,15 @@ the text by default). Every result has the same envelope:
 
 `usage.call` is the usage the domain result records (reads, analyses,
 previews, settled jobs) and `null` otherwise; the call's charges are then
-visible in `usage.cumulative`, the experiment's ledger. Read, analysis, and
-probe-job results list only the counters they charge in `cumulative`, and
-`wse_get_report`, which charges nothing, lists none. `wse_list_models` has
-no experiment and returns `usage: null`.
+visible in `usage.cumulative`, the experiment's ledger. Results that can
+fill the inline-result limit list only the counters they charge in
+`cumulative`: reads (`tensor_read_calls`, `compute_seconds`), analyses
+(their counter and `compute_seconds`), probe jobs (`probe_calls`,
+`teacher_forced_tokens`, `compute_seconds`), previews (`patch_previews`,
+`compute_seconds`), applied candidates (`candidate_commits`,
+`compute_seconds`), and inspections (`compute_seconds`). `wse_get_report`,
+which charges nothing, lists none, and `wse_get_experiment` lists every
+counter. `wse_list_models` has no experiment and returns `usage: null`.
 
 ### Response size
 
@@ -152,6 +157,12 @@ stays within 64 KiB. Oversized requests fail with `INVALID_ARGUMENT` and
 result in a 63,505-byte JSON-RPC response; values of about 1e15 (19-20
 characters each) limit the read to 1,536 elements, a 31,386-byte result in a
 64,155-byte response.
+
+The envelope (summary, URIs, `usage`, and the framing) stays within that
+allowance in both copies, with every number at its widest, because results
+that can fill the limit list only the counters they charge (above): about
+1.5 to 1.8 KB, where every counter of a language-model policy's ledger
+would take about 5 KB.
 
 Language models add results whose JSON is mostly text: output tails, tensor
 names and axes, and report keys. The text mirror escapes every quote,
@@ -274,12 +285,26 @@ sample counts, or prompts fail with `INCOMPATIBLE_REPORTS`. Other reports
 give M1's `ComparisonReport`.
 
 **Large models.** A result that would exceed the inline-result limit takes a
-bounded form; the choice depends on the model and the policy only, never on
-measured times:
+bounded form. Inspection pages depend on the model and the policy only; a
+preview's form also depends on its patch (texts, operations, and diff
+values), and a candidate's view on the tensors its patch changed; none
+depends on measured times:
 
 - `wse_preview_patch`: `tensors` lists the diffs of the changed tensors only,
   and `unchanged_tensors` counts the others (absent when every tensor is
-  listed). The aggregates cover the whole model.
+  listed). The aggregates cover the whole model. `hypothesis` and
+  `expected_behavior` take at most 2,000 characters each. A request whose
+  bounded preview, or the bounded view of the candidate it would create,
+  could exceed the limit is refused with `INVALID_PATCH` before anything is
+  materialized or charged (`details`: `limit_bytes`, `preview_bound_bytes`,
+  `candidate_bound_bytes`). The bound comes from the request and the
+  manifest alone: every tensor an operation names counts as changed and
+  every number takes its widest form. Only many operations on tensors with
+  long names together with long texts full of characters that JSON escapes
+  (quotes, backslashes, control characters) reach it: on a 321-tensor
+  layout, 32 operations with 2,000-character plain texts fit, and texts of
+  2,000 quotes do not. Propose fewer operations per patch or shorten the
+  texts.
 - `wse_inspect_model`: the inspection is paged. `manifest.tensors` and
   `tensor_statistics` hold one page's tensors, `tensor_page` (`start`,
   `stop`, `tensor_count`, `page`, `page_count`, `next_cursor`) says which,
@@ -296,7 +321,9 @@ The whole documents stay available as resources (`wse://models/{id}/manifest`,
 
 Measured on 2026-11-10 through the protocol (`mcp.Client` against
 `wse serve`, PyTorch MPS) on Qwen3.5-0.8B, an open-weight model with 321
-tensors, under a policy with the default 32 KiB inline limit:
+tensors, under a policy with the default 32 KiB inline limit, when every
+result listed all counters in `cumulative` (its responses are now about 1.5
+to 3 KB smaller):
 
 | Result | Whole form (JSON) | Bounded form (JSON) | Largest response |
 | --- | --- | --- | --- |

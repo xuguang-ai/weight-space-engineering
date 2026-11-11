@@ -737,6 +737,196 @@ def test_open_weight_previews_inspections_and_candidates_take_bounded_forms_when
     run(body)
 
 
+@pytest.fixture(scope="module")
+def wide_layouts(tmp_path_factory) -> dict[str, Any]:
+    """Two tiny models with realistic tensor counts, built offline: an 8-layer Llama (75 tensors) and a 24-layer
+    Qwen3.5 in Qwen3.5-0.8B's layer pattern (321 tensors)."""
+    pytest.importorskip("transformers")
+    import torch
+    from transformers import LlamaConfig, LlamaForCausalLM, Qwen3_5Config, Qwen3_5ForConditionalGeneration
+
+    import hf_fixtures
+
+    root = tmp_path_factory.mktemp("wide_layouts")
+    torch.manual_seed(0)
+    llama = LlamaForCausalLM(LlamaConfig(**{**hf_fixtures.LLAMA, "num_hidden_layers": 8}, tie_word_embeddings=False,
+                                         bos_token_id=1, eos_token_id=2))
+    hf_fixtures._finish(llama, root / "llama8", dtype=torch.bfloat16)
+    text = {**hf_fixtures.QWEN3_5_TEXT, "num_hidden_layers": 24,
+            "layer_types": (["linear_attention"] * 3 + ["full_attention"]) * 6}
+    qwen = Qwen3_5ForConditionalGeneration(Qwen3_5Config(text_config=text, vision_config=hf_fixtures.QWEN3_5_VISION,
+                                                         tie_word_embeddings=True))
+    hf_fixtures._finish(qwen, root / "qwen3_5_24", dtype=torch.bfloat16, max_shard_size="2MB",
+                        f32_suffixes=(".linear_attn.A_log", ".linear_attn.norm.weight"))
+    return {"llama8": root / "llama8", "qwen3_5_24": root / "qwen3_5_24"}
+
+
+def _import_run(snapshot, workspace) -> tuple[str, str, str]:
+    """Import ``snapshot`` into ``workspace`` and open a qwen_loop_v1 run on it: (base, run_id, experiment_id)."""
+    with Engine(workspace) as engine:
+        base = engine.import_hf_snapshot(snapshot, repo="example-org/wide", revision=REVISION).checkpoint_id
+    run_id, eid = _open_run(workspace, base)
+    return base, run_id, eid
+
+
+def test_bounded_results_list_the_counters_they_charge_and_their_widest_envelopes_fit_the_allowance(lm, monkeypatch):
+    """Previews, applied candidates, and inspections list only the counters they charge in usage.cumulative, so that
+    their envelope (summary, URIs, usage, and the JSON-RPC framing, in both copies) stays within the allowance that
+    the inline-result limit leaves (RESPONSE_ENVELOPE_BYTES per copy) even with every number at its widest; every
+    counter of qwen_loop_v1's ledger would take about 5 KB."""
+    from wse.experiments import _WIDEST_FLOAT
+    from wse.mcp_server import WSEMCPServer
+    from wse.policy import RESPONSE_ENVELOPE_BYTES, response_size
+    from wse.schemas import BudgetEntry, ModelInspection, ModelManifest, PatchPreview, TensorPage
+
+    run_id, eid = _open_run(lm.workspace, lm.base)
+    spec = {"base_checkpoint_id": lm.base, "hypothesis": "One weight.",
+            "operations": [{"op": "fill_slice", "tensor": f"{DOWN0}.weight", "value": 0.25,
+                            "selection": _sel((0, 1), (0, 1))}]}
+    with Engine(lm.workspace, run_id=run_id) as bound:
+        server = WSEMCPServer(bound)
+        preview = server.wse_preview_patch(experiment_id=eid, patch_spec=spec, idempotency_key="p")
+        patch_id = preview.structured_content["result"]["patch_id"]
+        applied = server.wse_apply_patch(experiment_id=eid, patch_id=patch_id, idempotency_key="a")
+        inspected = server.wse_inspect_model(experiment_id=eid, checkpoint_id=lm.base)
+        assert [sorted(response.structured_content["usage"]["cumulative"]) for response in (preview, applied,
+                                                                                             inspected)] == [
+            ["compute_seconds", "patch_previews"], ["candidate_commits", "compute_seconds"], ["compute_seconds"]]
+        # Every ledger number, count, and measured value at its widest.
+        wide, count = _WIDEST_FLOAT, 10 ** 16 - 1
+        experiment = bound.get_experiment(eid)
+        widest = experiment.model_copy(update={"budget": {name: BudgetEntry(limit=wide, consumed=wide, reserved=wide,
+                                                                              remaining=wide)
+                                                          for name in experiment.budget}})
+        shown = PatchPreview.model_validate(preview.structured_content["result"])
+        shown = shown.model_copy(update={"changed_elements": count, "parameter_count": count, "usage": shown.usage.
+                                         model_copy(update={"artifact_bytes": count, "compute_seconds": wide})})
+        manifest = ModelManifest.model_validate(applied.structured_content["result"])
+        inspection = ModelInspection.model_validate(inspected.structured_content["result"])
+        inspection = inspection.model_copy(update={
+            "role": "candidate", "usage": inspection.usage.model_copy(update={"compute_seconds": wide}),
+            "manifest": inspection.manifest.model_copy(update={"parameter_count": count}),
+            "tensor_page": TensorPage(start=10 ** 9, stop=10 ** 9, tensor_count=10 ** 9, page=10 ** 9 - 2,
+                                      page_count=10 ** 9, next_cursor=f"tensors:{10 ** 9 - 1}")})
+        monkeypatch.setattr(bound, "get_experiment", lambda *args, **kwargs: widest)
+        monkeypatch.setattr(bound, "preview_patch", lambda *args, **kwargs: shown)
+        monkeypatch.setattr(bound, "apply_patch", lambda *args, **kwargs: manifest.model_copy(
+            update={"unchanged_tensors": 10 ** 9}))
+        monkeypatch.setattr(bound, "inspect_model_details", lambda *args, **kwargs: inspection)
+        responses = [server.wse_preview_patch(experiment_id=eid, patch_spec=spec, idempotency_key="p"),
+                     server.wse_apply_patch(experiment_id=eid, patch_id=patch_id, idempotency_key="a"),
+                     server.wse_inspect_model(experiment_id=eid, checkpoint_id=lm.base)]
+        envelopes = [_wire_bytes(response) - response_size(response.structured_content["result"])
+                     for response in responses]
+        assert all(0 < envelope <= 2 * RESPONSE_ENVELOPE_BYTES for envelope in envelopes), envelopes
+    print(f"widest envelopes (preview, candidate, inspection): {envelopes} of {2 * RESPONSE_ENVELOPE_BYTES} bytes")
+
+
+def test_whole_previews_up_to_the_limit_fit_one_response_on_the_wire(wide_layouts, tmp_path):
+    """C5: on a 75-tensor model, one fill_slice with a 900-character hypothesis kept the whole form (a result of
+    62,504 response bytes) and took 65,541 bytes on the wire. Up to the length where the bounded form takes over,
+    every whole preview now fits 64 KiB, through the handler and through a real stdio session."""
+    from wse.mcp_server import WSEMCPServer
+
+    workspace = tmp_path / "workspace"
+    base, run_id, eid = _import_run(wide_layouts["llama8"], workspace)
+
+    def spec(length: int) -> dict:
+        return {"base_checkpoint_id": base, "hypothesis": "h" * length, "expected_behavior": "",
+                "operations": [{"op": "fill_slice", "tensor": "model.layers.0.mlp.down_proj.weight", "value": 0.25,
+                                "selection": _sel((0, 1), (0, 1))}]}
+
+    whole = []
+    with Engine(workspace, run_id=run_id) as bound:
+        server = WSEMCPServer(bound)
+        for length in range(100, 2001, 100):
+            response = server.wse_preview_patch(experiment_id=eid, patch_spec=spec(length),
+                                                idempotency_key=f"p{length}")
+            assert not response.is_error and _wire_bytes(response) <= MAX_RESPONSE_BYTES, (length, _wire_bytes(
+                response))
+            if "unchanged_tensors" not in response.structured_content["result"]:
+                whole.append((_wire_bytes(response), length))
+    largest, length = max(whole)
+    assert largest > 63 * 1024  # the sweep reaches the whole form's limit
+
+    async def body():
+        async with connect(workspace, run_id, tmp_path / "serve.err") as session:
+            response = await session.raw("wse_preview_patch", experiment_id=eid, patch_spec=spec(length),
+                                         idempotency_key=f"stdio{length}")
+            assert not response.is_error and _wire_bytes(response) <= MAX_RESPONSE_BYTES
+            assert "unchanged_tensors" not in response.structured_content["result"]
+
+    run(body)
+    print(f"largest whole preview: {largest} bytes on the wire with a {length}-character hypothesis")
+
+
+def test_a_preview_whose_bounded_form_could_exceed_the_limit_is_refused_before_anything_is_charged(
+        wide_layouts, tmp_path):
+    """C5: 32 fill_slice operations on a 321-tensor layout with hypothesis and expected_behavior of 2,000 quotes each
+    gave a bounded preview of 74,437 bytes on the wire. Such a request is now refused (INVALID_PATCH) from the
+    request alone, before anything is materialized or charged; with plain texts of the maximum length the same
+    operations fit, and so does the largest escape-heavy text accepted, through a real stdio session too."""
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    from wse.mcp_server import WSEMCPServer
+
+    workspace = tmp_path / "workspace"
+    base, run_id, eid = _import_run(wide_layouts["qwen3_5_24"], workspace)
+    with Engine(workspace) as engine:
+        tensors = engine.load_manifest(base).tensors
+    names = [info.name for info in tensors if info.name.endswith(("mlp.down_proj.weight", "mlp.up_proj.weight",
+                                                                  "mlp.gate_proj.weight"))][:32]
+    assert len(tensors) == 321 and len(names) == 32
+
+    def spec(text: str) -> dict:
+        return {"base_checkpoint_id": base, "hypothesis": text, "expected_behavior": text,
+                "operations": [{"op": "fill_slice", "tensor": name, "value": 0.5, "selection": _sel((0, 1), (0, 1))}
+                               for name in names]}
+
+    with Engine(workspace, run_id=run_id) as bound:
+        server = WSEMCPServer(bound)
+        before = _budget(bound, eid)
+        with pytest.raises(ToolError) as raised:
+            server.wse_preview_patch(experiment_id=eid, patch_spec=spec('"' * 2000), idempotency_key="quotes")
+        error = json.loads(str(raised.value))["error"]
+        assert error["code"] == "INVALID_PATCH" and error["details"]["preview_bound_bytes"] > \
+            error["details"]["limit_bytes"] == 2 * INLINE_RESULT_LIMIT
+        assert _budget(bound, eid) == before
+        assert bound.store.db.conn.execute("SELECT COUNT(*) FROM patches").fetchone()[0] == 0
+        # Plain texts of the maximum length: the bounded preview and the candidate's view fit one response.
+        plain = server.wse_preview_patch(experiment_id=eid, patch_spec=spec("p" * 2000), idempotency_key="plain")
+        result = plain.structured_content["result"]
+        assert len(result["tensors"]) == 32 and result["unchanged_tensors"] == 321 - 32
+        applied = server.wse_apply_patch(experiment_id=eid, patch_id=result["patch_id"], idempotency_key="apply")
+        assert len(applied.structured_content["result"]["tensors"]) == 32
+        sizes = {"plain preview": _wire_bytes(plain), "candidate": _wire_bytes(applied)}
+        # The longest texts of quotes that are accepted.
+        low, high = 0, 2000
+        while low < high:
+            middle = (low + high + 1) // 2
+            try:
+                server.wse_preview_patch(experiment_id=eid, patch_spec=spec('"' * middle),
+                                         idempotency_key=f"q{middle}")
+                low = middle
+            except ToolError:
+                high = middle - 1
+        assert 0 < low < 2000
+        accepted = server.wse_preview_patch(experiment_id=eid, patch_spec=spec('"' * low), idempotency_key=f"q{low}")
+        sizes["largest accepted preview"] = _wire_bytes(accepted)
+    assert all(size <= MAX_RESPONSE_BYTES for size in sizes.values()), sizes
+
+    async def body():
+        async with connect(workspace, run_id, tmp_path / "serve.err") as session:
+            response = await session.raw("wse_preview_patch", patch_spec=spec('"' * low), idempotency_key="stdio")
+            assert not response.is_error and _wire_bytes(response) <= MAX_RESPONSE_BYTES
+            sizes["stdio"] = _wire_bytes(response)
+            await session.fails("INVALID_PATCH", "wse_preview_patch", patch_spec=spec('"' * (low + 1)),
+                                idempotency_key="stdio-over")
+
+    run(body)
+    print(f"321 tensors, 32 operations: {sizes}; texts of {low} quotes accepted")
+
+
 def test_invalid_cursors_are_refused_with_a_bounded_echo(hf_snapshots, tmp_path):
     """An inspection or model-list cursor that no page returned is INVALID_ARGUMENT, echoed at most 64 characters."""
     from mcp.server.mcpserver.exceptions import ToolError

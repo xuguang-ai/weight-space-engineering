@@ -27,12 +27,14 @@ decisions, and usage accounting.
   SDK shows the model the text, not ``structuredContent``. Every result has
   a one-line ``summary``, the artifact ``uris`` it refers to, the per-call
   usage where the domain object records one, and the experiment's
-  cumulative budget, around the domain ``result``. Results stay within the
-  experiment policy's inline-result limit also for open-weight models with
-  hundreds of tensors: previews list the changed tensors, inspections are
-  paged, an applied candidate's manifest lists its changed tensors, and a
-  report too large for one result is a ``ReportOverview`` that names its
-  paged resource. M1 models, whose results fit whole, keep their M1 forms.
+  cumulative budget (``ToolUsage``: only the counters the call charges, for
+  results that can fill the inline-result limit), around the domain
+  ``result``. Results stay within the experiment policy's inline-result
+  limit also for open-weight models with hundreds of tensors: previews list
+  the changed tensors, inspections are paged, an applied candidate's
+  manifest lists its changed tensors, and a report too large for one result
+  is a ``ReportOverview`` that names its paged resource. M1 models, whose
+  results fit whole, keep their M1 forms.
 * **Errors.** A domain failure is returned as an MCP tool error
   (``isError``) whose text is ``Error executing tool <name>: `` followed by
   the canonical JSON ``{"error": {"code", "message", "retryable",
@@ -107,8 +109,14 @@ SERVER_NAME = "wse"
 RESOURCE_PAGE_BYTES = 32 * 1024
 PAGE_ENVELOPE_BYTES = 256
 WAIT_POLL_SECONDS = 0.05
+# The counters that bounded results list in usage.cumulative: those the call charges. The envelope then stays
+# within RESPONSE_ENVELOPE_BYTES per copy (JSON-RPC framing included) at its widest, which the result limits assume;
+# every counter of the ledger at its widest would take about 5 KB.
 READ_COUNTERS = ("tensor_read_calls", "compute_seconds")
 PROBE_COUNTERS = ("probe_calls", "teacher_forced_tokens", "compute_seconds")
+PREVIEW_COUNTERS = ("patch_previews", "compute_seconds")
+APPLY_COUNTERS = ("candidate_commits", "compute_seconds")
+INSPECTION_COUNTERS = ("compute_seconds",)
 
 T = TypeVar("T")
 logger = logging.getLogger("wse.mcp")
@@ -126,9 +134,12 @@ class ToolUsage(BaseModel):
     previews, and settled jobs) and ``null`` when the result records none;
     the call's charges are then visible in ``cumulative``. ``cumulative``
     maps ledger counters to their limit, consumed, reserved, and remaining
-    amounts; read, analysis, and probe-job results list only the counters
-    they charge, and ``wse_get_report`` (not charged) lists none, which keeps
-    those responses within the response-size limit.
+    amounts. Results that can fill the inline-result limit list only the
+    counters they charge (reads, analyses, probe jobs, previews, applied
+    candidates, and inspections), and ``wse_get_report`` (not charged) lists
+    none, so that the envelope stays within its allowance
+    (``wse.policy.RESPONSE_ENVELOPE_BYTES`` per copy) and the whole response
+    within the response-size limit; ``wse_get_experiment`` lists them all.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -458,7 +469,8 @@ class WSEMCPServer:
                            + (f"pass cursor {page.next_cursor} for the next page" if page.next_cursor
                               else "the last page"))
             return ToolResponse[ModelInspection](summary=summary, uris=[inspection.manifest_uri],
-                                                 usage=self._usage(eid, inspection.usage), result=inspection)
+                                                 usage=self._usage(eid, inspection.usage, INSPECTION_COUNTERS),
+                                                 result=inspection)
         return _respond(self._call(run))
 
     def wse_read_tensor(self, *, experiment_id: ExperimentIdArg = None, checkpoint_id: IdArg,
@@ -536,7 +548,7 @@ class WSEMCPServer:
             return ToolResponse[PatchPreview](
                 summary=f"patch {preview.patch_id} changes {preview.changed_elements} of {preview.parameter_count} "
                         "parameters", uris=[preview.patch_uri],
-                usage=self._usage(eid, preview.usage), result=preview)
+                usage=self._usage(eid, preview.usage, PREVIEW_COUNTERS), result=preview)
         return _respond(self._call(run))
 
     def wse_apply_patch(self, *, experiment_id: ExperimentIdArg = None, patch_id: IdArg, idempotency_key: KeyArg,
@@ -555,7 +567,7 @@ class WSEMCPServer:
                             f"{len(manifest.tensors) + manifest.unchanged_tensors}")
             return ToolResponse[ModelManifest](
                 summary=summary, uris=[_manifest_uri(manifest.checkpoint_id), _patch_uri(patch_id)],
-                usage=self._usage(eid, None), result=manifest)
+                usage=self._usage(eid, None, APPLY_COUNTERS), result=manifest)
         return _respond(self._call(run))
 
     def wse_submit_evaluation(self, *, experiment_id: ExperimentIdArg = None, checkpoint_id: IdArg,

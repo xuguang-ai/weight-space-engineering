@@ -59,15 +59,23 @@ Rules implemented here (Sections 4.1, 5.1-5.3, and 6.2 of the plan):
   limit, also for open-weight models with hundreds of tensors: a result
   fits when both of its copies in an MCP response, its JSON and the escaped
   text mirror (``wse.policy.response_size``), take at most twice
-  ``max_result_json_bytes``. A preview lists the diff of every tensor when
-  that fits, as for M1 models, and otherwise only the changed tensors,
-  counting the others (``PatchPreview.unchanged_tensors``). An inspection whose
-  tensors do not fit one result is paged (``inspect_details``,
-  ``inspection_pages``). The bounded view of an applied candidate
-  (``candidate_view``) lists only the tensors that differ from its parent
-  when the whole manifest does not fit. Page boundaries and the choice of
-  form depend on the manifest and the policy only, never on measured times
-  or values.
+  ``max_result_json_bytes``. The MCP envelope around them (summary, URIs,
+  usage, and the JSON-RPC framing) stays within the rest of the inline
+  limit, ``RESPONSE_ENVELOPE_BYTES`` per copy, because these results list
+  only the counters they charge (``wse.mcp_server.ToolUsage``). A preview
+  lists the diff of every tensor when that fits, as for M1 models, and
+  otherwise only the changed tensors, counting the others
+  (``PatchPreview.unchanged_tensors``). An inspection whose tensors do not
+  fit one result is paged (``inspect_details``, ``inspection_pages``). The
+  bounded view of an applied candidate (``candidate_view``) lists only the
+  tensors that differ from its parent when the whole manifest does not fit.
+  A preview request whose bounded preview or candidate view could exceed
+  the limit (``_preview_size_bound``, from the request and the manifest
+  alone) is refused with ``INVALID_PATCH`` before anything is materialized
+  or charged. Page boundaries depend on the manifest and the policy only; a
+  preview's form also depends on its patch (texts, operations, and diff
+  values), and a candidate's view on the tensors its patch changed; none
+  depends on measured times.
 * A service bound to a run has at most one experiment, so agent-facing
   callers may omit its ID (``bound_experiment_id``).
 * Rejected mutations (creation, previews, applies, selections, freezing) are
@@ -110,6 +118,7 @@ from wse.schemas import (
     CHECKPOINT_ID_PATTERN,
     IDEMPOTENCY_KEY_PATTERN,
     OBJECT_ID_PATTERNS,
+    AxisSlice,
     BudgetEntry,
     DomainError,
     ErrorCode,
@@ -128,6 +137,7 @@ from wse.schemas import (
     Provenance,
     RunGrant,
     StorageCost,
+    TensorDiff,
     TensorInfo,
     TensorPage,
     TensorStatistics,
@@ -236,7 +246,13 @@ def _response_bytes(value: Any) -> int:
 
 
 def _fits(value: Any, limit: int) -> bool:
-    """Whether ``value`` fits an inline result under the limit ``limit`` (``max_result_json_bytes``)."""
+    """Whether ``value`` fits an inline result under the limit ``limit`` (``max_result_json_bytes``).
+
+    Both copies of the result count (``_response_bytes``) against twice the
+    limit; the MCP envelope around them stays within its own allowance
+    (``wse.policy.RESPONSE_ENVELOPE_BYTES`` per copy, which the limit leaves
+    out), so the whole response stays within twice ``max_inline_json_bytes``.
+    """
     return _response_bytes(value) <= 2 * limit
 
 
@@ -244,13 +260,85 @@ def _fit_tensor_diffs(preview: PatchPreview, limit: int) -> PatchPreview:
     """``preview`` with every tensor's diff when it fits ``limit``, else with the changed tensors' diffs only.
 
     The size is measured with the widest compute time, so the form depends on
-    the model and the patch only. The aggregates cover every tensor either way.
+    the model and the patch (its texts, operations, and diff values) only,
+    never on a measured time. The aggregates cover every tensor either way.
+    The changed tensors' form fits whenever ``_preview_size_bound`` allowed
+    the request; were it ever larger, the preview is refused before anything
+    is charged.
     """
     widest = preview.model_copy(update={"usage": preview.usage.model_copy(update={"compute_seconds": _WIDEST_FLOAT})})
     if _fits(widest, limit):
         return preview
     changed = [diff for diff in preview.tensors if diff.changed_elements]
-    return preview.model_copy(update={"tensors": changed, "unchanged_tensors": len(preview.tensors) - len(changed)})
+    bounded = preview.model_copy(update={"tensors": changed, "unchanged_tensors": len(preview.tensors) - len(changed)})
+    if not _fits(bounded.model_copy(update={"usage": widest.usage}), limit):
+        raise WSEError(ErrorCode.INVALID_PATCH, "the preview's bounded form exceeds the inline-result limit; propose "
+                       "fewer operations per patch or shorter texts", details={"limit_bytes": 2 * limit})
+    return bounded
+
+
+# Integers a preview reports that its request does not bound (patch and candidate bytes): at most 16 digits.
+_WIDEST_COUNT = 10 ** 16 - 1
+_WIDEST_HASH = "sha256:" + "0" * 64
+_WIDEST_ID = "0" * 32
+
+
+def _preview_size_bound(experiment_id: str, spec: PatchSpec, manifest: ModelManifest,
+                        policy: ExperimentPolicy) -> tuple[int, int] | None:
+    """Upper bounds on the response bytes of the bounded forms of ``spec``'s preview and of its applied candidate.
+
+    From the request alone, before anything is materialized: every tensor an
+    operation names counts as changed, IDs and hashes take their fixed
+    lengths, element counts the digits of their tensor's or the model's
+    size, and measured numbers their widest forms, so neither bound depends
+    on the base's weights. The texts count as given. The candidate's bound is
+    its whole manifest or its changed tensors' view (``candidate_view``),
+    whichever is smaller. ``None`` when an operation names a tensor the
+    manifest lacks or the policy permits no edit: materialization refuses
+    those requests with their own errors.
+    """
+    infos = {info.name: info for info in manifest.tensors}
+    named: list[str] = []
+    for operation in spec.operations:
+        if operation.tensor not in infos:
+            return None
+        if operation.tensor not in named:
+            named.append(operation.tensor)
+    refs = list(policy.operations.edits.values())
+    if not refs:
+        return None
+    operator = max(refs, key=lambda ref: len(str(ref)))
+    total = manifest.parameter_count
+    operations = [
+        PatchOperationSummary(index=index, op=operation.op, operator=operator, tensor=operation.tensor,
+                              selection=[AxisSlice(start=size, stop=size) for size in infos[operation.tensor].shape],
+                              changed_elements=infos[operation.tensor].element_count)
+        for index, operation in enumerate(spec.operations)]
+    diffs = [TensorDiff(tensor=name, before_hash=_WIDEST_HASH, after_hash=_WIDEST_HASH,
+                        changed_elements=infos[name].element_count, element_count=infos[name].element_count,
+                        l2_delta=_WIDEST_FLOAT, max_abs_delta=_WIDEST_FLOAT, before_l2=_WIDEST_FLOAT,
+                        relative_l2_delta=_WIDEST_FLOAT, all_finite=False) for name in named]
+    preview = PatchPreview(
+        patch_id=f"patch_{_WIDEST_ID}", experiment_id=experiment_id, spec_hash=_WIDEST_HASH,
+        base_checkpoint_id=spec.base_checkpoint_id, base_weights_hash=_WIDEST_HASH, result_weights_hash=_WIDEST_HASH,
+        hypothesis=spec.hypothesis, expected_behavior=spec.expected_behavior,
+        development_suite_id=spec.development_suite_id, operations=operations, tensors=diffs, changed_elements=total,
+        parameter_count=total, changed_fraction=_WIDEST_FLOAT, l2_delta=_WIDEST_FLOAT, max_abs_delta=_WIDEST_FLOAT,
+        relative_l2_delta=_WIDEST_FLOAT, all_finite=False,
+        storage=StorageCost(patch_bytes=_WIDEST_COUNT, candidate_bytes=_WIDEST_COUNT),
+        patch_uri=f"{PATCH_URI_PREFIX}patch_{_WIDEST_ID}",
+        usage=Usage(model_forward_calls=0, candidate_commits=0, patch_previews=1, artifact_bytes=_WIDEST_COUNT,
+                    compute_seconds=_WIDEST_FLOAT),
+        unchanged_tensors=len(manifest.tensors))
+    candidate = manifest.model_copy(update={
+        "checkpoint_id": f"ckpt_{_WIDEST_ID}", "weights_hash": _WIDEST_HASH,
+        "provenance": Provenance(kind="patch", source=f"patch_{_WIDEST_ID}", parent_checkpoint_id=f"ckpt_{_WIDEST_ID}"),
+        "tensors": [info if info.blob_id is None else info.model_copy(update={"blob_id": "0" * 64})
+                    for info in manifest.tensors]})
+    view = candidate.model_copy(update={"tensors": [info.model_copy(update={"blob_id": "0" * 64})
+                                                    for info in manifest.tensors if info.name in named],
+                                        "unchanged_tensors": len(manifest.tensors)})
+    return _response_bytes(preview), min(_response_bytes(candidate), _response_bytes(view))
 
 
 def _widest_statistics(info: TensorInfo, operator: Any) -> TensorStatistics:
@@ -979,6 +1067,7 @@ class ExperimentService:
         parsed = self._parse_spec(raw)
         policy = self.experiment_policy(experiment_id)
         self._owned_checkpoint(self.db.conn, experiment_id, parsed.base_checkpoint_id)
+        self._check_preview_size(experiment_id, parsed, policy)
         operations = [{"op": operation.op, **operation.operator_request()} for operation in parsed.operations]
         # Vector references resolve against this experiment's own results, as analyses do, before any weights are
         # read, whatever engine runs the preview.
@@ -1081,6 +1170,28 @@ class ExperimentService:
                          experiment_id=experiment_id)
             self._remember(conn, experiment_id, key, "preview_patch", request_hash, preview_json)
         return preview
+
+    def _check_preview_size(self, experiment_id: str, spec: PatchSpec, policy: ExperimentPolicy) -> None:
+        """Refuse a request whose preview or applied candidate could exceed the inline-result limit in its bounded
+        form (``_preview_size_bound``), before anything is materialized or charged.
+
+        The decision depends on the request and the model's manifest only.
+        It is reached only by many operations on tensors with long names
+        together with long texts full of characters that JSON escapes; a
+        patch of 32 operations with 2,000-character plain texts fits.
+        """
+        bounds = _preview_size_bound(experiment_id, spec, self.store.load_manifest(spec.base_checkpoint_id), policy)
+        allowed = 2 * policy.operations.limits.max_result_json_bytes
+        if bounds is None or max(bounds) <= allowed:
+            return
+        raise WSEError(
+            ErrorCode.INVALID_PATCH,
+            f"the preview of these {len(spec.operations)} operations could exceed the inline-result limit of the "
+            f"experiment's policy ({max(bounds)} of {allowed} response bytes for its result at most); propose fewer "
+            "operations per patch, or shorten hypothesis and expected_behavior (quotes, backslashes, and control "
+            "characters take the most room)",
+            details={"limit_bytes": allowed, "preview_bound_bytes": bounds[0], "candidate_bound_bytes": bounds[1],
+                     "operations": len(spec.operations)})
 
     def _refuse_net_whole_tensor_scaling(self, row: sqlite3.Row, base_checkpoint_id: str, base: ModelHandle,
                                          edit: Any, policy: ExperimentPolicy) -> None:
