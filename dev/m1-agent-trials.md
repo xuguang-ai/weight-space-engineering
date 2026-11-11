@@ -1,7 +1,7 @@
 # M1 agent trials
 
 This report records the live trials of the OpenAI Agents SDK reference agent
-that the [plan](../agentic-weight-space-engineering-plan.md) requires for M1.
+that the [plan](agentic-weight-space-engineering-plan.md) requires for M1.
 Agent acceptance asks for 5 independent trials with a fixed configuration,
 with a target of at least 4 of 5 trials whose selected candidate reaches at
 least 99% final accuracy. The report describes the injected fault and its
@@ -39,7 +39,7 @@ fixture says little about agent capability in general.
   - Final evaluations run after every trial of a set has frozen. Each one
     includes the unedited base checkpoint as a fixed control.
 - **Policy:** `small_model_v1`; budgets and tools are in
-  [experiments.md](experiments.md).
+  [experiments.md](../docs/experiments.md).
 - **Controller.** `openai_agents@1` with openai-agents 0.24.0, openai 3.46.0
   and mcp 2.3.0 (protocol 2026-07-28), on Python 3.14.8 and macOS 26.7.1
   (arm64).
@@ -56,7 +56,7 @@ fixture says little about agent capability in general.
   runs to its freeze before the next trial starts.
 - **Command:** `examples/signed_sum/run_trials.py OUT --label LABEL
   --controller openai-agents --model gpt-5.6-luna --trials N`, as described
-  in [experiments.md](experiments.md#live-agent-trials).
+  in [experiments.md](../docs/experiments.md#live-agent-trials).
 
 ## Sets
 

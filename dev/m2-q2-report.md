@@ -1,6 +1,6 @@
 # M2 Q2 Report: Agent-Usable Tools for Open-Weight Language Models
 
-Q2 of the [M2 plan](../agentic-weight-space-engineering-m2-plan.md) gives agents the tools to work on open-weight language models:
+Q2 of the [M2 plan](agentic-weight-space-engineering-m2-plan.md) gives agents the tools to work on open-weight language models:
 
 - family roles and protections;
 - direction, low-rank, and fill edits;
@@ -139,7 +139,7 @@ This analysis ran after the attempt, by the operator, with knowledge of p50c. It
 - **Direction.** At those layers, the probe's contrast is aligned with p50c's direction, though less strongly than a comparison with random directions suggests.
   - Its cosine with p50c's per-layer direction is +0.35 at layer 15 and −0.44 at layer 19. The sign does not matter to `project_out`.
   - Random directions are the wrong baseline. In 1,024 dimensions their cosine stays below 0.103 in magnitude in 99.9% of draws, but the outputs' activations vary strongly along p50c's direction itself.
-  - The right baseline compares the actual split with arbitrary splits of the same outputs. This run's stored probe keeps only the group means, so the operator ran that check on the sample of the four-step example (README, Section 5): 32 other problems, probed with full context, with the per-output means of `Probe.means`.
+  - The right baseline compares the actual split with arbitrary splits of the same outputs. This run's stored probe keeps only the group means, so the operator ran that check on the sample of the four-step example (README, How WSE Works): 32 other problems, probed with full context, with the per-output means of `Probe.means`.
   - There, p50c's direction carries 6.7% (layer 15) and 14.4% (layer 19) of the outputs' variance, against 0.1% for a random direction. Over all 496 ways to set 2 of the 32 outputs apart, the median cosine magnitude is 0.24 and 0.36. The actual split gives 0.37 and 0.45 and ranks 4th and 7th (p = 0.008 and 0.014). In each layer, all 32 outputs' components along the direction have the same sign, and the 2 finished outputs have the smallest in magnitude at layer 15 and two of the three smallest at layer 19.
   - The actual split also has the largest contrast norm of all 496: the finished outputs differ from the rest in many directions, not only in p50c's (Section 4.4, position confound).
 - **Columns.**
@@ -242,7 +242,7 @@ The smoke check found one bug. The parameter counts counted the tied embedding t
 
 Section 3 and Section 4 each ran a base pass in a separate experiment, about 1.5 hours apart. The two passes produced the same 32 outputs, token for token: 253,567 generated tokens in all. Only the experiment and job IDs in the output records differ.
 
-The four-step example (README, Section 5) ran in full twice, in separate processes, with the library code of b3534a4.
+The four-step example (README, How WSE Works) ran in full twice, in separate processes, with the library code of b3534a4.
 
 - **The runs.** The two comparisons started 2 h 38 min apart. The second run started from a fresh download of the model and the data into new directories.
 - **What changed between them.** Only the example script:
@@ -252,7 +252,7 @@ The four-step example (README, Section 5) ran in full twice, in separate process
 - **What matched.**
   - Both records hold the same weights hashes for the base and the edited model, and the same data and profile hashes.
   - The 64 outputs of the comparison are the same, token for token, with the same answers.
-  - Only the random checkpoint IDs and the creation times differ.
+  - Apart from the random checkpoint and batch IDs, the timestamps, and the measured times, the records are the same.
 - **A third process.** The rerun behind the permutation check of Section 4.3 reproduced the 32 base outputs token for token as well.
 
 On this machine, a pass with a fixed suite, profile, seed, and batch size is reproducible to the token.
@@ -267,7 +267,7 @@ On this machine, a pass with a fixed suite, profile, seed, and batch size is rep
   - a `project_out` preview took 3.6–5.2 s, and applying it took 2.9–3.1 s;
   - a `direction_projection` over a whole `mlp.down` (3,670,016 entries) took 0.14 s;
   - an inspection page took about 0.2 s, and a comparison under 0.1 s.
-- **MCP response sizes:** measured on Qwen3.5-0.8B and listed in [protocol.md](protocol.md#language-model-tools).
+- **MCP response sizes:** measured on Qwen3.5-0.8B and listed in [protocol.md](../docs/protocol.md#language-model-tools).
 
 ## 7. Reviews
 

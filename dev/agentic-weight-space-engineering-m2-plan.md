@@ -126,7 +126,7 @@ class FamilyDescriptor(BaseModel):
 | Names need a mapping, or structure-aware tools are wanted | Register a family descriptor: data only, with no core changes. |
 | `transformers` does not implement the architecture | Register a new model adapter (code), as M1's extension contract allows. |
 
-[docs/models.md](./docs/models.md) documents these levels for users (Task 12).
+[docs/models.md](../docs/models.md) documents these levels for users (Task 12).
 
 ## 3. Contracts Added or Changed
 
@@ -235,7 +235,7 @@ Each (problem, sample) pair gets its own seed, derived from the profile seed, th
 - **The article's protocol** runs MATH-500 with 4 samples per problem, up to 32,768 tokens each. Its independent re-run of the edited model generated 43.4 million tokens in about 51 minutes on an H200 with vLLM. The base model reaches the limit on about 93% of answers, so it generates even more.
 - **Task 7 measures local throughput** and estimates the cost of three protocols: the 25-problem comparison, a 100-problem single-sample final suite, and the full protocol.
 - **The user then decides** whether Q3's final evaluation runs locally on a subset or on a GPU worker. A GPU worker would become its own task, inserted before Task 13.
-- **Q3 is paused** (user decision, 2026-11-10): it follows WSE's open-source release, and this gate waits until then. Q2 reached its exit on 2026-11-11 (`docs/m2-q2-report.md`).
+- **Q3 is paused** (user decision, 2026-11-10): it follows WSE's open-source release, and this gate waits until then. Q2 reached its exit on 2026-11-11 (`dev/m2-q2-report.md`).
 
 ## 5. Agent-Facing Tools (Q2)
 
@@ -302,7 +302,7 @@ Generation suites are evaluated as development evaluations through M1's job syst
   - the replayed p50c edit, as an operator-only reference;
   - five random projections matched to p50c's changed-element count and L2 norm (M1 plan Section 7.3).
 - **Agent.** The OpenAI Agents SDK adapter with `gpt-5.6-luna`, in one fixed configuration. Turn and time limits are preregistered in Task 13.
-- **Trials.** Five trials. Final evaluations run only after every trial has frozen. The report follows M1's form in `docs/m2-qwen-trials.md`.
+- **Trials.** Five trials. Final evaluations run only after every trial has frozen. The report follows M1's form in `dev/m2-qwen-trials.md`.
 
 ## 7. Planned Files
 
@@ -336,6 +336,7 @@ examples/qwen_loops/
   check_expressiveness.py              # operator-only scripted MCP client for the Q2 expressiveness check
 docs/
   models.md                            # model support levels and adding a model
+dev/
   m2-q1-report.md                      # Q1 measurements and the decision gate
   m2-q2-report.md                      # Q2 expressiveness, scripted discovery, and smoke matrix
   m2-qwen-trials-prereg.md             # Q3 preregistration
@@ -645,7 +646,7 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
 
 ### Task 13: Q3 preregistration and leak checks
 
-**Files:** create `examples/qwen_loops/task.json`, `examples/qwen_loops/policy.json`, `examples/qwen_loops/profiles.json`, and `docs/m2-qwen-trials-prereg.md`; modify `src/wse/runner.py` and `src/wse/agent_adapters/openai_agents.py`; extend `tests/test_runner.py` and `tests/test_agent_adapter.py`.
+**Files:** create `examples/qwen_loops/task.json`, `examples/qwen_loops/policy.json`, `examples/qwen_loops/profiles.json`, and `dev/m2-qwen-trials-prereg.md`; modify `src/wse/runner.py` and `src/wse/agent_adapters/openai_agents.py`; extend `tests/test_runner.py` and `tests/test_agent_adapter.py`.
 
 - [ ] Write the preregistration and commit it before any trial. It covers:
   - the task text and objective metrics;
@@ -668,7 +669,7 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
 
 ### Task 14: Controls
 
-**Files:** append to `docs/m2-qwen-trials.md`.
+**Files:** append to `dev/m2-qwen-trials.md`.
 
 - [ ] **(real model)** Generate five random projections matched to p50c's changed-element count and L2 norm, with the seeds recorded in the preregistration. Evaluate them, the base, and p50c on the final suite with the preregistered profile. These are operator runs; no agent is involved.
 - [ ] Record each control's report hashes and costs.
@@ -676,7 +677,7 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
 
 ### Task 15: Five agent trials and the report
 
-**Files:** create `docs/m2-qwen-trials.md`.
+**Files:** create `dev/m2-qwen-trials.md`.
 
 - [ ] **(operator)** Run the five live trials with the fixed configuration. **They are outward-facing:** they send task instructions and tool results to the model provider, and they cost money. Before starting, post the expected tokens and cost in chat and check that no other luna-heavy job is running.
 - [ ] Run final evaluations only after all five trials have frozen. Each pairs its candidate with the base control, as in M1.
@@ -684,7 +685,7 @@ Tasks run in order 1→15. Q1 is Tasks 1–7, Q2 is Tasks 8–12, and Q3 is Task
   - replay every export;
   - scan every output for the key, the endpoint, final-suite items, and oracle values;
   - re-derive every reported number from the raw exports.
-- [ ] Write `docs/m2-qwen-trials.md`. For every trial it records:
+- [ ] Write `dev/m2-qwen-trials.md`. For every trial it records:
   - candidates, development and final metrics, generated and teacher-forced tokens, probe calls, and changed parameters;
   - agent tokens and cost;
   - elapsed time and failure causes.

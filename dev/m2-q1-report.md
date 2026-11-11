@@ -1,6 +1,6 @@
 # M2 Q1 Report: Load, Replay, and Evaluate Open-Weight Models
 
-This report covers Task 7 of the [M2 plan](../agentic-weight-space-engineering-m2-plan.md). It records:
+This report covers Task 7 of the [M2 plan](agentic-weight-space-engineering-m2-plan.md). It records:
 
 - the measurements from the operator's Mac;
 - the exact replay of the article's published edits;

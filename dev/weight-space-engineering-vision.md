@@ -66,4 +66,4 @@ The earliest adoption target is researchers who repeatedly change models, method
 
 Begin with a small-model workflow to validate the engineering foundation, then demonstrate extensibility across models, methods, and agents before expanding to useful pretrained-model workflows. The [implementation plan](./agentic-weight-space-engineering-plan.md) contains the milestone definitions, concrete tasks, and verification requirements.
 
-For an illustrative developer workflow, see the [SDK-usage repair API sketch](./examples/repair_sdk_usage_api_sketch.py). It proposes a convenience API for a later code-model experiment; it is not executable and does not represent existing functionality.
+For an illustrative developer workflow, see the [SDK-usage repair API sketch](../examples/repair_sdk_usage_api_sketch.py). It proposes a convenience API for a later code-model experiment; it is not executable and does not represent existing functionality.
