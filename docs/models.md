@@ -17,6 +17,7 @@ Mixture-of-experts tensors stay readable and editable through the generic tools,
 | **A new adapter** | Code, under the extension contract in [extensions.md](extensions.md) | `transformers` does not implement the architecture |
 
 At Level 0 the adapter instantiates the module on the meta device and takes every tensor's axes from its module type, never from its name:
+
 - an `nn.Linear` weight is `[out_features, in_features]`;
 - an `nn.Embedding` weight is `[num_embeddings, embedding_dim]`;
 - a normalization weight is `[features]`;
@@ -27,6 +28,7 @@ Tied input and output embeddings are one object in the module, so they form an *
 ## Importing a model
 
 The importer reads only allow-listed files at the snapshot root:
+
 - `config.json` and `generation_config.json`;
 - `*.safetensors` and its index;
 - the tokenizer files and the chat template.
@@ -58,6 +60,7 @@ Gated repositories (Llama, Gemma) need access granted on the Hub and the user's 
 ## Roles, heads, and protections
 
 A family descriptor names the tensors that play each role:
+
 - per layer: `attn.q`, `attn.k`, `attn.v`, `attn.o`, `linear_attn.in`, `linear_attn.out`, `mlp.gate`, `mlp.up`, `mlp.down`, `norm.input`, `norm.post_attention`;
 - once per model: `embed`, `lm_head`, `final_norm`.
 
@@ -107,6 +110,7 @@ def setup(registry):
 ```
 
 Rules:
+
 - a pattern must match whole canonical tensor names;
 - a per-layer role has a named group `layer`, and a model-wide role has none;
 - at most one rule may match a tensor, and at most one tensor may hold a role in a layer;
@@ -124,8 +128,8 @@ Every check below ran on an Apple M4 Pro with PyTorch 2.15.0 and `transformers` 
 
 | Model | Revision | Level | Checks |
 | --- | --- | --- | --- |
-| `Qwen/Qwen3.5-0.8B` | `2fc06364715b` | 1 (`qwen3_5@1`) | Import (321 tensors, 752,393,024 parameters); logits; exact replay of the three published edits; generation evaluation; probes; managed experiments ([m2-q1-report.md](m2-q1-report.md)) |
-| `meta-llama/Llama-3.2-1B-Instruct` | `9213176726f5` | 1 (`llama@1`) | Import (1,235,814,400 parameters); logits; a patch round trip; GSM8K generation (checked at Level 0 before `llama@1` existed; [m2-q1-report.md](m2-q1-report.md)) |
+| `Qwen/Qwen3.5-0.8B` | `2fc06364715b` | 1 (`qwen3_5@1`) | Import (321 tensors, 752,393,024 parameters); logits; exact replay of the three published edits; generation evaluation; probes; managed experiments ([m2-q1-report.md](../dev/m2-q1-report.md)) |
+| `meta-llama/Llama-3.2-1B-Instruct` | `9213176726f5` | 1 (`llama@1`) | Import (1,235,814,400 parameters); logits; a patch round trip; GSM8K generation (checked at Level 0 before `llama@1` existed; [m2-q1-report.md](../dev/m2-q1-report.md)) |
 | `Qwen/Qwen3-0.6B` | `c1899de289a0` | 0 | Import (311 tensors, 596,049,920 parameters, tied embeddings); logits; a patch round trip (edit, replay, store, reopen); the analyses `stats`, `tensor_norms`, `svd_top_k`, and `direction_projection`; probes equal to `output_hidden_states` at the layer boundaries; generation |
 | `google/gemma-3-1b-it` | `dcc83ea841ab` | 0 | The same checks as Qwen3-0.6B (341 tensors, 999,885,952 parameters, tied embeddings) |
 
@@ -133,7 +137,7 @@ The Qwen3 and Gemma checks needed no model-specific code (M2 plan, Q2 exit).
 
 ## Known limits
 
-- **Qwen3.5 on the CPU.** `transformers` runs Gated DeltaNet through reference PyTorch code there, at about 5–10 s per generated token. Use `mps` on Apple silicon.
+- **Qwen3.5 on the CPU.** `transformers` runs Gated DeltaNet through reference PyTorch code there, where a decoding step takes about 5–10 s, about 170 times slower than on MPS. Use `mps` on Apple silicon.
 - **Probes.** A probe reads at most 16,384 positions per text in direct use. Under the agent policy `qwen_loop_v1`, a probe text has at most 1,024 tokens.
 - **Export.** Exporting and replaying a whole managed experiment (`wse export`, `wse replay`) carries M1's small models only. Patches of open-weight models replay exactly, and imports are hash-checked.
 - **Reproducibility.** Bitwise reproducibility holds within one device and library version, not across them. Edits are computed on the CPU in a platform-independent way, so patches are exact everywhere.

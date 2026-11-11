@@ -229,6 +229,33 @@ without development feedback, so its outcome depends only on the search
 order; the scripted and test-double runs exercise the toolchain and say
 nothing about an agent's ability.
 
+### One experiment in one call
+
+`wse.agent_runs.run_agent_experiment` grants a run, runs the controller, and
+freezes the experiment. With `final_evaluation=True`, as the example below
+passes, it also runs the final evaluation, exports the closed experiment,
+and replays the export. `examples/signed_sum/agent_api.py` builds the
+signed-sum workspace on its first use and runs one experiment this way.
+Offline, with a scripted controller in place of a model, it takes a few
+seconds. The IDs differ per run, and the script prints the export path in
+full, shortened here to `OUT/...`:
+
+```sh
+uv run --no-sync python examples/signed_sum/agent_api.py OUT
+```
+
+```text
+experiment exp_a0373ebd434304fad7bacc2ef3280b99 (run run_ad9c7452e48359213d4dbef2da5e6a2c): CLOSED
+controller scripted_search@1 ended stopped: target_met: a full development evaluation of the selected checkpoint meets the target
+success: True; final: {"candidate_accuracy": 1.0, "clopper_pearson_lower": 0.9928210499737405, "clopper_pearson_upper": 1.0, "clusters": 512, "control_accuracy": 0.5, "difference": 0.5, "fully_correct_clusters": 512}
+export: OUT/workspace/agent_runs/run_ad9c7452e48359213d4dbef2da5e6a2c/export; replay byte-identical: True
+```
+
+For a live LLM agent, add `--model MODEL_NAME`, with the model provider's
+credentials in the environment. For a series of trials, leave the final
+evaluation off (the default) and run it only after every trial has frozen,
+so that no trial can adapt to an earlier trial's final result.
+
 ## Live agent trials
 
 The M1 agent acceptance run uses 5 trials with isolated run grants and fresh
@@ -257,4 +284,4 @@ ones. The script exits with 0, with 1 if any trial or step failed, or with
 130 after an interrupt; each server's log is `LIVE/logs/serve-RUN_ID.log`. The exact SDK and
 model settings are in each export's `controller.json`. Running these trials
 sends the task instructions and tool results to the model provider. The M1
-acceptance trials and their results are in [m1-agent-trials.md](m1-agent-trials.md).
+acceptance trials and their results are in [m1-agent-trials.md](../dev/m1-agent-trials.md).

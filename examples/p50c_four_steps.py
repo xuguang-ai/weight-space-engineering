@@ -1,4 +1,4 @@
-"""The four steps of a weight-space experiment on Qwen3.5-0.8B, with the article's p50c edit (README, Section 5).
+"""The four steps of a weight-space experiment on Qwen3.5-0.8B, with the article's p50c edit (README, How WSE Works).
 
 1. **Behavioral diagnosis.** A generation pass on 32 GSM8K training problems shows which answers are cut off
    at the token limit.
@@ -11,7 +11,7 @@
    resumable.
 
 Each layer's direction and columns are recovered from p50c's published change: the columns it changes and
-the top singular vector of its change to them, signed so that its largest entry is positive, as
+the top singular vector of its change to them, signed so that its largest-magnitude entry is positive, as
 ``svd_top_k@1`` signs its vectors. They come from the published edit, not from the data: the script shows the
 workflow; it does not discover the edit. The data layout is the README quick start's, plus GSM8K's training set as
 practice problems, so that MATH-500 stays unseen::
@@ -54,7 +54,7 @@ def recover(layer: int) -> tuple[str, np.ndarray, np.ndarray]:
     delta = p50c.model.tensor(name).double().numpy() - base.tensor(name).double().numpy()
     columns = np.flatnonzero(delta.any(axis=0))
     d = np.linalg.svd(delta[:, columns], full_matrices=False)[0][:, 0]
-    d *= np.sign(d[np.argmax(np.abs(d))])  # the sign convention of svd_top_k: the largest entry is positive
+    d *= np.sign(d[np.argmax(np.abs(d))])  # the sign convention of svd_top_k: the largest-magnitude entry is positive
     return name, d, columns
 
 
