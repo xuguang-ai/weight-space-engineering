@@ -698,13 +698,11 @@ def _scripted_text(order: int):
     return text_for
 
 
-def scripted_generation(registry) -> None:
-    """Worker setup hook ``test_direction_search:scripted_generation`` (``tests`` must be on ``PYTHONPATH``).
+def _install_scripted_texts(texts) -> None:
+    """Replace the worker's text models with scripted runtimes (``test_llm_policy_mcp.ScriptedRuntime``).
 
-    Replaces the worker's text models with scripted runtimes
-    (``test_llm_policy_mcp.ScriptedRuntime``) whose outputs depend on the order
-    in which the worker first loads each checkpoint (``_scripted_text``).
-    Probes still read the real fixture weights.
+    ``texts(order)`` gives the outputs of the checkpoint the worker loaded
+    ``order``-th (0 is the base). Probes still read the real fixture weights.
     """
     from test_llm_policy_mcp import ScriptedRuntime
     from wse.evaluators import generation
@@ -715,11 +713,78 @@ def scripted_generation(registry) -> None:
     def load(handle, files, *, device=None):
         real = original(handle, files, device="cpu")
         position = order.setdefault(handle.weights_hash, len(order))
-        runtime = ScriptedRuntime(real.tokenizer, _scripted_text(position), real.stop_token_ids[0])
+        runtime = ScriptedRuntime(real.tokenizer, texts(position), real.stop_token_ids[0])
         return generation.TextModel(runtime=runtime, tokenizer=real.tokenizer, stop_token_ids=real.stop_token_ids,
                                     pad_token_id=real.pad_token_id)
 
     generation.load_text_model = load
+
+
+def scripted_generation(registry) -> None:
+    """Worker setup hook ``test_direction_search:scripted_generation`` (``tests`` must be on ``PYTHONPATH``).
+
+    Scripted outputs that depend on the order in which the worker first loads
+    each checkpoint (``_scripted_text``).
+    """
+    _install_scripted_texts(_scripted_text)
+
+
+def _same_accuracy_until_third(order: int):
+    """The base and the first two candidates answer even problems and loop on odd ones; from the third candidate on,
+    odd problems finish with a wrong answer: the same accuracy, and no output reaches the limit."""
+
+    def text_for(prompt: str) -> str:
+        index = int(re.search(r"p(\d+) plus", prompt).group(1))
+        if index % 2 == 0:
+            return f"\\boxed{{{2 * index}}}<STOP>"
+        return "\\boxed{999}<STOP>" if order >= 3 else "loop " * 10
+
+    return text_for
+
+
+def same_accuracy_until_third(registry) -> None:
+    """Worker setup hook ``test_direction_search:same_accuracy_until_third`` (``_same_accuracy_until_third``)."""
+    _install_scripted_texts(_same_accuracy_until_third)
+
+
+def _register_loop_task(workspace) -> None:
+    from wse.schemas import TaskDefinition
+
+    with Engine(workspace) as engine:
+        engine.register_task(TaskDefinition.model_validate({
+            "task_id": TASK, "title": "Finish answers", "description": "Make the model finish its answers.",
+            "objective": {"task_id": TASK, "description": "Fewer outputs at the token limit, no lower accuracy.",
+                          "gates": [{"metric": "accuracy", "min_delta": 0.0}]},
+            "development_suite_id": "practice", "development_examples": 4}))
+
+
+def test_with_three_alphas_the_runner_lets_the_strategy_select_a_lower_limit_hit_rate(lm, monkeypatch):  # noqa: F811
+    """Candidates 1 and 2 change nothing measurable; candidate 3 keeps the accuracy and no output reaches the limit.
+    The runner's no-improvement patience (3 candidates) counts that as an improvement, so the strategy selects it."""
+    from wse.policy import QWEN_LOOP_POLICY_ID
+    from wse.registry import builtin_registry
+    from wse.runner import ReferenceRunner
+
+    monkeypatch.setenv("PYTHONPATH", str(TESTS_DIR))  # the worker imports this module's setup hook
+    _register_loop_task(lm.workspace)
+    with Engine(lm.workspace) as engine:
+        grant = engine.grant_run(TASK, QWEN_LOOP_POLICY_ID, lm.base)
+    runner = ReferenceRunner(lm.workspace, registry=builtin_registry(),
+                             setup=["test_direction_search:same_accuracy_until_third"],
+                             worker_args=["--poll-seconds", "0.02", "--device", "cpu"])
+    eid = runner.run_experiment(grant.run_id, TASK, QWEN_LOOP_POLICY_ID, {
+        "kind": "strategy", "strategy": "direction_search@1",
+        "parameters": {"columns": 4, "alphas": [1.0, 2.0, 6.0]}, "max_steps": 400, "wall_clock_seconds": 600})
+    result = runner.last_result["result"]
+    assert result["status"] == "completed" and result["stop_condition"] is None, result
+    assert re.fullmatch(r"the strategy stopped: selected alpha 6 at layer [01] \(limit-hit/accuracy: base "
+                        r"0\.5/0\.5, a1 0\.5/0\.5, a2 0\.5/0\.5, a6 0/0\.5\)", result["reason"]), result["reason"]
+    with Engine(lm.workspace) as engine:
+        experiment = engine.get_experiment(eid)
+        selected = next(c for c in engine.list_experiment_checkpoints(eid)
+                        if c.checkpoint_id == experiment.selected_checkpoint_id)
+        assert selected.role == "candidate"
+        assert engine.find_patch(selected.patch_id).spec.operations[0].parameters["alpha"] == 6.0
 
 
 def test_direction_search_runs_end_to_end_through_the_reference_runner(lm, monkeypatch):  # noqa: F811

@@ -27,8 +27,10 @@ drives one trial on an operator-prepared workspace:
    including no candidate commits left while no development evaluation, by
    evaluation batches or generation passes, remains), the selected
    checkpoint's full development evaluation meeting the task's target, 3
-   consecutive evaluated candidates without improvement, or 3 consecutive
-   policy denials (bounded_eval); the single permitted candidate committed
+   consecutive evaluated candidates without improvement (a higher accuracy
+   than the best checkpoint before them or, on a generation suite, a lower
+   limit-hit rate at no lower accuracy), or 3 consecutive policy denials
+   (bounded_eval); the single permitted candidate committed
    and selected (weights_only, which uses no development-score threshold);
    and the controller stopping voluntarily. A met condition cancels the
    controller.
@@ -126,6 +128,7 @@ EVALUATION_TOOLS = ("wse_submit_evaluation", "wse_get_job", "wse_get_report", "w
 PROBE_TOOLS = ("wse_probe",)
 JOB_TOOLS = ("wse_get_job", "wse_cancel_job")  # evaluations and probes are both jobs
 NO_IMPROVEMENT_PATIENCE = 3
+IMPROVEMENT_TOLERANCE = 1e-9
 POLICY_DENIAL_LIMIT = 3
 TEST_DOUBLE_PREFIX = "wse-test-double:"
 OPERATOR_INTERRUPT = "operator_interrupt: the operator interrupted the run (SIGINT)"
@@ -290,9 +293,12 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
               "then frozen for a separate final evaluation that you cannot see."]
     lines += [f"{number}. {step}" for number, step in enumerate(steps, start=1)] + [""]
     if evaluation:
+        # M1 policies keep their M1 sentence; with generation passes, a lower limit-hit rate also counts.
+        improvement = (" (a higher accuracy than the best checkpoint before them, or a lower limit-hit rate at no lower "
+                       "accuracy)" if passes else "")
         lines.append(f"The run also ends automatically once a full development evaluation of the selected checkpoint "
                      f"meets the target, after {NO_IMPROVEMENT_PATIENCE} consecutive evaluated candidates without "
-                     "improvement, or when the budget cannot cover the next operation (BUDGET_EXCEEDED).")
+                     f"improvement{improvement}, or when the budget cannot cover the next operation (BUDGET_EXCEEDED).")
     else:
         lines.append("The run also ends automatically once the permitted candidate is committed and selected, or "
                      "when the budget cannot cover the next operation (BUDGET_EXCEEDED).")
@@ -463,8 +469,15 @@ class StopMonitor:
 
     @staticmethod
     def no_improvement_streak(reports: Sequence[Any], base_checkpoint_id: str) -> int:
-        """Consecutive most recent evaluated candidates whose accuracy did not exceed the best before them."""
-        best: float | None = None
+        """Consecutive most recent evaluated candidates that did not improve on the best checkpoint before them.
+
+        A checkpoint improves on the best when its accuracy is higher; on a
+        generation suite (reports with a ``limit_hit_rate``) also when its
+        accuracy is at least the best's and its limit-hit rate is lower, which
+        is the objective of a task such as the Qwen loop task. The base sets
+        the first best; each report counts once per checkpoint.
+        """
+        best: tuple[float, float | None] | None = None
         streak, seen = 0, set()
         for report in reports:
             if report.checkpoint_id in seen:
@@ -473,14 +486,26 @@ class StopMonitor:
             accuracy = report.metrics.get("accuracy")
             if accuracy is None:
                 continue
+            current = (accuracy, report.metrics.get("limit_hit_rate"))
             if report.checkpoint_id == base_checkpoint_id:
-                best = accuracy if best is None else max(best, accuracy)
+                if best is None or _improves(best, current):
+                    best = current
                 continue
-            if best is None or accuracy > best:
-                best, streak = accuracy, 0
+            if best is None or _improves(best, current):
+                best, streak = current, 0
             else:
                 streak += 1
         return streak
+
+
+def _improves(best: tuple[float, float | None], candidate: tuple[float, float | None]) -> bool:
+    """Whether ``(accuracy, limit-hit rate)`` improves on the best: a higher accuracy, or, when both have a limit-hit
+    rate, a lower one at no lower accuracy (metrics are means over samples; differences below 1e-9 are ties)."""
+    (accuracy, rate), (best_accuracy, best_rate) = candidate, best
+    if accuracy > best_accuracy:
+        return True
+    return (rate is not None and best_rate is not None and accuracy >= best_accuracy - IMPROVEMENT_TOLERANCE
+            and rate < best_rate - IMPROVEMENT_TOLERANCE)
 
 
 def _action_shortfall(action: Action, budget: Mapping[str, BudgetEntry], *, generation: bool | None = False,

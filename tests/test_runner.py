@@ -189,6 +189,28 @@ def test_the_stop_monitor_counts_consecutive_candidates_without_improvement():
     assert streak([Report("b", 0.5), Report("c1", 0.4), Report("c1", 0.9)], "b") == 1  # first report per checkpoint
 
 
+def test_on_a_generation_suite_a_lower_limit_hit_rate_at_no_lower_accuracy_is_an_improvement():
+    class Report:
+        def __init__(self, checkpoint_id, accuracy, limit_hit_rate):
+            self.checkpoint_id = checkpoint_id
+            self.metrics = {"accuracy": accuracy, "limit_hit_rate": limit_hit_rate, "mean_generated_tokens": 9.0}
+
+    streak = StopMonitor.no_improvement_streak
+    same = [Report("b", 0.5, 0.5), Report("c1", 0.5, 0.5), Report("c2", 0.5, 0.5)]
+    assert streak(same, "b") == 2
+    # The third candidate keeps the accuracy and lowers the limit-hit rate: the streak ends.
+    assert streak([*same, Report("c3", 0.5, 0.0)], "b") == 0
+    # Lower accuracy is no improvement, however few outputs reach the limit; higher accuracy always is.
+    assert streak([*same, Report("c3", 0.25, 0.0)], "b") == 3
+    assert streak([*same, Report("c3", 0.75, 1.0)], "b") == 0
+    # The best so far is the reference: after c1 raised the accuracy, c2 at that accuracy improves only by a lower
+    # limit-hit rate than c1's.
+    assert streak([Report("b", 0.5, 0.5), Report("c1", 0.75, 0.75), Report("c2", 0.75, 0.75)], "b") == 1
+    assert streak([Report("b", 0.5, 0.5), Report("c1", 0.75, 0.75), Report("c2", 0.75, 0.5)], "b") == 0
+    # A base evaluated later raises the reference in the same order.
+    assert streak([Report("c1", 0.5, 0.5), Report("b", 0.5, 0.25), Report("c2", 0.5, 0.25)], "b") == 1
+
+
 def test_a_strategy_reaches_only_the_run_bound_operations(engine, workspace, prepared):
     run_id = _grant(engine, prepared)
     with Engine(workspace, run_id=run_id) as bound:
