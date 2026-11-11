@@ -24,10 +24,11 @@ this module takes no key and reads no ``.env``. As with
 ``OPENAI_AGENTS_DISABLE_TRACING=1`` in the process environment unless the
 variable is already set, so the SDK exports no traces of the run.
 
-Agent experiments on open-weight language models need agent tools that are
-planned and not built (probes, generation passes, and a language-model
-policy: Section 5 of the M2 plan), so the wrapper runs the small-model tasks
-the engine supports.
+The wrapper has been used on M1's small-model tasks only. Managed
+experiments on open-weight language models run through the same runner and
+MCP tools (M2 Q2), but exporting and replaying a whole managed experiment
+carries M1's small models only (``docs/models.md``, Known limits); patches
+of open-weight models replay exactly.
 """
 
 from __future__ import annotations
