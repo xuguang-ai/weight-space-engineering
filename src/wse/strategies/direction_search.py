@@ -1,10 +1,18 @@
 """The scripted discovery strategy ``direction_search@1`` (M2 plan Task 12).
 
 Behavioral diagnosis, mechanism investigation, weight intervention, and
-evaluation, done through the agent-facing tools alone and with no oracle: the
-strategy knows nothing about the task, the model, or any published edit. It
-works for any model whose family descriptor gives its tensors the role
-``mlp.down`` (the MLP's output projection, ``[hidden, intermediate]``).
+evaluation, done through the agent-facing tools alone and with no oracle
+value: the layer, the direction, and the columns come from the run's own
+generation pass, probe, and analysis, and no layer index, column list,
+direction, or evaluation item of a published edit is used. The edit's form
+and its size defaults do come from p50c's published edit: ``project_out`` of
+a residual-space direction from columns of ``mlp.down`` (the form the M2
+plan's Task 12 prescribes), 64 columns, and alphas 1 and 6 (which the plan
+does not prescribe; alpha 6 is p50c's own, and alpha 1 removes the
+component). A run therefore tests whether the tools can localize an edit of
+p50c's shape from the model's behavior. The strategy works for any model
+whose family descriptor gives its tensors the role ``mlp.down`` (the MLP's
+output projection, ``[hidden, intermediate]``).
 
 1. **Diagnose.** Read the architecture (``wse_inspect_model``, every page of a
    paged inspection), run one generation pass of the base on the practice
@@ -312,7 +320,8 @@ class DirectionSearchStrategy:
     Parameters (all optional): ``suite_id`` (the practice suite; default the
     task's development suite), ``sample_count`` and ``seed`` (the evaluation
     configuration; default every problem and the suite's first seed),
-    ``columns`` (default 64, at most 64), ``alphas`` (default ``[1.0, 6.0]``),
+    ``columns`` (default 64, at most 64), ``alphas`` (default ``[1.0, 6.0]``;
+    both defaults follow p50c's published edit, module docstring),
     ``layers`` (default every decoder layer with an ``mlp.down`` role),
     ``last`` (the probe window in output tokens; default the whole output
     within the policy's per-text limit), ``column_rule`` (``cosine``,

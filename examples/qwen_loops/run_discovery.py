@@ -1,13 +1,17 @@
 """Run the scripted discovery ``direction_search@1`` on Qwen3.5-0.8B (operator use only; M2 plan Task 12).
 
-The discovery uses only the agent-facing tools and no oracle: a generation
-pass of the base on practice problems, a probe of the outputs that reached
-the token limit against those that finished at the input and output of
-``mlp.down`` in every layer, a ``project_out`` of the contrast direction from
+The discovery uses only the agent-facing tools and no oracle value: a
+generation pass of the base on practice problems, a probe of the outputs that
+reached the token limit against those that finished at the input and output
+of ``mlp.down`` in every layer, a ``project_out`` of the contrast direction from
 the most aligned columns of the layer that separates them most (one candidate
 per alpha), and a generation pass of each candidate, then a selection
-(``wse.strategies.direction_search``). Its outcome is reported whether or not
-it improves on the base.
+(``wse.strategies.direction_search``). The layer, the direction, and the
+columns come from the run's own pass, probe, and analysis; the edit's form
+and its size defaults (64 columns, alphas 1 and 6) come from p50c's
+published edit, so the run tests whether the tools can localize an edit of
+p50c's shape from behavior. Its outcome is reported whether or not it
+improves on the base.
 
 Each invocation:
 
