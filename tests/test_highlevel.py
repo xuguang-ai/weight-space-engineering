@@ -255,6 +255,16 @@ def test_project_out_is_available_by_name(llama):
     assert edit.verify() is True
 
 
+def test_fill_and_low_rank_edits_are_available_by_name(llama):
+    filled = llama.edit("layers.0.mlp.down_proj[:, 4:8]", "fill_slice", value=0.0)
+    assert str(filled.patch.steps[0].operator) == "fill_slice@1" and filled.verify() is True
+    assert torch.count_nonzero(filled.model.tensor("layers.0.mlp.down_proj")[:, 4:8]) == 0
+    rng = np.random.default_rng(2)
+    low_rank = llama.edit("layers.0.mlp.down_proj", "add_low_rank", u=rng.normal(size=(2, 16)),
+                          v=rng.normal(size=(2, 32)), alpha=0.01)
+    assert str(low_rank.patch.steps[0].operator) == "add_low_rank@1" and low_rank.verify() is True
+
+
 def test_unknown_operators_name_the_available_ones(llama):
     error = _expect(ErrorCode.NOT_FOUND, llama.edit, "layers.0.mlp.down_proj", "rotate", angle=1.0)
     assert "rotate" in str(error) and "project_out" in str(error)

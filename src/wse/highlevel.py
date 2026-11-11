@@ -78,7 +78,9 @@ DEFAULT_WORKSPACE = "workspace"
 OPERATORS = MappingProxyType({
     "scale_slice": "scale_slice@1",
     "set_slice": "set_slice@1",
+    "fill_slice": "fill_slice@1",
     "project_out": "project_out@1",
+    "add_low_rank": "add_low_rank@1",
 })
 _HUB_CACHE_DIR = re.compile(r"^models--(?:(?P<org>[A-Za-z0-9][A-Za-z0-9._-]*)--)?(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)$")
 # The default grader of each dataset format.
@@ -747,8 +749,10 @@ class WSE:
         ``target`` is resolved by ``target``; ``operator`` is an exact
         reference (``"project_out@1"``) or a name in ``OPERATORS``; the
         keyword arguments are the operator's parameters, for example
-        ``factor=0.5`` for ``scale_slice`` or ``direction=..., columns=...,
-        alpha=...`` for ``project_out``. NumPy arrays and tensors among them
+        ``factor=0.5`` for ``scale_slice``, ``value=0.0`` for ``fill_slice``,
+        ``direction=..., columns=..., alpha=...`` for ``project_out``, or
+        ``u=..., v=..., alpha=...`` (``r`` columns each) for ``add_low_rank``.
+        NumPy arrays and tensors among them
         become lists, and NumPy scalars Python numbers.
         """
         if {"tensor", "selection"} & set(parameters):
