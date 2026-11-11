@@ -20,11 +20,19 @@ registry.register_alias(kind, "mlp", "mlp@1")                    # a version-les
 
 Every kind has a registration validator that checks the declared identity
 and the required methods before anything is stored; a duplicate
-registration fails with `VERSION_CONFLICT`. `builtin_registry()` contains the
-M1 extensions: adapter `mlp@1` (alias `mlp`), analyses `tensor_stats@1`,
-`tensor_norm@1`, `tensor_top_k@1`, edits `set_slice@1` and `scale_slice@1`,
-evaluators `classification@1` and `forward_batch@1`, and strategy
-`scripted_search@1`.
+registration fails with `VERSION_CONFLICT`. `builtin_registry()` contains:
+
+- **M1:** adapter `mlp@1` (alias `mlp`); analyses `tensor_stats@1`,
+  `tensor_norm@1`, and `tensor_top_k@1`; edits `set_slice@1` and
+  `scale_slice@1`; evaluators `classification@1` and `forward_batch@1`;
+  strategy `scripted_search@1`.
+- **M2:**
+  - adapter `hf_causal_lm@1` and family descriptors `qwen3_5@1` and
+    `llama@1` ([models.md](models.md));
+  - analyses `tensor_norms@1`, `svd_top_k@1`, and `direction_projection@1`;
+  - edits `fill_slice@1`, `project_out@1`, and `add_low_rank@1`;
+  - evaluator `generation@1`, profile `qwen35think@1`, and graders
+    `math_boxed@1` and `gsm8k_numeric@1`.
 
 Operators register extensions; agents only invoke what a policy permits.
 Processes pick up operator registrations through setup hooks, functions
@@ -96,10 +104,55 @@ exact versions (`OperationPolicy.with_analysis("abs_mean", "abs_mean@1")` or
 an operation that the experiment's policy does not list is rejected with
 `POLICY_DENIED`, and an unknown version with `NOT_FOUND`.
 
-Unsupported operations in M1: low-rank and directional edits (`add_low_rank`,
-`project_out`) are M2 operators; models with shared parameters (alias
-groups) are rejected; no operator may run the target network, compute
-gradients, or execute agent-supplied code under the M1 benchmark policies.
+No operator may run the target network, compute gradients, or execute
+agent-supplied code. Edits of alias-group members (tied embeddings) and of
+roles a family descriptor protects are refused under every policy.
+
+### The M2 edit operators
+
+Each takes a two-dimensional tensor with known axes and records exact
+after-values, as every edit does. Their arithmetic is the same on every
+platform: products are exact in float64, sums are correctly rounded
+(`math.fsum`), and the result is rounded to the stored dtype with
+round-to-nearest-even.
+
+| Operator | Effect | Parameters |
+| --- | --- | --- |
+| `fill_slice@1` | Sets the selection to one value, for example to ablate an attention head | `value`: finite; recorded as stored (rounded to float32, then to the stored dtype) |
+| `project_out@1` | `W'[:, C] = W[:, C] - alpha d (d^T W[:, C]) / (d^T d)` on an `[out_features, in_features]` tensor; the selection covers every row | `direction` (one value per row, at most 2,048, norm at least 1e-6; inline or a reference); `columns` (strictly increasing indices `C`); `alpha` (default 1) |
+| `add_low_rank@1` | `W' = W + alpha U V^T` over the selection, rank `r <= 16` | `u`, `v`: the `r` columns of `U` and `V` (one value per selected row, and per selected column), inline or as references; `alpha` |
+
+Entries whose update is zero keep their stored bytes, including `-0.0`.
+`alpha = 1` in `project_out@1` makes the edited columns orthogonal to `d`.
+The published p50c edit of Qwen3.5-0.8B has this form with `alpha = 6`,
+applied to 64 columns of `mlp.down` in layers 15 and 19, each layer with
+its own direction. Re-executing it with the directions recovered from the
+published diff reproduces about 91% of the entries in those columns byte
+for byte (5,924 and 6,162 of 65,536 differ), so exact replay of the
+published patch stays the hash-exact path.
+
+### Vector references
+
+An analysis or edit parameter that a spec lists in its `reference_parameters`
+may name a vector of a stored result instead of carrying it inline:
+`wse://analyses/<sha256>#<JSON pointer>`, at most 256 characters, for
+example `wse://analyses/3f...#/left_vectors/0`. Managed calls resolve it
+against the experiment's own results before reading any weights; a URI of
+another experiment fails as one that does not exist. Steps record the
+reference with the vector's length and SHA-256, and replay never reads
+it again. Direct use has no stored results and refuses references.
+
+### The M2 analyses
+
+| Analysis | Result |
+| --- | --- |
+| `tensor_norms@1` | L2 norms per row or column, with the top entries |
+| `svd_top_k@1` | The top `k <= 16` singular values and vectors in FP32; exact up to 2^22 elements, randomized above (recorded seed) |
+| `direction_projection@1` | Projections or cosines of a direction against the rows or columns |
+
+In managed use their vectors are stored as run-scoped artifacts. The
+response carries a summary, the top entries, and the `result_uri` whose
+pointers are vector references.
 
 ## Evaluators (`wse.evaluators.base`)
 
@@ -193,8 +246,11 @@ Agent SDKs are optional extras imported lazily inside the adapter module.
 
 ## Direct Python use
 
-The core works in memory, without a database, service, or MCP. Results are
-labeled `unmanaged` and support no managed-enforcement claim:
+For open-weight language models, the high-level entry point `wse.WSE`
+wraps the core and the operator `Engine` (see the README). Below it, the
+core works in memory, without a database, service, or MCP. Results are
+labeled `unmanaged` and support no managed-enforcement claim. This toy
+example edits a small MLP:
 
 ```python
 import torch
