@@ -30,8 +30,10 @@ Rules implemented here (Sections 3, 4.1, 4.3, 6.2, and 7.2 of the plan):
   can fit the policy's response limit. Text sources are checked before
   anything is reserved: an output URI must name a generation output that
   this experiment owns (any other URI fails exactly like one that does not
-  exist), and a suite item must be an item of a development generation
-  suite of the run's task (a final suite is refused as its evaluation is).
+  exist), a suite item must be an item of a development generation suite
+  of the run's task (a final suite is refused as its evaluation is), and a
+  string must encode to at least 2 tokens with the checkpoint's stored
+  tokenizer (its window starts after its first token).
   It reserves one ``probe_calls``, texts x ``tokens_per_probe_text``
   ``teacher_forced_tokens`` (the most its forwards can read), and its
   compute seconds; the worker settles the forward lengths it read. Retries
@@ -290,6 +292,7 @@ class JobService:
         self.db = engine.store.db
         self.experiments = engine.experiments
         self.ledger = engine.experiments.ledger
+        self._tokenizer_cache: tuple[Any, Any] | None = None  # (the stored files' hashes, their tokenizer)
 
     # -- suites (operator) ------------------------------------------------------
 
@@ -710,6 +713,7 @@ class JobService:
                            f"a probe teacher-forces at most {cap} texts under the experiment's policy, not {len(texts)}",
                            details={"texts_per_probe_call": cap, "texts": len(texts)})
         parsed = [self._probe_text(experiment_id, task_id, index, text) for index, text in enumerate(texts)]
+        self._check_probe_strings(manifest, parsed)
         resolved = _probe_sites(manifest, sites, self.engine.registry, MAX_PROBE_SITES)
         shown_groups = _probe_groups(groups, len(parsed))
         if top is None:
@@ -733,6 +737,31 @@ class JobService:
                                     "max_sites": fitting})
         return {"texts": parsed, "sites": resolved, "groups": shown_groups, "top": top,
                 "tokens_per_text": tokens_per_text}
+
+    def _check_probe_strings(self, manifest: ModelManifest, texts: list[dict[str, Any]]) -> None:
+        """Refuse a string text that encodes to fewer than 2 tokens, as the worker would after loading the model.
+
+        The string is encoded as the worker encodes it, with the checkpoint's
+        stored tokenizer (no weights are read); the tokenizer of the latest
+        checkpoint is kept for the next probe.
+        """
+        strings = [(index, text["text"]) for index, text in enumerate(texts) if "text" in text]
+        if not strings:
+            return
+        from wse.engines.hf_torch import load_tokenizer
+        from wse.hf_snapshot import MODEL_TEXT_FILES
+
+        key = None if manifest.source is None else tuple(sorted(
+            (name, digest) for name, digest in manifest.source.files.items() if name in MODEL_TEXT_FILES))
+        if self._tokenizer_cache is None or self._tokenizer_cache[0] != key:
+            self._tokenizer_cache = (key, load_tokenizer(self.engine._model_files(manifest)))
+        tokenizer = self._tokenizer_cache[1]
+        for index, string in strings:
+            count = len(tokenizer(string)["input_ids"])
+            if count < 2:
+                raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                               f"text {index} encodes to {count} token(s); a probed string needs at least 2, since "
+                               "its window starts after its first token", details={"text": index})
 
     def _probe_text(self, experiment_id: str, task_id: str, index: int, text: Any) -> dict[str, Any]:
         """One checked probe text, as stored in the request."""

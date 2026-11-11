@@ -379,6 +379,10 @@ def test_invalid_probe_requests_are_refused_before_anything_is_reserved(lm, monk
             refused(ErrorCode.INVALID_ARGUMENT, good, ["residual:1"], "bad-groups", groups=groups)
         refused(ErrorCode.INVALID_ARGUMENT, good, ["residual:1"], "bad-top", top=0)
         refused(ErrorCode.INVALID_ARGUMENT, good, ["residual:1"], "bad-top", top=65)
+        # A string that encodes to one token has no scored window: refused at submission, with the checkpoint's
+        # stored tokenizer, not in the worker after the reservation and the model load.
+        error = refused(ErrorCode.INVALID_ARGUMENT, [*good, {"text": "a"}], ["residual:1"], "one-token")
+        assert error.details == {"text": 3} and "encodes to 1 token" in error.message
         # Unknown sites, roles, layers, and suite items are NOT_FOUND, with candidates for sites.
         error = refused(ErrorCode.NOT_FOUND, good, ["model.layers.0.mlp.down_projj:input"], "unknown-site")
         assert "model.layers.0.mlp.down_proj" in error.details["candidates"]

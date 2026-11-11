@@ -875,10 +875,15 @@ class Engine:
         SHA-256 its manifest recorded at import and verified. A model imported
         before files were kept has none (``NOT_FOUND``; import it again).
         """
+        self._require_unbound("model_files")
+        return self._model_files(self._manifest(self.require_visible(checkpoint_id)))
+
+    def _model_files(self, manifest: ModelManifest) -> dict[str, bytes]:
+        """``model_files`` of a manifest the caller may use (no access check): the job service tokenizes probe
+        strings with them at submission. The files hold no weights."""
         from wse.hf_snapshot import MODEL_TEXT_FILES
 
-        self._require_unbound("model_files")
-        manifest = self._manifest(self.require_visible(checkpoint_id))
+        checkpoint_id = manifest.checkpoint_id
         if manifest.source is None:
             raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY,
                            f"checkpoint {checkpoint_id} is not an imported open-weight model and has no model files")
