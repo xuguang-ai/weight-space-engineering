@@ -391,7 +391,8 @@ def test_cancellation_and_budget_exhaustion_through_mcp(engine, trial, tmp_path,
             final = (await session.call("wse_get_experiment", experiment_id=eid))["result"]
             assert _consumed(final["experiment"]["budget"]) | {"compute_seconds": 0} == {
                 "analysis_calls": 0, "candidate_commits": 1, "compute_seconds": 0, "evaluated_examples": 128,
-                "evaluation_batches": 2, "model_forward_calls": 2, "patch_previews": 2, "tensor_read_calls": 2}
+                "evaluation_batches": 2, "model_forward_calls": 2, "patch_previews": 2, "tensor_read_calls": 2,
+                "generation_passes": 0, "generated_tokens": 0, "probe_calls": 0, "teacher_forced_tokens": 0}
             assert [c["role"] for c in final["checkpoints"]] == ["base", "candidate"]  # no partial candidate
 
     run(body)

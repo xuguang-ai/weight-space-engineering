@@ -92,6 +92,14 @@ DEFAULT_MAX_MODEL_BYTES = 64 * 1024 * 1024
 DEFAULT_EVAL_BATCH_SIZE = 64
 # The record format of a patch made in direct use and stored by Engine.store_patch.
 DIRECT_PATCH_FORMAT = "wse-direct-v1"
+
+
+class _RecordedPatch(Exception):
+    """Raised inside a patch commit when a concurrent writer already recorded the same patch."""
+
+    def __init__(self, record_json: str) -> None:
+        super().__init__("the patch was recorded concurrently")
+        self.record_json = record_json
 MAX_CONFIG_BYTES = 1024 * 1024
 BUNDLE_MANIFEST_NAME = "wse_bundle.json"
 
@@ -974,8 +982,12 @@ class Engine:
         after hashes; nothing is stored unless it replays. The patch file, the
         candidate checkpoint (whose parent is the base), and the record (format
         ``wse-direct-v1``, with ``label`` as its run) are committed together,
-        with a ``patch.stored`` audit event. Storing the same patch on the same
-        base again returns the existing record.
+        with a ``patch.stored`` audit event. A record is keyed by the base and
+        the exact patch (its blocks included), not by the label: storing the
+        same patch on the same base again, under any label, returns the
+        existing record with its first label and stores nothing. (A record
+        written before the key left the label out is found under the same
+        label only.)
         """
         from wse.patches import replay_patch, tensor_diffs
         from wse.schemas import ExternalPatchSource, ImportedPatch, ImportedPatchTensor
@@ -989,10 +1001,13 @@ class Engine:
         except ValidationError as exc:
             raise WSEError(ErrorCode.INVALID_PATCH, f"invalid patch: {exc}") from exc
         blocks = dict(blocks or {})
-        dedup_key = json_hash({"store_patch": {"base_checkpoint_id": base_checkpoint_id, "label": label,
-                                               "patch": patch.model_dump(mode="json"), "blocks": sorted(blocks)}})
-        existing = self.store.db.conn.execute("SELECT record_json FROM imported_patches WHERE dedup_key = ?",
-                                              (dedup_key,)).fetchone()
+        identity = {"base_checkpoint_id": base_checkpoint_id, "patch": patch.model_dump(mode="json"),
+                    "blocks": sorted(blocks)}
+        dedup_key = json_hash({"store_patch": identity})
+        legacy_key = json_hash({"store_patch": {**identity, "label": label}})
+        existing = self.store.db.conn.execute(
+            "SELECT record_json FROM imported_patches WHERE dedup_key IN (?, ?) ORDER BY created_at, rowid LIMIT 1",
+            (dedup_key, legacy_key)).fetchone()
         if existing is not None:
             return ImportedPatch.model_validate_json(existing["record_json"])
         base = self._open_checkpoint(base_checkpoint_id)
@@ -1016,7 +1031,14 @@ class Engine:
     def _commit_patch(self, base_checkpoint_id: str, base: ModelHandle, candidate: ModelHandle,
                       patch: MaterializedPatch, blocks: Mapping[str, bytes], *, source: Any, tensors: list[Any],
                       dedup_key: str, event: str) -> ImportedPatch:
-        """Publish ``patch`` as a binary patch file and commit ``candidate`` with its record and audit event."""
+        """Publish ``patch`` as a binary patch file and commit ``candidate`` with its record and audit event.
+
+        When a concurrent store or import of the same patch (the same
+        ``dedup_key``) commits first, this commit rolls back and returns the
+        winner's record.
+        """
+        import sqlite3
+
         from wse.database import insert_audit_event, utc_now
         from wse.experiments import _candidate_tensor_infos, _new_id
         from wse.patch_blocks import write_patch_file
@@ -1038,6 +1060,12 @@ class Engine:
                                changed_elements=sum(t.changed_elements for t in tensors), patch_bytes=size)
 
         def on_commit(conn: Any, committed: ModelManifest) -> None:
+            # Inside the write transaction (BEGIN IMMEDIATE): a concurrent store or import of the same patch that
+            # committed first is seen here, and this commit rolls back and returns its record.
+            winner = conn.execute("SELECT record_json FROM imported_patches WHERE dedup_key = ?",
+                                  (dedup_key,)).fetchone()
+            if winner is not None:
+                raise _RecordedPatch(winner["record_json"])
             self.store.require_published(relpath)
             conn.execute(
                 "INSERT INTO imported_patches (patch_id, format, dedup_key, base_checkpoint_id, checkpoint_id, "
@@ -1050,8 +1078,19 @@ class Engine:
                                 "checkpoint_id": committed.checkpoint_id, "source": source.model_dump(mode="json"),
                                 "changed_elements": record.changed_elements})
 
-        self.store.commit_checkpoint(manifest, dict(candidate._tensors), dedup_key=None,
-                                     event_type="checkpoint.candidate", on_commit=on_commit)
+        try:
+            self.store.commit_checkpoint(manifest, dict(candidate._tensors), dedup_key=None,
+                                         event_type="checkpoint.candidate", on_commit=on_commit)
+        except _RecordedPatch as won:
+            return ImportedPatch.model_validate_json(won.record_json)
+        except sqlite3.IntegrityError:
+            # A writer that bypassed the check above (it cannot: the check and the insert share one transaction)
+            # would surface here; the transaction rolled back, so return the record that holds the key.
+            row = self.store.db.conn.execute("SELECT record_json FROM imported_patches WHERE dedup_key = ?",
+                                             (dedup_key,)).fetchone()
+            if row is None:
+                raise
+            return ImportedPatch.model_validate_json(row["record_json"])
         return record
 
     def read_imported_patch(self, patch_id: str) -> tuple[MaterializedPatch, dict[str, bytes]]:
@@ -1188,7 +1227,11 @@ class Engine:
         *,
         parameters: Mapping[str, Any] | None = None,
         policy: OperationPolicy | None = None,
+        read_result: Any = None,
     ) -> AnalysisResult:
+        """``read_result`` reads the stored results that vector references name: an experiment's own results for
+        experiment-scoped analyses (``ExperimentService.experiment_results``), by default the results this engine
+        may read (``find_analysis_result``)."""
         from wse.analysis import run_analysis
 
         manifest = self._manifest(checkpoint_id)
@@ -1208,7 +1251,7 @@ class Engine:
             management="managed",
             store_large=self.store.put_analysis_result,
             # Vector references resolve like read_analysis_result: a run reads only its own results.
-            read_result=self.experiments.find_analysis_result,
+            read_result=read_result or self.experiments.find_analysis_result,
         )
 
     def read_analysis_result(self, uri: str) -> dict[str, Any]:
@@ -1314,10 +1357,11 @@ class Engine:
         suites = [SuiteSummary.from_suite(suite) for suite in self.jobs.list_suites(experiment.task_id)
                   if suite.split == "development"]
         operations = OperationsSummary(analyses=dict(policy.operations.analyses), edits=dict(policy.operations.edits),
-                                       limits=policy.operations.limits.model_dump())
+                                       limits=policy.operations.limits.model_dump(),
+                                       refuse_whole_tensor_scaling=bool(policy.operations.refuse_whole_tensor_scaling))
         return ExperimentDescription(
             experiment=experiment, task=task, operations=operations,
-            evaluation_available=experiment.mode == "bounded_eval" and policy.budget.evaluation_batches > 0,
+            evaluation_available=policy.evaluation_available,
             suites=suites, checkpoints=self.list_experiment_checkpoints(experiment_id),
             policy_uri=f"wse://experiments/{experiment_id}/policy", constraint_status=constraint_status,
         )
@@ -1378,7 +1422,13 @@ class Engine:
 
     def submit_evaluation(self, experiment_id: str, checkpoint_id: str, suite_id: str,
                           config: EvalConfig | Mapping[str, Any], key: str) -> Job:
-        """Queue a development evaluation; returns the job immediately."""
+        """Queue a development evaluation; returns the job immediately.
+
+        A generation suite (``generation@1``) is evaluated as a generation
+        pass, metered in passes and generated tokens (``wse.jobs``); its
+        report carries per-problem grades, lengths, limit hits, tail
+        excerpts, and the URIs of the full outputs.
+        """
         return self.jobs.submit_evaluation(experiment_id, checkpoint_id, suite_id, config, key)
 
     def get_job(self, experiment_id: str, job_id: str, wait_seconds: float = 0) -> Job:
@@ -1431,7 +1481,8 @@ class Engine:
         """Evaluate the frozen candidate and the base-checkpoint control on the final set, then close (operator only).
 
         ``checkpoint_id``, when given, must be the frozen selection: final
-        evaluation accepts no other checkpoint.
+        evaluation accepts no other checkpoint. A generation task's final
+        suite runs on the host's engine device (``mps`` when available).
         """
         return self.evaluation.final_evaluate(experiment_id, checkpoint_id)
 

@@ -10,6 +10,16 @@ Rules implemented here (Sections 3, 4.1, 4.3, 6.2, and 7.2 of the plan):
   the idempotent result, and it returns the job immediately. The same key and
   input return the same job without reserving again; the same key with other
   input is an ``IDEMPOTENCY_CONFLICT``.
+* A suite whose evaluator generates text (``generation@1``) is evaluated as a
+  generation pass (M2 plan Section 5.4). It needs a policy that grants
+  generation passes and a checkpoint that can generate; the pass may hold at
+  most ``problems_per_generation_pass`` problems, each output at most
+  ``new_tokens_per_output`` new tokens. It reserves one ``generation_passes``,
+  problems x samples x ``max_new_tokens`` ``generated_tokens`` (the most it can
+  generate), and its compute seconds, and no forward-batch counter; the worker
+  settles the tokens it generated. A pass's size comes from the suite's
+  parameters and the model's profile, so submission never reads the
+  problems, which stay in evaluator storage.
 * ``get_job`` can hold the call for up to 10 seconds until the job is
   terminal, so polling does not consume agent turns.
 * ``cancel_job`` releases a queued job's whole reservation. For a running job
@@ -81,10 +91,16 @@ def _wait_seconds(value: Any) -> float:
     return float(value)
 
 
+def unused_counters() -> dict[str, int]:
+    """Zero for the ledger counters that no evaluation job charges: synchronous operations' and probes'."""
+    return {"analysis_calls": 0, "tensor_read_calls": 0, "candidate_commits": 0, "patch_previews": 0,
+            "probe_calls": 0, "teacher_forced_tokens": 0}
+
+
 def queued_cancel_usage() -> Usage:
     """Usage of a job cancelled before any worker started it."""
     return Usage(evaluation_batches=0, evaluated_examples=0, model_forward_calls=0, compute_seconds=0.0,
-                 analysis_calls=0, tensor_read_calls=0, candidate_commits=0, patch_previews=0, artifact_bytes=0,
+                 generation_passes=0, generated_tokens=0, **unused_counters(), artifact_bytes=0,
                  peak_memory_bytes=None,
                  unavailable={"peak_memory_bytes": "no worker executed this job, so no memory was measured"})
 
@@ -93,8 +109,9 @@ def lost_job_usage(requested: Mapping[str, Any]) -> Usage:
     """Usage charged for a lost job: its whole reservation, with unmeasured fields explained."""
     return Usage.model_validate({
         "evaluation_batches": 0, "evaluated_examples": 0, "model_forward_calls": 0, "compute_seconds": 0.0,
+        "generation_passes": 0, "generated_tokens": 0,
         **requested,
-        "analysis_calls": 0, "tensor_read_calls": 0, "candidate_commits": 0, "patch_previews": 0, "artifact_bytes": 0,
+        **unused_counters(), "artifact_bytes": 0,
         "peak_memory_bytes": None,
         "unavailable": {"peak_memory_bytes": "the worker was lost before reporting usage"},
     })
@@ -348,10 +365,15 @@ class JobService:
                 details={"preregistered": {"sample_count": suite.sample_counts, "seed": suite.seeds}},
             )
         policy = self.experiments.experiment_policy(experiment_id)
-        per_batch = policy.budget.examples_per_batch
-        if per_batch < 1:
-            raise WSEError(ErrorCode.POLICY_DENIED, "the experiment's policy permits no evaluation batches")
-        batches = -(-config.sample_count // per_batch)
+        if self.generates_text(suite):
+            planned, batches = self._generation_request(policy, suite, config, checkpoint_id)
+        else:
+            per_batch = policy.budget.examples_per_batch
+            if per_batch < 1:
+                raise WSEError(ErrorCode.POLICY_DENIED, "the experiment's policy permits no evaluation batches")
+            batches = -(-config.sample_count // per_batch)
+            planned = {"evaluation_batches": batches, "evaluated_examples": config.sample_count,
+                       "model_forward_calls": batches}
         job_id = _new_id("job")
         with self.db.transaction() as conn:
             again = self.experiments._lookup(conn, experiment_id, key, "submit_evaluation", request_hash)
@@ -364,12 +386,8 @@ class JobService:
                               self.ledger.remaining(conn, experiment_id, "compute_seconds"))
                 if compute <= 0:
                     raise budget_error(conn, experiment_id, "compute_seconds", policy.budget.seconds_per_operation)
-                reservation = self.ledger.reserve(
-                    experiment_id, job_id,
-                    {"evaluation_batches": batches, "evaluated_examples": config.sample_count,
-                     "model_forward_calls": batches, "compute_seconds": compute},
-                    conn=conn,
-                )
+                reservation = self.ledger.reserve(experiment_id, job_id, {**planned, "compute_seconds": compute},
+                                                  conn=conn)
                 now = utc_now()
                 conn.execute(
                     "INSERT INTO jobs (job_id, experiment_id, kind, checkpoint_id, suite_id, config_json, state, "
@@ -385,6 +403,62 @@ class JobService:
                 self.experiments._remember(conn, experiment_id, key, "submit_evaluation", request_hash,
                                            canonical_json({"job_id": job_id}))
         return self._job(experiment_id, job_id)
+
+    def generates_text(self, suite: EvaluationSuite) -> bool:
+        """Whether ``suite`` runs as a generation pass: its evaluator generates text (``generation@1``)."""
+        from wse.evaluators.generation import generates_text
+
+        return generates_text(self.engine.registry.resolve_ref("evaluator", suite.evaluator))
+
+    def _generation_request(self, policy: Any, suite: EvaluationSuite, config: EvalConfig,
+                            checkpoint_id: str) -> tuple[dict[str, int], int]:
+        """The allowance a generation pass reserves, after checking it against the policy, and its batch count.
+
+        One pass and its most tokens: problems x samples x ``max_new_tokens``
+        (``generation_pass_size``). A policy that leaves the generation
+        counters unset permits no pass; a pass of more problems than
+        ``problems_per_generation_pass``, or a suite whose outputs may be longer
+        than ``new_tokens_per_output``, is refused before anything is reserved.
+        """
+        from wse.evaluators.generation import DEFAULT_BATCH_SIZE, generation_pass_size
+
+        budget = policy.budget
+        if budget.limit("generation_passes") < 1:
+            raise WSEError(
+                ErrorCode.POLICY_DENIED,
+                f"suite {suite.suite_id} is a generation suite, and the experiment's policy {policy.policy_id} "
+                "permits no generation passes",
+                details={"suite_id": suite.suite_id, "policy_id": policy.policy_id},
+            )
+        manifest = self.engine.store.load_manifest(checkpoint_id)
+        if not self.engine._capabilities(manifest).supports("generate.text"):
+            raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY,
+                           f"checkpoint {checkpoint_id} ({manifest.adapter}) cannot generate text, so it cannot be "
+                           f"evaluated on generation suite {suite.suite_id}",
+                           details={"checkpoint_id": checkpoint_id, "adapter": str(manifest.adapter)})
+        size = generation_pass_size(suite, config, source=manifest.source, registry=self.engine.registry)
+        problems_cap, tokens_cap = budget.limit("problems_per_generation_pass"), budget.limit("new_tokens_per_output")
+        if size.problems > problems_cap:
+            permitted = [count for count in suite.sample_counts if count <= problems_cap]
+            raise WSEError(
+                ErrorCode.POLICY_DENIED,
+                f"a generation pass evaluates at most {problems_cap} problems under the experiment's policy, and "
+                f"sample_count {size.problems} asks for more; use one of the preregistered sample counts "
+                f"{permitted} of suite {suite.suite_id}",
+                details={"problems_per_generation_pass": problems_cap, "sample_count": size.problems,
+                         "permitted_sample_counts": permitted},
+            )
+        if size.max_new_tokens > tokens_cap:
+            raise WSEError(
+                ErrorCode.POLICY_DENIED,
+                f"suite {suite.suite_id} generates up to {size.max_new_tokens} new tokens per output, and the "
+                f"experiment's policy permits at most {tokens_cap}; evaluate a suite whose max_new_tokens is at most "
+                f"{tokens_cap}",
+                details={"new_tokens_per_output": tokens_cap, "max_new_tokens": size.max_new_tokens,
+                         "suite_id": suite.suite_id},
+            )
+        return ({"generation_passes": 1, "generated_tokens": size.max_generated_tokens},
+                -(-size.outputs // DEFAULT_BATCH_SIZE))
 
     # -- reading ----------------------------------------------------------------
 

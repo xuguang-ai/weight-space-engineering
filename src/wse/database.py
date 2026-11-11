@@ -391,6 +391,26 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             """,
         ],
     ),
+    (
+        10,
+        [
+            # The language-model ledger counters (M2 plan Section 5.5). Every existing
+            # experiment gets them with the limit its policy sets, which for every policy
+            # written before they existed is unset, so 0: not permitted. Nothing is
+            # consumed or reserved, and no existing row changes.
+            """
+            INSERT INTO budget_ledger (experiment_id, counter, limit_value, consumed, reserved)
+            SELECT e.experiment_id, c.counter,
+                   COALESCE(json_extract(p.policy_json, '$.budget.' || c.counter), 0), 0, 0
+            FROM experiments e
+            LEFT JOIN policies p ON p.policy_id = e.policy_id
+            CROSS JOIN (SELECT 'generation_passes' AS counter UNION ALL SELECT 'generated_tokens'
+                        UNION ALL SELECT 'probe_calls' UNION ALL SELECT 'teacher_forced_tokens') c
+            WHERE NOT EXISTS (SELECT 1 FROM budget_ledger b
+                              WHERE b.experiment_id = e.experiment_id AND b.counter = c.counter)
+            """,
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

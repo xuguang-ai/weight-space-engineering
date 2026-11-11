@@ -576,7 +576,11 @@ class ObjectiveSpec(_Frozen):
 class Usage(_Frozen):
     """Observed resource usage. ``None`` means unavailable, never zero.
 
-    ``unavailable`` maps a field name to the reason it is ``None``.
+    ``unavailable`` maps a field name to the reason it is ``None``. The
+    language-model counters (``generation_passes``, ``generated_tokens``,
+    ``probe_calls``, ``teacher_forced_tokens``; M2 plan Section 5.5) are
+    omitted from the JSON while unset, so records written before they existed
+    keep their content and hashes; settled jobs set every counter.
     """
 
     evaluation_batches: int | None = None
@@ -587,6 +591,10 @@ class Usage(_Frozen):
     tensor_read_calls: int | None = None
     candidate_commits: int | None = None
     patch_previews: int | None = None
+    generation_passes: int | None = _optional()
+    generated_tokens: int | None = _optional()
+    probe_calls: int | None = _optional()
+    teacher_forced_tokens: int | None = _optional()
     artifact_bytes: int | None = None
     peak_memory_bytes: int | None = None
     unavailable: dict[str, str] = Field(default_factory=dict)
@@ -743,6 +751,10 @@ UsageCounter = Literal[
     "model_forward_calls",
     "evaluation_batches",
     "evaluated_examples",
+    "generation_passes",
+    "generated_tokens",
+    "probe_calls",
+    "teacher_forced_tokens",
 ]
 
 
@@ -1341,7 +1353,7 @@ class JobProgress(_Frozen):
 
 
 class Job(_Frozen):
-    """An asynchronous evaluation job.
+    """An asynchronous evaluation job: a forward-batch evaluation, or a generation pass of a generation suite.
 
     ``usage`` is the settled usage once the job is terminal and ``None``
     before. ``result`` carries the report summary (metrics, sample count,
@@ -1472,6 +1484,13 @@ class SampleResult(_Frozen):
     ``answer`` is the answer the grader read (at most 200 characters; ``None``
     when there was none). ``output_sha256`` identifies the generated token
     IDs, so identical generations can be recognized without the text.
+
+    In the report of a generation pass (a managed development evaluation),
+    ``tail`` is the end of the output's decoded text, at most
+    ``wse.evaluators.generation.TAIL_BYTES`` bytes of JSON (shorter when the
+    report would otherwise exceed the inline-result limit), so that repetition
+    is visible; ``output_uri`` references the whole output, a run-scoped
+    ``GenerationOutput`` artifact. Both are absent elsewhere.
     """
 
     sample: int = Field(ge=0)
@@ -1482,6 +1501,36 @@ class SampleResult(_Frozen):
     finished: bool
     limit_hit: bool
     output_sha256: str = Field(pattern=HASH_PATTERN.pattern)
+    tail: str | None = _optional()
+    output_uri: str | None = _optional(pattern=r"^wse://analyses/[0-9a-f]{64}$")
+
+
+class GenerationOutput(_Frozen):
+    """The whole output of one sample of a generation pass, stored as a run-scoped artifact.
+
+    ``tokens`` are the generated token IDs, the stop token included, and
+    ``text`` their decoded text without it (what the grader read). The
+    report's ``SampleResult.output_uri`` references it; only the run whose
+    experiment produced it can read it.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    kind: Literal["generation_output"] = "generation_output"
+    experiment_id: str
+    job_id: str
+    checkpoint_id: str
+    suite_id: str
+    index: int = Field(ge=0)
+    item_id: str
+    sample: int = Field(ge=0)
+    seed: int = Field(ge=0)
+    prompt_sha256: str = Field(pattern=HASH_PATTERN.pattern)
+    output_sha256: str = Field(pattern=HASH_PATTERN.pattern)
+    generated_tokens: int = Field(ge=0)
+    finished: bool
+    limit_hit: bool
+    tokens: list[int]
+    text: str
 
 
 class ProblemResult(_Frozen):
@@ -1674,11 +1723,16 @@ class SuiteSummary(_Frozen):
 
 
 class OperationsSummary(_Frozen):
-    """The operations an experiment's policy permits: public names mapped to exact operator versions."""
+    """The operations an experiment's policy permits: public names mapped to exact operator versions.
+
+    ``refuse_whole_tensor_scaling`` is the policy's protection against
+    patches that only change a tensor's overall scale (``wse.policy``).
+    """
 
     analyses: dict[str, ExtensionRef]
     edits: dict[str, ExtensionRef]
     limits: dict[str, int]
+    refuse_whole_tensor_scaling: bool = False
 
 
 class ModelSummary(BaseModel):
@@ -1711,7 +1765,9 @@ class ExperimentDescription(_Frozen):
     ``task`` is the registered task definition with its ``ObjectiveSpec``
     (``None`` when the operator registered none). ``suites`` lists the
     development suites the experiment may evaluate; ``evaluation_available``
-    is false in ``weights_only`` mode. ``constraint_status`` is ``verified``
+    is whether the policy permits development evaluations (forward-batch
+    evaluation batches or generation passes), so it is false in
+    ``weights_only`` mode. ``constraint_status`` is ``verified``
     only when the operator who started the interface attests that the
     controller has no other execution channel (Section 6.1 of the plan);
     otherwise it is ``unverified``.

@@ -35,11 +35,31 @@ code: it runs registered evaluators over registered adapters only.
   execution configuration, in the transaction that settles the job; the job
   carries its summary inline. Stored examples are read from evaluator
   storage only here.
+* **Generation passes** (M2 plan Section 5.4). A job whose reservation holds
+  ``generation_passes`` evaluates a generation suite: ``run_generation`` on
+  the cached model of the checkpoint, at batch size 8, on the worker's device
+  (``mps`` when available, else ``cpu``, or ``--device``). The
+  ``GenerationMeter`` checks for cancellation and the time limit at every
+  decoding step and counts the tokens generated: exactly for finished
+  batches, and rows x steps for the batch in progress. Settlement charges
+  one pass (once a batch started), those tokens, and the compute seconds,
+  and releases the rest of the reservation. Each output is stored as a
+  run-scoped ``GenerationOutput`` artifact (``wse://analyses/<sha256>``),
+  which the run can read once the job has succeeded (ownership is recorded
+  in the settling transaction); the report carries every sample's grade,
+  length, limit hit, a tail excerpt of its text, and its artifact's URI,
+  within the policy's inline-result limit (``report_with_tails``).
+* **Model cache.** Generation passes load their checkpoint through
+  ``ModelCache``, keyed by checkpoint ID, so consecutive jobs on a checkpoint
+  load it once; see ``ModelCache`` for its bound and memory. M1 jobs load
+  their (small) models per job, as before.
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import gc
 import importlib
 import os
 import resource
@@ -50,23 +70,30 @@ import subprocess
 import sys
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from wse.api import evaluate_candidate
 from wse.audit import record_event
 from wse.database import Database, utc_now
-from wse.jobs import queued_cancel_usage
-from wse.schemas import ErrorCode, EvalConfig, JobProgress, Usage, WSEError
+from wse.jobs import queued_cancel_usage, unused_counters
+from wse.schemas import ErrorCode, EvalConfig, GenerationOutput, JobProgress, Usage, WSEError
+
+if TYPE_CHECKING:
+    from wse.api import EvaluationResult, ModelHandle
+    from wse.evaluators.generation import SampleOutput, TextModel
 
 EXIT_HARD_STOP = 70
 DEFAULT_LEASE_SECONDS = 10.0
 DEFAULT_POLL_SECONDS = 0.1
 DEFAULT_CANCEL_GRACE_SECONDS = 2.0
 DEFAULT_TIMEOUT_GRACE_SECONDS = 1.0
+DEFAULT_MODEL_CACHE_SIZE = 2
 
 
 def peak_memory_bytes() -> int:
@@ -134,6 +161,159 @@ class ForwardMeter:
         return JobProgress(batches_total=batches_total, batches_started=self.started_calls,
                            batches_completed=self.completed_calls, examples_started=self.started_examples)
 
+    def counts(self) -> dict[str, int]:
+        """The counters this job charges: the forward calls and examples it started."""
+        return {"evaluation_batches": self.started_calls, "evaluated_examples": self.started_examples,
+                "model_forward_calls": self.started_calls, "generation_passes": 0, "generated_tokens": 0}
+
+
+class GenerationMeter:
+    """The meter of a generation pass: its batches, its generated tokens, and its stops.
+
+    The worker passes ``check``, ``step``, and ``batch_finished`` to
+    ``run_generation``. ``step`` runs at every decoding step and checks for
+    cancellation and the time limit, so a pass stops at its next step. A
+    finished batch counts its outputs' tokens exactly (stop tokens
+    included); the batch in progress counts rows x steps so far, an upper
+    bound, because a row that stopped early still counts every step. The
+    count never exceeds the reserved tokens, which cover every output at its
+    token limit. The pass itself counts once its first batch started.
+    The monitor thread reads the counts while the job runs, so they change
+    under a lock.
+    """
+
+    def __init__(self, *, permitted: bool, max_tokens: int, deadline: float) -> None:
+        self.permitted = permitted
+        self.max_tokens = max_tokens
+        self.deadline = deadline
+        self.stop_reason: str | None = None
+        self._lock = threading.Lock()
+        self.batches_started = 0
+        self.batches_completed = 0
+        self.rows_started = 0
+        self.completed_tokens = 0
+        self._rows = 0  # rows of the batch in progress
+        self._steps = 0  # its decoding steps so far
+
+    def check(self) -> None:
+        if self.stop_reason is None and time.monotonic() > self.deadline:
+            self.stop_reason = "timeout"
+        if self.stop_reason is not None:
+            raise JobStopped(self.stop_reason)
+
+    def step(self, rows: int, step: int) -> None:
+        """``StepHook``: step 0 starts a batch of ``rows`` rows; step ``k`` is its ``k``-th decoding step."""
+        with self._lock:
+            if step == 0:
+                self.batches_started += 1
+                self.rows_started += rows
+                self._rows, self._steps = rows, 0
+            else:
+                self._steps = step
+        self.check()
+
+    def batch_finished(self, outputs: Sequence[SampleOutput], seconds: float) -> None:
+        with self._lock:
+            self.completed_tokens += sum(len(output.tokens) for output in outputs)
+            self.batches_completed += 1
+            self._rows = self._steps = 0
+
+    def progress(self, batches_total: int) -> JobProgress:
+        with self._lock:
+            return JobProgress(batches_total=batches_total, batches_started=self.batches_started,
+                               batches_completed=self.batches_completed, examples_started=self.rows_started)
+
+    def counts(self) -> dict[str, int]:
+        """The counters this pass charges: the pass, once started, and the tokens generated so far."""
+        with self._lock:
+            tokens = min(self.max_tokens, self.completed_tokens + self._rows * self._steps)
+            passes = 1 if self.batches_started else 0
+        return {"evaluation_batches": 0, "evaluated_examples": 0, "model_forward_calls": 0,
+                "generation_passes": passes, "generated_tokens": tokens}
+
+
+@dataclass(frozen=True)
+class LoadedModel:
+    """A checkpoint loaded for generation: its hash-verified handle and its text model on the worker's device.
+
+    The handle keeps the engine runtime it built (``ModelHandle.runtime``),
+    so another job on the same device, a probe for example, reuses the module.
+    """
+
+    checkpoint_id: str
+    handle: ModelHandle
+    text_model: TextModel
+
+
+def _release_device_memory(entry: LoadedModel) -> None:
+    gc.collect()
+    device = getattr(getattr(entry.text_model.runtime, "device", None), "type", None)
+    if device == "mps":
+        torch.mps.empty_cache()
+
+
+class ModelCache:
+    """Models the worker keeps loaded across jobs, keyed by checkpoint ID; the least recently used leaves first.
+
+    **Memory.** An entry holds its checkpoint's tensors in CPU memory, their
+    stored bytes (about 1.5 GB for Qwen3.5-0.8B's BF16 text model), and, on
+    MPS, one device copy of every distinct tensor (about as much again), plus
+    the tokenizer. At most ``capacity`` entries are held: the entry to evict
+    is dropped before a new model loads, so a load never holds one model more.
+    The default of 2 keeps a base and a candidate, which an experiment's loop
+    alternates: about 6 GB for Qwen3.5-0.8B on MPS. ``capacity`` 0 disables
+    the cache: each job loads its model and releases it when it ends.
+
+    Checkpoints are immutable and verified against their hashes when loaded,
+    so an entry never goes stale; the worker still refuses a checkpoint marked
+    CORRUPT since it was loaded (``Worker.loaded_model``).
+    """
+
+    def __init__(self, load: Callable[[str], LoadedModel], capacity: int = DEFAULT_MODEL_CACHE_SIZE) -> None:
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 0:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, "the model cache size must be an integer >= 0")
+        self._load = load
+        self.capacity = capacity
+        self._entries: OrderedDict[str, LoadedModel] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def __contains__(self, checkpoint_id: object) -> bool:
+        return checkpoint_id in self._entries
+
+    def get(self, checkpoint_id: str) -> LoadedModel:
+        """The cached model of ``checkpoint_id``, loading it (after evicting if full) when absent."""
+        entry = self._entries.get(checkpoint_id)
+        if entry is not None:
+            self._entries.move_to_end(checkpoint_id)
+            return entry
+        while self._entries and len(self._entries) >= self.capacity:
+            _, evicted = self._entries.popitem(last=False)
+            _release_device_memory(evicted)
+        loaded = self._load(checkpoint_id)
+        if self.capacity > 0:
+            self._entries[checkpoint_id] = loaded
+        return loaded
+
+    def discard(self, checkpoint_id: str) -> None:
+        evicted = self._entries.pop(checkpoint_id, None)
+        if evicted is not None:
+            _release_device_memory(evicted)
+
+    def clear(self) -> None:
+        while self._entries:
+            _, evicted = self._entries.popitem(last=False)
+            _release_device_memory(evicted)
+
+
+@dataclass(frozen=True)
+class GenerationPass:
+    """A finished generation pass: its result (output URIs attached) and each output's text by (problem, sample)."""
+
+    result: EvaluationResult
+    texts: Mapping[tuple[int, int], str]
+
 
 def _stop_error(reason: str, limit: float) -> WSEError:
     if reason == "cancelled":
@@ -149,9 +329,14 @@ def _stop_error(reason: str, limit: float) -> WSEError:
 
 
 class _Execution:
-    """State shared by the main thread and the monitor of one running job."""
+    """State shared by the main thread and the monitor of one running job.
 
-    def __init__(self, job_id: str, meter: ForwardMeter, batches_total: int, limit: float) -> None:
+    ``output_uris`` and ``artifact_bytes`` are a generation pass's stored
+    outputs, and ``report_limit`` the policy's inline-result limit for its
+    report.
+    """
+
+    def __init__(self, job_id: str, meter: ForwardMeter | GenerationMeter, batches_total: int, limit: float) -> None:
         self.job_id = job_id
         self.experiment_id: str | None = None
         self.checkpoint_id: str | None = None
@@ -162,19 +347,18 @@ class _Execution:
         self.started = time.monotonic()
         self.done = threading.Event()
         self.cancel_seen: float | None = None
+        self.output_uris: list[str] = []
+        self.artifact_bytes = 0
+        self.report_limit: int | None = None
 
     def usage(self) -> Usage:
+        """The usage to settle: the meter's counters, compute seconds capped at the reservation, and 0 elsewhere."""
         elapsed = time.monotonic() - self.started
         return Usage(
-            evaluation_batches=self.meter.started_calls,
-            evaluated_examples=self.meter.started_examples,
-            model_forward_calls=self.meter.started_calls,
+            **self.meter.counts(),
             compute_seconds=round(min(elapsed, self.limit), 6),
-            analysis_calls=0,
-            tensor_read_calls=0,
-            candidate_commits=0,
-            patch_previews=0,
-            artifact_bytes=0,
+            **unused_counters(),
+            artifact_bytes=self.artifact_bytes,
             peak_memory_bytes=peak_memory_bytes(),
         )
 
@@ -195,9 +379,15 @@ class Worker:
         timeout_grace_seconds: float = DEFAULT_TIMEOUT_GRACE_SECONDS,
         hard_exit: Callable[[int], Any] = os._exit,
         parent_pid: int | None = None,
+        device: str | None = None,
+        model_cache_size: int = DEFAULT_MODEL_CACHE_SIZE,
     ) -> None:
         from wse.api import Engine
 
+        if device is not None:
+            from wse.engines.hf_torch import select_device
+
+            device = select_device(device).type  # an unknown or unavailable device fails here, before any job
         self.engine = Engine(workspace, registry=registry, recover=False)
         self.db = self.engine.store.db
         self.jobs = self.engine.jobs
@@ -209,9 +399,12 @@ class Worker:
         self.timeout_grace_seconds = float(timeout_grace_seconds)
         self.hard_exit = hard_exit
         self.parent_pid = parent_pid
+        self.device = device  # None: mps when available, else cpu
+        self.models = ModelCache(self._load_model, model_cache_size)
         self._stop = threading.Event()
 
     def close(self) -> None:
+        self.models.clear()
         self.engine.close()
 
     def __enter__(self) -> Worker:
@@ -292,10 +485,19 @@ class Worker:
         requested = reservation.requested if reservation.state == "HELD" else {}
         progress = JobProgress.model_validate_json(row["progress_json"])
         limit = float(requested.get("compute_seconds", 0))
-        permitted = experiment["mode"] == "bounded_eval" and requested.get("model_forward_calls", 0) > 0
-        meter = ForwardMeter(permitted=permitted, batch_size=1, max_calls=int(requested.get("model_forward_calls", 0)),
-                             max_examples=int(requested.get("evaluated_examples", 0)),
-                             deadline=time.monotonic() + limit)
+        # A generation pass is the job whose reservation holds a pass (jobs.JobService._generation_request).
+        generation = "generation_passes" in requested
+        meter: ForwardMeter | GenerationMeter
+        if generation:
+            meter = GenerationMeter(
+                permitted=experiment["mode"] == "bounded_eval" and requested.get("generated_tokens", 0) > 0,
+                max_tokens=int(requested.get("generated_tokens", 0)), deadline=time.monotonic() + limit)
+        else:
+            permitted = experiment["mode"] == "bounded_eval" and requested.get("model_forward_calls", 0) > 0
+            meter = ForwardMeter(permitted=permitted, batch_size=1,
+                                 max_calls=int(requested.get("model_forward_calls", 0)),
+                                 max_examples=int(requested.get("evaluated_examples", 0)),
+                                 deadline=time.monotonic() + limit)
         execution = _Execution(row["job_id"], meter, progress.batches_total, limit)
         execution.experiment_id, execution.checkpoint_id = row["experiment_id"], row["checkpoint_id"]
         monitor = threading.Thread(target=self._monitor, args=(execution,), daemon=True,
@@ -314,10 +516,18 @@ class Worker:
             policy = self.engine.experiments.get_policy(experiment["policy_id"])
             if policy.policy_hash != experiment["policy_hash"]:
                 raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"policy of experiment {experiment['experiment_id']} changed")
-            meter.batch_size = policy.budget.examples_per_batch
             execution.suite = self.jobs.load_suite(row["suite_id"])
-            result = self.evaluate(row["checkpoint_id"], row["suite_id"],
-                                   EvalConfig.model_validate_json(row["config_json"]), meter)
+            config = EvalConfig.model_validate_json(row["config_json"])
+            if generation != self.jobs.generates_text(execution.suite):
+                raise WSEError(ErrorCode.WORKER_FAILED,
+                               f"the job's reservation does not match the evaluator of suite {row['suite_id']}, so it "
+                               "was not run", details={"reason": "reservation_mismatch"})
+            if isinstance(meter, GenerationMeter):
+                execution.report_limit = policy.operations.limits.max_result_json_bytes
+                result = self.generate(execution, config, meter, policy)
+            else:
+                meter.batch_size = policy.budget.examples_per_batch
+                result = self.evaluate(row["checkpoint_id"], row["suite_id"], config, meter)
             meter.check()  # a stop requested while the evaluator swallowed it still wins
             if time.monotonic() - execution.started > limit:
                 raise JobStopped("timeout")
@@ -358,19 +568,108 @@ class Worker:
         return evaluate_candidate(handle, suite, config, registry=self.engine.registry, forward=meter,
                                   batch_size=meter.batch_size)
 
+    # -- generation passes --------------------------------------------------------
+
+    def _load_model(self, checkpoint_id: str) -> LoadedModel:
+        from wse.evaluators import generation
+
+        handle = self.engine.open_checkpoint(checkpoint_id)  # verified against the checkpoint's hashes
+        text_model = generation.load_text_model(handle, self.engine.model_files(checkpoint_id), device=self.device)
+        return LoadedModel(checkpoint_id=checkpoint_id, handle=handle, text_model=text_model)
+
+    def loaded_model(self, checkpoint_id: str) -> LoadedModel:
+        """The checkpoint's model, from the cache or loaded into it (worker-internal; jobs that run the engine).
+
+        A checkpoint that is no longer READY (marked CORRUPT since it was
+        loaded) is dropped from the cache and refused.
+        """
+        state = self.engine.store.checkpoint_state(checkpoint_id)
+        if state != "READY":
+            self.models.discard(checkpoint_id)
+            raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"checkpoint {checkpoint_id} is {state} and cannot be used",
+                           details={"checkpoint_id": checkpoint_id, "state": state})
+        return self.models.get(checkpoint_id)
+
+    def generate(self, execution: _Execution, config: EvalConfig, meter: GenerationMeter, policy: Any
+                 ) -> GenerationPass:
+        """Run the generation pass of a job through ``meter`` and store its outputs (worker-internal only).
+
+        The suite's problems are read from evaluator storage, the model comes
+        from the cache, and ``run_generation`` runs with the meter's hooks at
+        the generation batch size. The pass is checked against the policy and
+        the reservation again before it starts. Every output is then stored as
+        a ``GenerationOutput`` artifact; the run may read them once the job
+        has succeeded.
+        """
+        from wse.evaluators.generation import DEFAULT_BATCH_SIZE, plan_generation, run_generation
+
+        if not meter.permitted:
+            raise WSEError(ErrorCode.POLICY_DENIED,
+                           "this experiment permits no generation; the worker never runs the target network")
+        suite = execution.suite
+        if suite.data is None:
+            suite = suite.resolved(self.engine.datasets.load(suite.dataset))
+        loaded = self.loaded_model(execution.checkpoint_id)
+        plan = plan_generation(loaded.handle, suite, config, registry=self.engine.registry)
+        budget, tokens = policy.budget, len(plan.rows) * plan.profile.max_new_tokens
+        if len(plan.items) > budget.limit("problems_per_generation_pass") \
+                or plan.profile.max_new_tokens > budget.limit("new_tokens_per_output"):
+            raise WSEError(ErrorCode.POLICY_DENIED, "the generation pass exceeds the policy's per-pass limits",
+                           details={"problems": len(plan.items), "max_new_tokens": plan.profile.max_new_tokens})
+        if tokens > meter.max_tokens:
+            raise WSEError(ErrorCode.BUDGET_EXCEEDED,
+                           f"the generation pass may generate {tokens} tokens, more than the {meter.max_tokens} "
+                           "reserved for this job", details={"reserved_generated_tokens": meter.max_tokens,
+                                                             "generated_tokens": tokens})
+        run = run_generation(loaded.handle, suite, config, text_model=loaded.text_model,
+                             registry=self.engine.registry, batch_size=DEFAULT_BATCH_SIZE, check=meter.check,
+                             on_batch=meter.batch_finished, on_step=meter.step)
+        graded = {(problem.index, sample.sample): sample for problem in run.result.problems
+                  for sample in problem.samples}
+        uris: dict[tuple[int, int], str] = {}
+        for output in run.outputs:
+            key = (output.index, output.sample)
+            sample = graded[key]
+            record = GenerationOutput(
+                experiment_id=execution.experiment_id, job_id=execution.job_id,
+                checkpoint_id=execution.checkpoint_id, suite_id=suite.suite_id, index=output.index,
+                item_id=output.item_id, sample=output.sample, seed=output.seed, prompt_sha256=output.prompt_sha256,
+                output_sha256=sample.output_sha256, generated_tokens=sample.generated_tokens,
+                finished=sample.finished, limit_hit=sample.limit_hit, tokens=list(output.tokens), text=output.text)
+            data = record.canonical_json().encode("utf-8")
+            uris[key] = self.engine.store.put_analysis_result(data)
+            execution.artifact_bytes += len(data)
+        execution.output_uris = list(uris.values())
+        problems = tuple(problem.model_copy(update={"samples": [
+            sample.model_copy(update={"output_uri": uris[(problem.index, sample.sample)]})
+            for sample in problem.samples]}) for problem in run.result.problems)
+        return GenerationPass(result=dataclasses.replace(run.result, problems=problems),
+                              texts={(output.index, output.sample): output.text for output in run.outputs})
+
     def _finish(self, db: Database, execution: _Execution, state: str, result: Any,
                 error: WSEError | None) -> bool:
+        from wse.evaluators.generation import report_with_tails
+
         usage = execution.usage()
         report = None
         if result is not None and state == "succeeded":
+            evaluated = result.result if isinstance(result, GenerationPass) else result
             report = self.engine.evaluation.build_report(
-                result, experiment_id=execution.experiment_id, job_id=execution.job_id,
+                evaluated, experiment_id=execution.experiment_id, job_id=execution.job_id,
                 checkpoint_id=execution.checkpoint_id, suite=execution.suite, usage=usage, keep_scores=True)
+            if isinstance(result, GenerationPass):
+                report = report_with_tails(report, result.texts, limit=execution.report_limit)
         with db.transaction() as conn:
-            return self.jobs.finish(conn, execution.job_id, state, usage,
-                                    result=report.summary() if report is not None else None, error=error,
-                                    progress=execution.meter.progress(execution.batches_total),
-                                    lease_owner=self.worker_id, report=report)
+            finished = self.jobs.finish(conn, execution.job_id, state, usage,
+                                        result=report.summary() if report is not None else None, error=error,
+                                        progress=execution.meter.progress(execution.batches_total),
+                                        lease_owner=self.worker_id, report=report)
+            if finished and report is not None:
+                # The run may read its pass's outputs from now on, as it reads its own analysis results.
+                for uri in execution.output_uris:
+                    conn.execute("INSERT OR IGNORE INTO analysis_results (uri, experiment_id, created_at) "
+                                 "VALUES (?, ?, ?)", (uri, execution.experiment_id, utc_now()))
+            return finished
 
     def _monitor(self, execution: _Execution) -> None:
         db = Database(self.db.path)
@@ -520,6 +819,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--idle-exit-seconds", type=float, default=None)
     parser.add_argument("--parent-pid", type=int, default=None,
                         help="stop (after the current job) once this process is no longer the worker's parent")
+    parser.add_argument("--device", choices=("mps", "cpu"), default=None,
+                        help="the engine device of generation passes (default: mps when available, else cpu)")
+    parser.add_argument("--model-cache-size", type=int, default=DEFAULT_MODEL_CACHE_SIZE,
+                        help="models kept loaded across jobs (0 disables the cache; see wse.worker.ModelCache)")
     args = parser.parse_args(argv)
 
     from wse.registry import builtin_registry
@@ -530,7 +833,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     worker = Worker(args.workspace, registry=registry, lease_seconds=args.lease_seconds,
                     heartbeat_seconds=args.heartbeat_seconds, poll_seconds=args.poll_seconds,
                     cancel_grace_seconds=args.cancel_grace_seconds,
-                    timeout_grace_seconds=args.timeout_grace_seconds, parent_pid=args.parent_pid)
+                    timeout_grace_seconds=args.timeout_grace_seconds, parent_pid=args.parent_pid,
+                    device=args.device, model_cache_size=args.model_cache_size)
     previous = {}
     if threading.current_thread() is threading.main_thread():
         for signum in (signal.SIGTERM, signal.SIGINT):

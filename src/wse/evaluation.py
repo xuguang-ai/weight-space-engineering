@@ -21,7 +21,10 @@
   frozen, so it can be retried on the same candidate. Final examples are
   read from evaluator storage only here; final reports carry aggregates only
   (no per-example scores, examples, or generation seed) and are withheld
-  from run-bound engines until the experiment is closed.
+  from run-bound engines until the experiment is closed. A generation
+  task's final suite (``generation@1``) is generated here directly with
+  ``run_generation``; its reports carry no per-problem results, tails, or
+  outputs, and no output is stored.
 """
 
 from __future__ import annotations
@@ -313,7 +316,13 @@ class EvaluationService:
         return report
 
     def final_evaluate(self, experiment_id: str, checkpoint_id: str | None = None) -> FinalEvaluationReport:
-        """Evaluate the frozen candidate and the base-checkpoint control, pair them, and close the experiment."""
+        """Evaluate the frozen candidate and the base-checkpoint control, pair them, and close the experiment.
+
+        A generation task's final suite is generated directly, in this
+        process, on the host's engine device (``mps`` when available, else
+        ``cpu``), which its reports record; they keep aggregates only, and
+        the outputs are stored nowhere.
+        """
         self.experiments._require_operator("final evaluation")
         row = self.experiments._experiment_row(experiment_id)
         request_hash = json_hash({"operation": "final_evaluate", "checkpoint_id": str(checkpoint_id)})
@@ -350,8 +359,6 @@ class EvaluationService:
                            "so it can be retried on the same candidate", retryable=True) from exc
 
     def _run_final(self, row: sqlite3.Row) -> FinalEvaluationReport:
-        from wse.api import evaluate_candidate
-
         experiment_id = row["experiment_id"]
         frozen, base = row["selected_checkpoint_id"], row["base_checkpoint_id"]
         suite = self.final_suite(row["task_id"])
@@ -359,8 +366,7 @@ class EvaluationService:
         config = EvalConfig(sample_count=suite.example_count, seed=suite.seeds[0])
         results = {}
         for checkpoint in dict.fromkeys((frozen, base)):
-            results[checkpoint] = evaluate_candidate(self.engine.open_checkpoint(checkpoint), resolved, config,
-                                                     registry=self.engine.registry, batch_size=FINAL_BATCH_SIZE)
+            results[checkpoint] = self._final_result(checkpoint, resolved, config)
         candidate_result, control_result = results[frozen], results[base]
         if candidate_result.scores is None:
             raise WSEError(ErrorCode.WORKER_FAILED,
@@ -385,6 +391,17 @@ class EvaluationService:
                 sealed_concurrently = False
                 final = self._seal(conn, row, suite, reports, comparison)
         return self.get_final_report(experiment_id) if sealed_concurrently else final
+
+    def _final_result(self, checkpoint_id: str, suite: EvaluationSuite, config: EvalConfig) -> EvaluationResult:
+        """One checkpoint's evaluation on the resolved final suite: a forward-batch evaluation, or a generation."""
+        from wse.api import evaluate_candidate
+        from wse.evaluators.generation import DEFAULT_BATCH_SIZE, generates_text, run_generation
+
+        handle = self.engine.open_checkpoint(checkpoint_id)
+        if generates_text(self.engine.registry.resolve_ref("evaluator", suite.evaluator)):
+            return run_generation(handle, suite, config, files=self.engine.model_files(checkpoint_id),
+                                  registry=self.engine.registry, batch_size=DEFAULT_BATCH_SIZE).result
+        return evaluate_candidate(handle, suite, config, registry=self.engine.registry, batch_size=FINAL_BATCH_SIZE)
 
     def _seal(self, conn: sqlite3.Connection, row: sqlite3.Row, suite: EvaluationSuite,
               reports: dict[str, EvaluationReport], comparison: ComparisonReport) -> FinalEvaluationReport:

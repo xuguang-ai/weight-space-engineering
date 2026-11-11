@@ -3,13 +3,26 @@
 ``OperationPolicy`` maps public analysis kinds and edit operation aliases to
 exact registered operator versions and bounds single reads, analyses, and
 patches. ``ExperimentPolicy`` adds the immutable experiment mode and budget
-limits; ``small_model_v1`` and ``small_model_weights_only_v1`` are built in.
+limits; ``small_model_v1``, ``small_model_weights_only_v1``, and
+``qwen_loop_v1`` are built in.
 Budget limits are recorded in every experiment's ledger and enforced by
 ``wse.budget``: candidate commits, tensor reads, and analyses are charged when
 they run; evaluation batches, examples, forward calls, and compute seconds
 are reserved before a job is queued and settled by the worker. Every
 synchronous managed operation also charges its elapsed compute seconds.
 ``examples_per_batch`` and ``seconds_per_operation`` bound each job.
+
+Language models (M2 plan Section 5.5) add four ledger counters:
+``generation_passes`` and ``generated_tokens`` (development evaluations of
+generation suites, reserved and settled like M1's jobs), and ``probe_calls``
+and ``teacher_forced_tokens`` (activation probes). Their per-operation limits
+are ``problems_per_generation_pass`` and ``new_tokens_per_output`` for a pass,
+and ``texts_per_probe_call`` and ``tokens_per_probe_text`` for a probe. All
+eight are optional fields: unset, they are absent from a policy's JSON, so the
+M1 policies keep their hashes, and an unset counter is recorded in the ledger
+with limit 0, which permits nothing. A generation pass is metered in passes
+and generated tokens (one decoding step of one output is one token), not in
+M1's evaluation batches, examples, or forward calls.
 
 Response-size rules (Section 4.1 of the plan): a read returns at most 2,048
 elements, and the canonical compact JSON of a read or analysis result must not
@@ -28,14 +41,19 @@ of a tensor whose role the model's family descriptor protects
 (``wse.patches``). Protections are the descriptor's data, not policy fields,
 so the built-in policies and their hashes are unchanged. One protection is a
 policy option, because it depends on the operation rather than the tensor:
-``OperationPolicy.refuse_whole_tensor_scaling`` refuses a ``scale_slice``
-whose selection covers its entire tensor (``require_partial_scaling``), as
-the article's ``save_edit`` did. It is off by default and, while unset,
+``OperationPolicy.refuse_whole_tensor_scaling`` refuses edits that scale a
+whole tensor by one constant, as the article's ``save_edit`` did. A
+``scale_slice`` whose selection covers its entire tensor is refused at once
+(``require_partial_scaling``); managed previews also refuse any patch whose
+net effect is such a scaling of a tensor of the experiment's base
+checkpoint, however its operations or earlier candidates produce it
+(``require_no_whole_tensor_scaling``). It is off by default and, while unset,
 absent from the policy's JSON, so stored policies keep their hashes.
 """
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal
@@ -249,6 +267,74 @@ def require_partial_scaling(policy: OperationPolicy, operator: ExtensionRef, ten
     )
 
 
+def constant_factor_bounds(base: Any, candidate: Any) -> tuple[float, float] | None:
+    """The factors ``c`` with ``candidate == round(c * base)`` in every element, as ``(lower, upper)``, or ``None``.
+
+    ``base`` and ``candidate`` are tensors of one shape; rounding is to
+    ``candidate``'s dtype (BF16, F16, or F32). Each element admits the
+    interval of factors whose product rounds to its stored value (half-way to
+    its neighbors, ties included, and widened by a float32 rounding, as the
+    edit operators multiply in float32 first); the tensor is a constant
+    scaling exactly when the intervals of all its elements intersect, and
+    every factor of the intersection reproduces it. A zero base element
+    admits any factor if its candidate is zero and none otherwise; an all-zero
+    base admits none. Computed in float64, so a factor that no single element
+    pins down (for example 0.7 in BF16) is still found.
+    """
+    import torch
+
+    values = candidate.detach().reshape(-1).cpu()
+    original = base.detach().reshape(-1).cpu().to(torch.float64)
+    if values.numel() == 0 or values.numel() != original.numel():
+        return None
+    exact = values.to(torch.float64)
+    if not bool(torch.isfinite(exact).all()) or not bool(torch.isfinite(original).all()):
+        return None
+    up = torch.nextafter(values, torch.full_like(values, math.inf)).to(torch.float64)
+    down = torch.nextafter(values, torch.full_like(values, -math.inf)).to(torch.float64)
+    slack = exact.abs() * 2.0 ** -24
+    low, high = (exact + down) / 2 - slack, (exact + up) / 2 + slack
+    zero = original == 0
+    if bool((zero & (exact != 0)).any()):
+        return None  # c * 0 is 0 for every finite c
+    if bool(zero.all()):
+        return None
+    scale, low, high = original[~zero], low[~zero], high[~zero]
+    lower = float(torch.where(scale > 0, low / scale, high / scale).max())
+    upper = float(torch.where(scale > 0, high / scale, low / scale).min())
+    return (lower, upper) if lower <= upper else None
+
+
+def require_no_whole_tensor_scaling(policy: OperationPolicy, tensor: str, base: Any, candidate: Any) -> None:
+    """Refuse a patch whose net effect scales ``tensor`` as a whole by one constant other than 1 (``POLICY_DENIED``).
+
+    Managed previews call this, when the policy sets
+    ``refuse_whole_tensor_scaling``, for every tensor a patch changes, with
+    the tensor of the experiment's base checkpoint as ``base``: patches that
+    split a tensor into parts scaled alike, scale its rest in a later
+    candidate, write ``c * W`` with ``set_slice``, or fill it with 0 have the
+    effect of one whole-tensor scaling and are refused like it. A tensor that
+    the factor 1 reproduces (unchanged up to rounding) is no scaling.
+    ``require_partial_scaling`` is the per-operation fast path.
+    """
+    if not policy.refuse_whole_tensor_scaling:
+        return
+    bounds = constant_factor_bounds(base, candidate)
+    if bounds is None or bounds[0] <= 1.0 <= bounds[1]:
+        return
+    shown = float(f"{(bounds[0] + bounds[1]) / 2:.6g}")
+    raise WSEError(
+        ErrorCode.POLICY_DENIED,
+        f"the patch would leave tensor {tensor!r} {list(candidate.shape)} equal to the experiment's base tensor scaled "
+        f"by one factor (about {shown:g}), which this experiment's operation policy refuses "
+        "(refuse_whole_tensor_scaling): it changes only the tensor's overall scale, whether one operation or several, "
+        "in this patch or with earlier candidates, have that effect. Change a proper part of the tensor in a way that "
+        "is not the same scaling of the whole.",
+        details={"tensor": tensor, "shape": list(candidate.shape), "factor": shown,
+                 "policy_option": "refuse_whole_tensor_scaling", "permitted_operations": sorted(policy.edits)},
+    )
+
+
 def json_size(payload: Mapping[str, Any]) -> int:
     """Size in bytes of the canonical compact JSON of ``payload``."""
     return len(canonical_json(payload).encode("utf-8"))
@@ -272,9 +358,11 @@ def contract_usage(spec: OperatorSpec, *, compute_seconds: float | None = None, 
 POLICY_ID_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
 SMALL_MODEL_POLICY_ID = "small_model_v1"
 WEIGHTS_ONLY_POLICY_ID = "small_model_weights_only_v1"
+QWEN_LOOP_POLICY_ID = "qwen_loop_v1"
 
-# Ledger counters, in the order they are reported. ``examples_per_batch`` and
-# ``seconds_per_operation`` are per-operation limits, not cumulative counters.
+# Ledger counters, in the order they are reported. ``examples_per_batch``,
+# ``seconds_per_operation``, and the per-pass and per-probe limits are
+# per-operation limits, not cumulative counters.
 LEDGER_COUNTERS = (
     "candidate_commits",
     "patch_previews",
@@ -284,15 +372,32 @@ LEDGER_COUNTERS = (
     "evaluated_examples",
     "model_forward_calls",
     "compute_seconds",
+    "generation_passes",
+    "generated_tokens",
+    "probe_calls",
+    "teacher_forced_tokens",
 )
+# Each cumulative counter of language models and the per-operation limits that a policy granting it must set.
+GENERATION_LIMITS = ("problems_per_generation_pass", "new_tokens_per_output", "generated_tokens")
+PROBE_LIMITS = ("texts_per_probe_call", "tokens_per_probe_text", "teacher_forced_tokens")
+INFERENCE_LIMITS = ("evaluation_batches", "examples_per_batch", "evaluated_examples", "model_forward_calls",
+                    "generation_passes", *GENERATION_LIMITS, "probe_calls", *PROBE_LIMITS)
 
 
 class BudgetLimits(_Frozen):
-    """Per-experiment allowances (Section 6.2 of the plan).
+    """Per-experiment allowances (Section 6.2 of the plan; M2 plan Section 5.5).
 
     ``patch_previews`` is counted separately because a preview's deltas
     reveal the base values of the edited region: two single-element previews
     determine one weight exactly.
+
+    The language-model fields are optional, and unset (``None``) means not
+    permitted: ``generation_passes`` and ``generated_tokens`` are cumulative
+    counters, and a pass evaluates at most ``problems_per_generation_pass``
+    problems, each output at most ``new_tokens_per_output`` new tokens;
+    ``probe_calls`` and ``teacher_forced_tokens`` likewise, with at most
+    ``texts_per_probe_call`` texts of ``tokens_per_probe_text`` tokens per
+    probe. A budget that grants passes or probes must set their limits.
     """
 
     candidate_commits: int = Field(default=20, ge=0)
@@ -305,17 +410,41 @@ class BudgetLimits(_Frozen):
     model_forward_calls: int = Field(default=10, ge=0)
     seconds_per_operation: float = Field(default=30.0, gt=0, allow_inf_nan=False)
     compute_seconds: float = Field(default=300.0, ge=0, allow_inf_nan=False)
+    generation_passes: int | None = _optional(ge=0, description="development evaluations of generation suites")
+    problems_per_generation_pass: int | None = _optional(ge=0, description="problems one generation pass may "
+                                                         "evaluate")
+    new_tokens_per_output: int | None = _optional(ge=0, description="new tokens one generated output may have "
+                                                  "(the suite's max_new_tokens)")
+    generated_tokens: int | None = _optional(ge=0, description="new tokens generated by all passes")
+    probe_calls: int | None = _optional(ge=0, description="activation probes")
+    texts_per_probe_call: int | None = _optional(ge=0, description="texts one probe may teacher-force")
+    tokens_per_probe_text: int | None = _optional(ge=0, description="tokens one probed text may have")
+    teacher_forced_tokens: int | None = _optional(ge=0, description="tokens teacher-forced by all probes")
+
+    @model_validator(mode="after")
+    def _limits_of_granted_operations(self) -> BudgetLimits:
+        for counter, limits in (("generation_passes", GENERATION_LIMITS), ("probe_calls", PROBE_LIMITS)):
+            missing = [name for name in limits if not getattr(self, counter) in (None, 0) and not getattr(self, name)]
+            if missing:
+                raise ValueError(f"a budget that grants {counter} must also set {', '.join(missing)} above 0")
+        return self
+
+    def limit(self, name: str) -> int | float:
+        """The limit ``name`` sets; an unset (optional) limit is 0, which permits nothing."""
+        value = getattr(self, name)
+        return 0 if value is None else value
 
     def ledger_limits(self) -> dict[str, int | float]:
-        return {counter: getattr(self, counter) for counter in LEDGER_COUNTERS}
+        """The limit of every ledger counter, as recorded in an experiment's ledger (unset counters are 0)."""
+        return {counter: self.limit(counter) for counter in LEDGER_COUNTERS}
 
 
 class ExperimentPolicy(_Frozen):
     """An immutable experiment policy: mode, budget limits, and permitted operations.
 
     ``mode`` cannot be overridden when an experiment is created. A
-    ``weights_only`` policy must grant no evaluation batches, examples, or
-    forward calls.
+    ``weights_only`` policy must grant no evaluation batches, examples,
+    forward calls, generation passes, or probes.
     """
 
     schema_version: Literal["1"] = "1"
@@ -327,11 +456,8 @@ class ExperimentPolicy(_Frozen):
     @model_validator(mode="after")
     def _weights_only_has_no_inference(self) -> ExperimentPolicy:
         if self.mode == "weights_only":
-            granted = {
-                name: getattr(self.budget, name)
-                for name in ("evaluation_batches", "examples_per_batch", "evaluated_examples", "model_forward_calls")
-                if getattr(self.budget, name) != 0
-            }
+            granted = {name: getattr(self.budget, name) for name in INFERENCE_LIMITS
+                       if getattr(self.budget, name) not in (None, 0)}
             if granted:
                 raise ValueError(f"weights_only policies must not grant inference allowances: {granted}")
         return self
@@ -340,9 +466,88 @@ class ExperimentPolicy(_Frozen):
     def policy_hash(self) -> str:
         return json_hash(self.model_dump(mode="json"))
 
+    @property
+    def evaluation_available(self) -> bool:
+        """Whether runs may submit development evaluations: forward-batch suites, generation suites, or both."""
+        return self.mode == "bounded_eval" and (self.budget.evaluation_batches > 0
+                                                or self.budget.limit("generation_passes") > 0)
+
+
+# The policy of the Qwen loop task (M2 plan Section 5.5); Task 13 may lower its limits from Task 7's measurements.
+QWEN_LOOP_GENERATION_PASSES = 10
+QWEN_LOOP_PROBLEMS_PER_PASS = 32
+QWEN_LOOP_NEW_TOKENS = 8192
+QWEN_LOOP_PROBE_CALLS = 25
+QWEN_LOOP_TEXTS_PER_PROBE = 64
+QWEN_LOOP_TOKENS_PER_TEXT = 1024
+# 2**28 elements: Qwen3.5-0.8B's largest tensor, its tied embedding (248,320 x 1,024 = 254,279,680), and
+# Llama-3.2-1B-Instruct's (128,256 x 2,048 = 262,668,288) can be analyzed whole.
+QWEN_LOOP_MAX_ANALYSIS_ELEMENTS = 1 << 28
+
+
+def qwen_loop_policy() -> ExperimentPolicy:
+    """``qwen_loop_v1``: generation passes, probes, and the M2 edits and analyses (M2 plan Section 5.5).
+
+    * 10 generation passes of at most 32 practice problems, each output at
+      most 8,192 new tokens, so at most 10 x 32 x 8,192 generated tokens;
+    * 25 probe calls of at most 64 texts of at most 1,024 tokens, so at most
+      25 x 64 x 1,024 teacher-forced tokens;
+    * 50 analyses, 100 slice reads, 50 previews, and 20 candidate commits;
+    * 6 hours of computation, at most 2 per operation;
+    * no M1 forward-batch evaluation: a language model is evaluated by
+      generation passes, and its forward passes are metered as tokens;
+    * edits ``scale_slice``, ``set_slice``, ``fill_slice``, ``project_out``,
+      and ``add_low_rank``; analyses ``stats``, ``norm``, ``top_k``,
+      ``tensor_norms``, ``svd_top_k``, and ``direction_projection``, of
+      tensors of up to 2**28 elements;
+    * whole-tensor scaling refused. Alias groups and the roles a family
+      descriptor protects (embeddings, output head, final norm) are refused
+      under every policy.
+    """
+    operations = OperationPolicy(
+        analyses={
+            "stats": ExtensionRef.parse("tensor_stats@1"),
+            "norm": ExtensionRef.parse("tensor_norm@1"),
+            "top_k": ExtensionRef.parse("tensor_top_k@1"),
+            "tensor_norms": ExtensionRef.parse("tensor_norms@1"),
+            "svd_top_k": ExtensionRef.parse("svd_top_k@1"),
+            "direction_projection": ExtensionRef.parse("direction_projection@1"),
+        },
+        edits={
+            "scale_slice": ExtensionRef.parse("scale_slice@1"),
+            "set_slice": ExtensionRef.parse("set_slice@1"),
+            "fill_slice": ExtensionRef.parse("fill_slice@1"),
+            "project_out": ExtensionRef.parse("project_out@1"),
+            "add_low_rank": ExtensionRef.parse("add_low_rank@1"),
+        },
+        limits=ResponseLimits(max_analysis_elements=QWEN_LOOP_MAX_ANALYSIS_ELEMENTS),
+        refuse_whole_tensor_scaling=True,
+    )
+    budget = BudgetLimits(
+        candidate_commits=20,
+        patch_previews=50,
+        analysis_calls=50,
+        tensor_read_calls=100,
+        evaluation_batches=0,
+        examples_per_batch=0,
+        evaluated_examples=0,
+        model_forward_calls=0,
+        seconds_per_operation=2 * 3600.0,
+        compute_seconds=6 * 3600.0,
+        generation_passes=QWEN_LOOP_GENERATION_PASSES,
+        problems_per_generation_pass=QWEN_LOOP_PROBLEMS_PER_PASS,
+        new_tokens_per_output=QWEN_LOOP_NEW_TOKENS,
+        generated_tokens=QWEN_LOOP_GENERATION_PASSES * QWEN_LOOP_PROBLEMS_PER_PASS * QWEN_LOOP_NEW_TOKENS,
+        probe_calls=QWEN_LOOP_PROBE_CALLS,
+        texts_per_probe_call=QWEN_LOOP_TEXTS_PER_PROBE,
+        tokens_per_probe_text=QWEN_LOOP_TOKENS_PER_TEXT,
+        teacher_forced_tokens=QWEN_LOOP_PROBE_CALLS * QWEN_LOOP_TEXTS_PER_PROBE * QWEN_LOOP_TOKENS_PER_TEXT,
+    )
+    return ExperimentPolicy(policy_id=QWEN_LOOP_POLICY_ID, mode="bounded_eval", budget=budget, operations=operations)
+
 
 def builtin_experiment_policies() -> dict[str, ExperimentPolicy]:
-    """``small_model_v1`` (bounded_eval) and ``small_model_weights_only_v1`` (weights_only)."""
+    """``small_model_v1`` (bounded_eval), ``small_model_weights_only_v1`` (weights_only), and ``qwen_loop_v1``."""
     bounded = ExperimentPolicy(policy_id=SMALL_MODEL_POLICY_ID, mode="bounded_eval")
     weights_only = ExperimentPolicy(
         policy_id=WEIGHTS_ONLY_POLICY_ID,
@@ -355,4 +560,4 @@ def builtin_experiment_policies() -> dict[str, ExperimentPolicy]:
             model_forward_calls=0,
         ),
     )
-    return {policy.policy_id: policy for policy in (bounded, weights_only)}
+    return {policy.policy_id: policy for policy in (bounded, weights_only, qwen_loop_policy())}

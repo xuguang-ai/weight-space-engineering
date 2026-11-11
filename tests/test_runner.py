@@ -77,8 +77,8 @@ def test_the_scripted_strategy_repairs_the_fixture_within_small_model_v1(engine,
         assert result["usage"][name] is None and reason.startswith("not applicable")
     # Within the small_model_v1 budget.
     limits = builtin_experiment_policies()[SMALL_MODEL_POLICY_ID].budget
-    for counter, entry in experiment.budget.items():
-        assert entry.consumed <= getattr(limits, counter), counter
+    for counter, entry in experiment.budget.items():  # counters the policy leaves unset have limit 0
+        assert entry.consumed <= limits.ledger_limits()[counter], counter
     assert experiment.budget["evaluated_examples"].consumed == 3 * 64  # base and two candidates
     # The trace records every operation; a run-bound executor was the only channel.
     trace = engine.store.db.conn.execute(

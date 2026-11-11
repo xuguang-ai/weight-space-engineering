@@ -19,9 +19,14 @@ Rules implemented here (Sections 4.1, 5.1-5.3, and 6.2 of the plan):
   immutable preview without changing the selected checkpoint. It runs only the
   edit operators that the experiment policy lists, whether an operation names
   an alias or an exact reference (``scale_slice@1``). Vector references among
-  the operators' parameters are read through the run-scoped reader of
-  ``find_analysis_result`` before any weights are read, so another run's
-  result fails exactly like a result that does not exist.
+  the operators' parameters are read through ``experiment_results``, which
+  reads only the experiment's own results, before any weights are read, so
+  another experiment's result fails exactly like a result that does not
+  exist, whether or not the engine is bound to a run; experiment-scoped
+  analyses resolve references the same way. Under a policy that sets
+  ``refuse_whole_tensor_scaling``, a preview whose net effect scales a
+  changed tensor of the experiment's base checkpoint by one constant is
+  refused (``wse.policy.require_no_whole_tensor_scaling``).
 * ``apply_patch`` accepts only a ``patch_id``, replays the stored materialized
   patch (no editing operator runs), and commits the candidate, its ownership,
   the candidate-commit charge, the idempotent result, and audit events in one
@@ -70,7 +75,12 @@ from wse.database import utc_now
 from wse.operators.base import MAX_REPORTED_PROBLEMS
 from wse.patch_blocks import read_patch_file, write_patch_file
 from wse.patches import materialize_patch, replay_patch, resolve_references, summarize_vector_parameters
-from wse.policy import LEDGER_COUNTERS, ExperimentPolicy, builtin_experiment_policies
+from wse.policy import (
+    LEDGER_COUNTERS,
+    ExperimentPolicy,
+    builtin_experiment_policies,
+    require_no_whole_tensor_scaling,
+)
 from wse.schemas import (
     CHECKPOINT_ID_PATTERN,
     IDEMPOTENCY_KEY_PATTERN,
@@ -642,9 +652,35 @@ class ExperimentService:
         return self._metered(
             experiment_id, checkpoint_id, spec.usage.counter, spec.usage.units_per_call,
             lambda policy: self.engine._analyze(checkpoint_id, kind, tensor, selection, k, parameters=parameters,
-                                                policy=policy.operations),
+                                                policy=policy.operations,
+                                                read_result=self.experiment_results(experiment_id)),
             record,
         )
+
+    def experiment_results(self, experiment_id: str) -> Callable[[Any], dict[str, Any]]:
+        """A reader of the stored results that ``experiment_id`` produced: its analyses and generation outputs.
+
+        Experiment-scoped operations (analyses and previews) resolve vector
+        references through it whether or not the engine is bound to a run, so
+        a result of another experiment, which that experiment's run alone may
+        read, never reaches this experiment's results or patches. Any other
+        URI fails exactly like one that does not exist (``NOT_FOUND``).
+        """
+        def read(uri: Any) -> dict[str, Any]:
+            missing = WSEError(ErrorCode.NOT_FOUND, f"analysis result {uri!r} does not exist",
+                               details={"uri": str(uri)})
+            owned = isinstance(uri, str) and self.db.conn.execute(
+                "SELECT 1 FROM analysis_results WHERE uri = ? AND experiment_id = ?", (uri, experiment_id)).fetchone()
+            if not owned:
+                raise missing
+            try:
+                return json.loads(self.store.read_analysis_result(uri))
+            except WSEError as exc:
+                if exc.code == ErrorCode.NOT_FOUND:
+                    raise missing from None
+                raise
+
+        return read
 
     def find_analysis_result(self, uri: Any) -> dict[str, Any]:
         """A stored large analysis result (``AnalysisResult.result_uri``).
@@ -765,9 +801,10 @@ class ExperimentService:
         policy = self.experiment_policy(experiment_id)
         self._owned_checkpoint(self.db.conn, experiment_id, parsed.base_checkpoint_id)
         operations = [{"op": operation.op, **operation.operator_request()} for operation in parsed.operations]
-        # Vector references resolve through the run-scoped reader, as analyses do, before any weights are read.
-        references = resolve_references(operations, self.find_analysis_result, registry=self.engine.registry,
-                                        policy=policy.operations)
+        # Vector references resolve against this experiment's own results, as analyses do, before any weights are
+        # read, whatever engine runs the preview.
+        references = resolve_references(operations, self.experiment_results(experiment_id),
+                                        registry=self.engine.registry, policy=policy.operations)
         base = self.engine._open_checkpoint(parsed.base_checkpoint_id)
         edit = materialize_patch(
             base,
@@ -777,6 +814,8 @@ class ExperimentService:
             references=references,
             managed=True,
         )
+        if policy.operations.refuse_whole_tensor_scaling:
+            self._refuse_net_whole_tensor_scaling(row, parsed.base_checkpoint_id, base, edit, policy)
         frozen = FrozenPatchSpec(
             base_checkpoint_id=parsed.base_checkpoint_id,
             base_weights_hash=base.weights_hash,
@@ -854,6 +893,27 @@ class ExperimentService:
                          experiment_id=experiment_id)
             self._remember(conn, experiment_id, key, "preview_patch", request_hash, preview_json)
         return preview
+
+    def _refuse_net_whole_tensor_scaling(self, row: sqlite3.Row, base_checkpoint_id: str, base: ModelHandle,
+                                         edit: Any, policy: ExperimentPolicy) -> None:
+        """Refuse a preview whose result scales a changed tensor of the experiment's base checkpoint as a whole.
+
+        Each tensor the patch changes is compared with the same tensor of the
+        experiment's base checkpoint, not of the patch's base, so that a later
+        candidate cannot complete a scaling that an earlier one began
+        (``require_no_whole_tensor_scaling``).
+        """
+        origin = row["base_checkpoint_id"]
+        for diff in edit.diff:
+            if not diff.changed_elements:
+                continue
+            candidate = edit.candidate._tensors[diff.tensor]
+            if base_checkpoint_id == origin:
+                original = base._tensors[diff.tensor]
+            else:
+                original = self.store.read_slice(origin, diff.tensor,
+                                                 tuple(slice(0, size) for size in candidate.shape))
+            require_no_whole_tensor_scaling(policy.operations, diff.tensor, original, candidate)
 
     def apply_patch(self, experiment_id: str, patch_id: str, key: str) -> ModelManifest:
         """Create a READY candidate from a validated preview, charging one candidate commit."""

@@ -34,15 +34,29 @@ problems.
   of its tokens (``ProblemResult``).
 
 ``compare_generation`` pairs two evaluations of one suite and configuration.
-Managed generation jobs (metered tokens, the worker's model cache) are not
-part of this module; ``GenerationEvaluator.evaluate``, the M1 metered-forward
-entry point, refuses them. ``transformers`` and ``math_verify`` are imported
-lazily.
+
+* **Generation passes.** In a managed experiment, a development evaluation of
+  a generation suite is a generation pass, a job of M1's job system that the
+  worker meters in generated tokens (``wse.worker``). Its size, known before
+  anything runs, is ``generation_pass_size``; the worker calls
+  ``run_generation`` with ``on_step`` (called at every decoding step, so the
+  pass stops at the next step on cancellation or its time limit) and
+  ``on_batch``. ``GenerationEvaluator.evaluate``, the M1 metered-forward entry
+  point, refuses generation suites.
+* **Tails.** The report of a pass carries each output's ``tail``: the longest
+  end of its decoded text whose canonical JSON takes at most ``TAIL_BYTES``
+  bytes. ``report_with_tails`` shortens every tail evenly when the report
+  would otherwise exceed the inline-result limit, so that a report of 32
+  single-sample problems fits it with full tails unless the answers are long
+  (``tests/test_llm_policy_mcp.py`` checks the sizes).
+
+``transformers`` and ``math_verify`` are imported lazily.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -74,18 +88,21 @@ from wse.schemas import (
     ClusterSummary,
     ErrorCode,
     EvalConfig,
+    EvaluationReport,
     EvaluationSuite,
     ExecutionConfig,
     ExtensionRef,
     GenerationComparison,
     GenerationProfile,
     IntervalEstimate,
+    ModelSource,
     ProblemResult,
     SampleResult,
     TextItem,
     TextSuiteData,
     Usage,
     WSEError,
+    canonical_json,
 )
 
 if TYPE_CHECKING:
@@ -96,8 +113,17 @@ EVALUATOR_ID = "generation"
 EVALUATOR_VERSION = "1"
 PARAMETERS = ("profile", "grader", "samples_per_problem", "max_new_tokens")
 MAX_SAMPLES_PER_PROBLEM = 64
+# The batch size of generation passes and of final generation evaluations (Task 7: throughput on MPS rises up to
+# about 8 rows and little beyond).
 DEFAULT_BATCH_SIZE = 8
 CLUSTER_UNIT = "problem"
+# The largest tail excerpt of one output in a pass's report, in bytes of canonical JSON (escapes included). With
+# it, a report of 32 single-sample problems whose answers are short fits the 31 KiB inline-result limit.
+TAIL_BYTES = 256
+
+# Called at every decoding step of a batch with the batch's row count and the step's number: 0 when the batch
+# starts, then 1, 2, ... before each step's tokens are chosen. It may raise to stop the generation.
+StepHook = Callable[[int, int], None]
 
 
 def _invalid(message: str, **details: Any) -> WSEError:
@@ -204,17 +230,37 @@ def encode_prompts(text_model: TextModel, profile: GenerationProfile, items: Seq
             for index in sorted(set(indices))}
 
 
+class _StepCounter:
+    """A pass-through logits processor that reports every decoding step of one batch to a ``StepHook``.
+
+    The engine calls its processors once per step, before choosing the
+    step's tokens; this one returns the scores unchanged, so the generated
+    tokens are those of a generation without it.
+    """
+
+    def __init__(self, hook: StepHook, rows: int) -> None:
+        self.hook, self.rows, self.steps = hook, rows, 0
+
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        self.steps += 1
+        self.hook(self.rows, self.steps)
+        return scores
+
+
 def generate_samples(text_model: TextModel, profile: GenerationProfile, items: Sequence[TextItem],
                      rows: Sequence[tuple[int, int]], *, eval_seed: int, batch_size: int = DEFAULT_BATCH_SIZE,
                      check: Callable[[], None] | None = None, prompts: Mapping[int, list[int]] | None = None,
-                     on_batch: Callable[[list[SampleOutput], float], None] | None = None) -> list[SampleOutput]:
+                     on_batch: Callable[[list[SampleOutput], float], None] | None = None,
+                     on_step: StepHook | None = None) -> list[SampleOutput]:
     """Generate the ``(problem index, sample index)`` rows in batches of ``batch_size``, in the order given.
 
     Prompts are left-padded and masked; each row draws from its own seed, so
     its tokens do not depend on its batch or position. The presence penalty
     of a batch counts output tokens only (the padded prompt length is shared).
     ``prompts`` supplies already encoded prompts (``encode_prompts``);
-    ``on_batch`` receives each finished batch's outputs and its seconds.
+    ``on_batch`` receives each finished batch's outputs and its seconds, and
+    ``on_step`` every decoding step (``StepHook``), through a pass-through
+    logits processor that runs after the profile's.
     """
     if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
         raise _invalid("batch_size must be a positive integer")
@@ -238,10 +284,14 @@ def generate_samples(text_model: TextModel, profile: GenerationProfile, items: S
             mask[row, width - len(ids):] = 1
         seeds = [sample_seed(profile.seed, eval_seed, items[index].item_id, sample) for index, sample in chunk]
         stops = profile.stop_token_ids if profile.stop_token_ids is not None else text_model.stop_token_ids
+        processors: list[Any] = list(logits_processors(profile, width))
+        if on_step is not None:
+            on_step(len(chunk), 0)
+            processors.append(_StepCounter(on_step, len(chunk)))
         result = text_model.runtime.generate(
             input_ids, mask, max_new_tokens=profile.max_new_tokens, stop_token_ids=stops,
             pad_token_id=text_model.pad_token_id, sampling=sampling, seeds=seeds if sampling is not None else None,
-            logits_processors=logits_processors(profile, width))
+            logits_processors=processors)
         batch_outputs = []
         for (index, sample), seed, tokens, finished in zip(chunk, seeds, result.tokens, result.finished, strict=True):
             body = tokens[:-1] if finished and tokens else tokens  # the text excludes the stop token
@@ -354,10 +404,16 @@ def suite_parameters(suite: EvaluationSuite) -> dict[str, Any]:
 
 
 class GenerationEvaluator:
-    """``generation@1``: the registered evaluator of generation suites."""
+    """``generation@1``: the registered evaluator of generation suites.
+
+    ``generates_text`` marks an evaluator whose suites the worker runs as
+    generation passes, metered in generated tokens, instead of through M1's
+    metered forward callable.
+    """
 
     evaluator_id = EVALUATOR_ID
     version = EVALUATOR_VERSION
+    generates_text = True
 
     def validate_suite(self, suite: EvaluationSuite, registry: Registry) -> None:
         """Registration check: text problems, known parameters, a registered grader, and a resolvable profile.
@@ -374,8 +430,14 @@ class GenerationEvaluator:
 
     def evaluate(self, forward: Any, suite: EvaluationSuite, config: EvalConfig, *, batch_size: int) -> dict[str, Any]:
         raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY,
-                       "generation suites are not evaluated through metered forward jobs yet; the operator evaluates "
-                       "them with Engine.evaluate_generation")
+                       "generation suites are not evaluated through a metered forward callable: in an experiment they "
+                       "run as generation passes (Engine.submit_evaluation), and in direct use through "
+                       "evaluate_generation")
+
+
+def generates_text(evaluator: Any) -> bool:
+    """Whether a registered evaluator's suites run as generation passes (``GenerationEvaluator.generates_text``)."""
+    return getattr(evaluator, "generates_text", False) is True
 
 
 def _grade(grader: Any, output: SampleOutput, reference: str, max_new_tokens: int) -> SampleResult:
@@ -420,6 +482,46 @@ class GenerationPlan:
         return int(self.parameters["samples_per_problem"])
 
 
+def effective_profile(parameters: Mapping[str, Any], source: ModelSource | None, registry: Registry,
+                      profile_overrides: Mapping[str, Any] | None = None) -> GenerationProfile:
+    """The profile a suite's checked parameters name, resolved for a model's source, with the suite's token limit."""
+    overrides = dict(profile_overrides or {})
+    if parameters.get("max_new_tokens") is not None:
+        overrides.setdefault("max_new_tokens", parameters["max_new_tokens"])
+    return with_overrides(resolve_profile(registry, parameters["profile"], source), overrides)
+
+
+@dataclass(frozen=True)
+class GenerationPassSize:
+    """The size of one generation pass, known before anything runs: problems, samples of each, and the token limit."""
+
+    problems: int
+    samples_per_problem: int
+    max_new_tokens: int
+
+    @property
+    def outputs(self) -> int:
+        return self.problems * self.samples_per_problem
+
+    @property
+    def max_generated_tokens(self) -> int:
+        """The most tokens the pass can generate: every output at the limit (problems x samples x max_new_tokens)."""
+        return self.outputs * self.max_new_tokens
+
+
+def generation_pass_size(suite: EvaluationSuite, config: EvalConfig, *, source: ModelSource | None,
+                         registry: Registry) -> GenerationPassSize:
+    """The size of a pass of ``suite`` under ``config`` for a model with ``source``; reads no problem.
+
+    Submission uses it to check a pass against the policy and reserve its
+    tokens without reaching the problems, which stay in evaluator storage.
+    """
+    parameters = suite_parameters(suite)
+    profile = effective_profile(parameters, source, registry)
+    return GenerationPassSize(problems=config.sample_count, samples_per_problem=int(parameters["samples_per_problem"]),
+                              max_new_tokens=profile.max_new_tokens)
+
+
 def plan_generation(model: ModelHandle, suite: EvaluationSuite, config: EvalConfig | Mapping[str, Any], *,
                     registry: Registry | None = None,
                     profile_overrides: Mapping[str, Any] | None = None) -> GenerationPlan:
@@ -437,10 +539,7 @@ def plan_generation(model: ModelHandle, suite: EvaluationSuite, config: EvalConf
     count = eval_config.sample_count
     if not 1 <= count <= suite.data.example_count:
         raise _invalid(f"sample_count must lie between 1 and the {suite.data.example_count} problems of the suite")
-    overrides = dict(profile_overrides or {})
-    if parameters.get("max_new_tokens") is not None:
-        overrides.setdefault("max_new_tokens", parameters["max_new_tokens"])
-    profile = with_overrides(resolve_profile(registry, parameters["profile"], model.source), overrides)
+    profile = effective_profile(parameters, model.source, registry, profile_overrides)
     grader = registry.resolve_ref("grader", parameters["grader"])
     rows = tuple((index, sample) for index in range(count) for sample in range(parameters["samples_per_problem"]))
     return GenerationPlan(suite=suite, eval_config=eval_config, parameters=MappingProxyType(parameters),
@@ -451,12 +550,15 @@ def run_problems(plan: GenerationPlan, text_model: TextModel, indices: Iterable[
                  batch_size: int = DEFAULT_BATCH_SIZE, check: Callable[[], None] | None = None,
                  prompts: Mapping[int, list[int]] | None = None,
                  on_problem: Callable[[ProblemResult, list[SampleOutput]], None] | None = None,
+                 on_batch: Callable[[list[SampleOutput], float], None] | None = None,
+                 on_step: StepHook | None = None,
                  ) -> tuple[dict[int, ProblemResult], list[SampleOutput]]:
     """Generate and grade every sample of the problems at ``indices``, in plan order and batches of ``batch_size``.
 
     ``on_problem`` receives each problem's result and outputs as soon as its
     last sample is graded, so a caller can record finished problems while
-    later batches still run.
+    later batches still run. ``on_batch`` and ``on_step`` are passed to
+    ``generate_samples``; ``on_batch`` runs after the batch is graded.
     """
     wanted = set(indices)
     unknown = sorted(wanted - set(range(len(plan.items))))
@@ -480,9 +582,12 @@ def run_problems(plan: GenerationPlan, text_model: TextModel, indices: Iterable[
                                                 samples=sorted(graded.pop(index), key=lambda s: s.sample))
                 if on_problem is not None:
                     on_problem(problems[index], done)
+        if on_batch is not None:
+            on_batch(outputs, seconds)
 
     outputs = generate_samples(text_model, plan.profile, plan.items, rows, eval_seed=plan.eval_config.seed,
-                               batch_size=batch_size, check=check, prompts=prompts, on_batch=finish_batch)
+                               batch_size=batch_size, check=check, prompts=prompts, on_batch=finish_batch,
+                               on_step=on_step)
     return problems, outputs
 
 
@@ -560,10 +665,15 @@ def run_generation(
     profile_overrides: Mapping[str, Any] | None = None,
     check: Callable[[], None] | None = None,
     on_problem: Callable[[ProblemResult, list[SampleOutput]], None] | None = None,
+    on_batch: Callable[[list[SampleOutput], float], None] | None = None,
+    on_step: StepHook | None = None,
 ) -> GenerationRun:
     """``evaluate_generation``, also returning the plan and every sample's output (token IDs and text).
 
-    ``on_problem`` receives each problem's result and outputs as soon as it is graded (``run_problems``).
+    ``on_problem`` receives each problem's result and outputs as soon as it
+    is graded, ``on_batch`` each graded batch's outputs, and ``on_step`` every
+    decoding step (``run_problems``); the managed worker meters a generation
+    pass through them.
     """
     plan = plan_generation(model, suite, config, registry=registry, profile_overrides=profile_overrides)
     if text_model is None:
@@ -572,7 +682,7 @@ def run_generation(
         text_model = load_text_model(model, files, device=device)
     start = time.perf_counter()
     problems, outputs = run_problems(plan, text_model, range(len(plan.items)), batch_size=batch_size, check=check,
-                                     on_problem=on_problem)
+                                     on_problem=on_problem, on_batch=on_batch, on_step=on_step)
     elapsed = time.perf_counter() - start
     batches = -(-len(plan.rows) // batch_size)
     steps = sum(max(len(o.tokens) for o in outputs[b * batch_size : (b + 1) * batch_size]) for b in range(batches))
@@ -610,6 +720,61 @@ def evaluate_generation(
                           check=check).result
 
 
+# ---------------------------------------------------------------------------
+# Tail excerpts of a pass's outputs
+# ---------------------------------------------------------------------------
+
+
+def json_string_bytes(text: str) -> int:
+    """The bytes ``text`` takes inside canonical JSON: UTF-8, with JSON's escapes, without the quotes."""
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8")) - 2
+
+
+def tail_excerpt(text: str, max_bytes: int) -> str:
+    """The longest end of ``text`` that takes at most ``max_bytes`` bytes inside canonical JSON."""
+    if max_bytes <= 0:
+        return ""
+    if json_string_bytes(text) <= max_bytes:
+        return text
+    used, start = 0, len(text)
+    while start > 0:
+        cost = json_string_bytes(text[start - 1])
+        if used + cost > max_bytes:
+            break
+        used, start = used + cost, start - 1
+    return text[start:]
+
+
+def with_tails(problems: Sequence[ProblemResult], texts: Mapping[tuple[int, int], str],
+               max_bytes: int) -> list[ProblemResult]:
+    """``problems`` with each sample's ``tail``: the end of its text (``texts`` by problem index and sample)."""
+    return [problem.model_copy(update={"samples": [
+        sample.model_copy(update={"tail": tail_excerpt(texts[(problem.index, sample.sample)], max_bytes)})
+        for sample in problem.samples]}) for problem in problems]
+
+
+def report_with_tails(report: EvaluationReport, texts: Mapping[tuple[int, int], str], *, limit: int,
+                      max_bytes: int = TAIL_BYTES) -> EvaluationReport:
+    """``report`` with every sample's tail, each at most ``max_bytes`` bytes, the report within ``limit`` bytes.
+
+    ``texts`` maps ``(problem index, sample)`` to the output's decoded text.
+    When the report with full tails would exceed ``limit`` bytes of canonical
+    JSON, every tail is shortened by the same number of bytes, as far as to
+    empty; a report that exceeds ``limit`` even then (very long answers or many
+    samples) keeps empty tails and is read in pages.
+    """
+    if report.problems is None:
+        raise _invalid("tails belong to the per-problem results of a development report")
+    samples = sum(len(problem.samples) for problem in report.problems)
+    budget = max(0, max_bytes)
+    while True:
+        tailed = report.model_copy(update={"problems": with_tails(report.problems, texts, budget)})
+        size = len(canonical_json(tailed.model_dump(mode="json")).encode("utf-8"))
+        if size <= limit or budget == 0 or samples == 0:
+            return tailed
+        budget = max(0, budget - max(1, -(-(size - limit) // samples)))
+
+
 def compare_generation(base: Any, candidate: Any) -> GenerationComparison:
     """Paired differences of two generation evaluations (results or reports) of one suite and configuration."""
     mismatched = [name for name in ("suite_id", "data_hash", "evaluator_config_hash", "sample_count")
@@ -643,8 +808,10 @@ def compare_generation(base: Any, candidate: Any) -> GenerationComparison:
         candidate={name: float(candidate.metrics[name]) for name in names}, differences=differences)
 
 
-__all__ = ["GenerationEvaluator", "GenerationPlan", "GenerationRun", "SampleOutput", "TextModel",
-           "compare_generation", "encode_prompts", "evaluate_generation", "generate_samples", "generation_metrics",
-           "generation_result", "generation_usage", "library_versions", "load_text_model", "mean_interval",
-           "model_stop_tokens", "paired_mean_difference", "plan_generation", "prompts_hash", "run_generation",
-           "run_problems", "suite_parameters", "token_hash"]
+__all__ = ["DEFAULT_BATCH_SIZE", "GenerationEvaluator", "GenerationPassSize", "GenerationPlan", "GenerationRun",
+           "SampleOutput", "StepHook", "TAIL_BYTES", "TextModel", "compare_generation", "effective_profile",
+           "encode_prompts", "evaluate_generation", "generate_samples", "generates_text", "generation_metrics",
+           "generation_pass_size", "generation_result", "generation_usage", "json_string_bytes", "library_versions",
+           "load_text_model", "mean_interval", "model_stop_tokens", "paired_mean_difference", "plan_generation",
+           "prompts_hash", "report_with_tails", "run_generation", "run_problems", "suite_parameters",
+           "tail_excerpt", "token_hash", "with_tails"]

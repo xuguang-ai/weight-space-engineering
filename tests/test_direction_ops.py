@@ -195,9 +195,11 @@ def test_edit_operator_vector_declarations_are_checked_at_registration(declarati
 
 def test_builtin_policies_do_not_permit_project_out_and_keep_their_hashes(task_model):
     policies = builtin_experiment_policies()
+    # qwen_loop_v1 (M2 Task 11) permits the M2 edits; the M1 policies permit only M1's.
     assert {name: sorted(policy.operations.edits) for name, policy in policies.items()} == {
         "small_model_v1": ["scale_slice", "set_slice"],
         "small_model_weights_only_v1": ["scale_slice", "set_slice"],
+        "qwen_loop_v1": ["add_low_rank", "fill_slice", "project_out", "scale_slice", "set_slice"],
     }
     assert policies["small_model_v1"].policy_hash == (
         "sha256:d8761471bfb88e1d322da1ca06003729886daafa028963f1dcf7ef807cc218b5")
