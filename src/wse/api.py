@@ -90,6 +90,8 @@ if TYPE_CHECKING:
 
 DEFAULT_MAX_MODEL_BYTES = 64 * 1024 * 1024
 DEFAULT_EVAL_BATCH_SIZE = 64
+# The record format of a patch made in direct use and stored by Engine.store_patch.
+DIRECT_PATCH_FORMAT = "wse-direct-v1"
 MAX_CONFIG_BYTES = 1024 * 1024
 BUNDLE_MANIFEST_NAME = "wse_bundle.json"
 
@@ -937,11 +939,8 @@ class Engine:
         the record also names the run and the SHA-256 of every file read. Importing the same
         files onto the same base again returns the existing record.
         """
-        from wse.database import insert_audit_event, utc_now
-        from wse.experiments import _candidate_tensor_infos, _new_id
         from wse.external_patches import FORMATS, materialize_lm_understand, read_lm_understand
-        from wse.patch_blocks import write_patch_file
-        from wse.schemas import ExternalPatchSource, ImportedPatch, Provenance
+        from wse.schemas import ExternalPatchSource, ImportedPatch
 
         self._require_operator("importing a patch")
         if format not in FORMATS:
@@ -961,20 +960,82 @@ class Engine:
             return ImportedPatch.model_validate_json(existing["record_json"])
         base = self._open_checkpoint(base_checkpoint_id)
         result = materialize_lm_understand(base, edit, source)
-        data = write_patch_file(result.patch.model_dump(mode="json"), result.blocks)
+        return self._commit_patch(base_checkpoint_id, base, result.candidate, result.patch, result.blocks,
+                                  source=source, tensors=result.tensors, dedup_key=dedup_key, event="patch.imported")
+
+    def store_patch(self, patch: MaterializedPatch | Mapping[str, Any], blocks: Mapping[str, bytes] | None = None,
+                    *, base_checkpoint_id: str, label: str = "direct") -> ImportedPatch:
+        """Store an exact patch made in direct use and commit its candidate (operator only).
+
+        ``patch`` and ``blocks`` are an ``EditResult``'s (``apply_operator``,
+        ``wse.patches.materialize_patch``). The patch is replayed on the stored
+        base without running any operator, which checks that it was made on
+        that base (``VERSION_CONFLICT`` otherwise) and every step's before and
+        after hashes; nothing is stored unless it replays. The patch file, the
+        candidate checkpoint (whose parent is the base), and the record (format
+        ``wse-direct-v1``, with ``label`` as its run) are committed together,
+        with a ``patch.stored`` audit event. Storing the same patch on the same
+        base again returns the existing record.
+        """
+        from wse.patches import replay_patch, tensor_diffs
+        from wse.schemas import ExternalPatchSource, ImportedPatch, ImportedPatchTensor
+        from wse.tensors import blob_id
+
+        self._require_operator("storing a patch")
+        if not isinstance(label, str) or not 0 < len(label) <= 128:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, "label must be a name of 1-128 characters")
+        try:
+            patch = patch if isinstance(patch, MaterializedPatch) else MaterializedPatch.model_validate(patch)
+        except ValidationError as exc:
+            raise WSEError(ErrorCode.INVALID_PATCH, f"invalid patch: {exc}") from exc
+        blocks = dict(blocks or {})
+        dedup_key = json_hash({"store_patch": {"base_checkpoint_id": base_checkpoint_id, "label": label,
+                                               "patch": patch.model_dump(mode="json"), "blocks": sorted(blocks)}})
+        existing = self.store.db.conn.execute("SELECT record_json FROM imported_patches WHERE dedup_key = ?",
+                                              (dedup_key,)).fetchone()
+        if existing is not None:
+            return ImportedPatch.model_validate_json(existing["record_json"])
+        base = self._open_checkpoint(base_checkpoint_id)
+        candidate = replay_patch(base, patch, blocks=blocks)
+        steps: dict[str, list[Any]] = {}
+        for step in patch.steps:
+            steps.setdefault(step.tensor, []).append(step)
+        tensors = []
+        for diff in tensor_diffs(base, candidate):
+            if not diff.changed_elements:
+                continue
+            kinds = {step.block.kind for step in steps.get(diff.tensor, []) if step.block is not None}
+            tensors.append(ImportedPatchTensor(
+                tensor=diff.tensor, form=",".join(sorted({str(step.operator) for step in steps.get(diff.tensor, [])})),
+                base_sha256=blob_id(base._tensors[diff.tensor]), edited_sha256=blob_id(candidate._tensors[diff.tensor]),
+                changed_elements=diff.changed_elements, block="sparse" if kinds == {"sparse"} else "dense"))
+        source = ExternalPatchSource(format=DIRECT_PATCH_FORMAT, run=label, files={})
+        return self._commit_patch(base_checkpoint_id, base, candidate, patch, blocks, source=source, tensors=tensors,
+                                  dedup_key=dedup_key, event="patch.stored")
+
+    def _commit_patch(self, base_checkpoint_id: str, base: ModelHandle, candidate: ModelHandle,
+                      patch: MaterializedPatch, blocks: Mapping[str, bytes], *, source: Any, tensors: list[Any],
+                      dedup_key: str, event: str) -> ImportedPatch:
+        """Publish ``patch`` as a binary patch file and commit ``candidate`` with its record and audit event."""
+        from wse.database import insert_audit_event, utc_now
+        from wse.experiments import _candidate_tensor_infos, _new_id
+        from wse.patch_blocks import write_patch_file
+        from wse.schemas import ImportedPatch, Provenance
+
+        data = write_patch_file(patch.model_dump(mode="json"), dict(blocks))
         relpath, file_sha, size = self.store.publish_patch(data, binary=True)
         patch_id = _new_id("patch")
         base_manifest = self.store.load_manifest(base_checkpoint_id)
         manifest = ModelManifest.model_validate(base_manifest.model_copy(update={
             "checkpoint_id": self.store.new_checkpoint_id(),
-            "weights_hash": result.candidate.weights_hash,
-            "tensors": _candidate_tensor_infos(base_manifest, base, result.candidate),
+            "weights_hash": candidate.weights_hash,
+            "tensors": _candidate_tensor_infos(base_manifest, base, candidate),
             "provenance": Provenance(kind="patch", source=patch_id, parent_checkpoint_id=base_checkpoint_id),
         }).model_dump(mode="json"))
         record = ImportedPatch(patch_id=patch_id, base_checkpoint_id=base_checkpoint_id,
                                checkpoint_id=manifest.checkpoint_id, result_weights_hash=manifest.weights_hash,
-                               source=source, tensors=result.tensors,
-                               changed_elements=sum(t.changed_elements for t in result.tensors), patch_bytes=size)
+                               source=source, tensors=tensors,
+                               changed_elements=sum(t.changed_elements for t in tensors), patch_bytes=size)
 
         def on_commit(conn: Any, committed: ModelManifest) -> None:
             self.store.require_published(relpath)
@@ -982,14 +1043,14 @@ class Engine:
                 "INSERT INTO imported_patches (patch_id, format, dedup_key, base_checkpoint_id, checkpoint_id, "
                 "result_weights_hash, relpath, file_sha256, size_bytes, record_json, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (patch_id, format, dedup_key, base_checkpoint_id, committed.checkpoint_id, committed.weights_hash,
-                 relpath, file_sha, size, record.canonical_json(), utc_now()))
-            insert_audit_event(conn, "patch.imported", patch_id,
-                               {"format": format, "base_checkpoint_id": base_checkpoint_id,
+                (patch_id, source.format, dedup_key, base_checkpoint_id, committed.checkpoint_id,
+                 committed.weights_hash, relpath, file_sha, size, record.canonical_json(), utc_now()))
+            insert_audit_event(conn, event, patch_id,
+                               {"format": source.format, "base_checkpoint_id": base_checkpoint_id,
                                 "checkpoint_id": committed.checkpoint_id, "source": source.model_dump(mode="json"),
                                 "changed_elements": record.changed_elements})
 
-        self.store.commit_checkpoint(manifest, dict(result.candidate._tensors), dedup_key=None,
+        self.store.commit_checkpoint(manifest, dict(candidate._tensors), dedup_key=None,
                                      event_type="checkpoint.candidate", on_commit=on_commit)
         return record
 

@@ -256,8 +256,8 @@ def test_project_out_is_available_by_name(llama):
 
 
 def test_unknown_operators_name_the_available_ones(llama):
-    error = _expect(ErrorCode.POLICY_DENIED, llama.edit, "layers.0.mlp.down_proj", "rotate", angle=1.0)
-    assert "project_out" in str(error)
+    error = _expect(ErrorCode.NOT_FOUND, llama.edit, "layers.0.mlp.down_proj", "rotate", angle=1.0)
+    assert "rotate" in str(error) and "project_out" in str(error)
 
 
 def _sparse_edit(directory: Path, base_bits: np.ndarray, count: int = 10) -> np.ndarray:
@@ -356,10 +356,12 @@ def test_probe_texts_of_an_evaluation_are_prompt_plus_output(llama, dataset):
     texts = evaluation.probe_texts()
     for text, output in zip(texts, evaluation.outputs):
         prompt = evaluation.prompts[output.index]
-        assert text.tokens == tuple(prompt) + tuple(output.tokens)
+        generated = tuple(output.tokens[:-1]) if output.finished else tuple(output.tokens)  # no stop token
+        assert text.tokens == tuple(prompt) + generated
         assert (text.start, text.stop) == (len(prompt), len(text.tokens))
     tails = evaluation.probe_texts(last=3)
-    assert [t.start for t in tails] == [len(t.tokens) - min(3, len(o.tokens)) for t, o in zip(tails, evaluation.outputs)]
+    assert [t.start for t in tails] == [len(t.tokens) - min(3, len(o.tokens) - o.finished)
+                                        for t, o in zip(tails, evaluation.outputs)]
 
 
 def test_compare_an_in_memory_edit_with_its_base(llama, dataset):
@@ -388,7 +390,7 @@ def test_compare_with_out_dir_records_a_resumable_run(llama, dataset, published,
     scaled = llama.edit("layers.0.mlp.down_proj", "scale_slice", factor=-3.0)
     error = _expect(ErrorCode.INVALID_ARGUMENT, llama.compare, scaled, dataset, problems=4,
                     out_dir=tmp_path / "other", **EVAL)
-    assert "stored" in str(error)
+    assert "save()" in str(error)
 
 
 # -- investigate -------------------------------------------------------------------
@@ -422,9 +424,21 @@ def test_probe_matches_the_core_and_resolves_short_names(llama):
     assert np.array_equal(result.group_mean("residual:1", [1, 2]), core.group_mean("residual:1", [1, 2]))
 
 
-def test_probe_encodes_strings_without_special_tokens(llama):
-    text_model = llama._text_model("cpu")
-    ids = text_model.tokenizer("abc 12", add_special_tokens=False)["input_ids"]
+def test_probe_encodes_strings_as_the_tokenizer_does(llama, monkeypatch):
+    from types import SimpleNamespace
+
+    from wse.highlevel import WSE
+
+    real = llama._text_model("cpu")
+
+    def tokenizer(text, add_special_tokens=True):  # a tokenizer that prepends BOS (1) by default, as Llama's does
+        ids = real.tokenizer(text, add_special_tokens=False)["input_ids"]
+        return {"input_ids": ([1] if add_special_tokens else []) + list(ids)}
+
+    monkeypatch.setattr(WSE, "_text_model", lambda self, device: SimpleNamespace(runtime=real.runtime,
+                                                                               tokenizer=tokenizer))
+    ids = tokenizer("abc 12")["input_ids"]
+    assert ids[0] == 1
     by_text = llama.probe(["abc 12"], sites=["residual:2"], device="cpu")
     by_ids = llama.probe([ids], sites=["residual:2"], device="cpu")
     assert np.array_equal(by_text.means("residual:2"), by_ids.means("residual:2"))
@@ -434,7 +448,174 @@ def test_probe_encodes_strings_without_special_tokens(llama):
 def test_probe_reads_an_evaluation_and_its_groups(llama, dataset):
     evaluation = llama.evaluate(dataset, problems=4, subset_seed=7, **EVAL)
     result = llama.probe(evaluation, sites=["layers.1.mlp.down_proj:output"], device="cpu")
-    assert result.result.token_counts == tuple(len(o.tokens) for o in evaluation.outputs)
+    assert result.result.token_counts == tuple(len(o.tokens) - o.finished for o in evaluation.outputs)
     direct = llama.probe(evaluation.probe_texts(), sites=["layers.1.mlp.down_proj:output"], device="cpu")
     assert np.array_equal(result.means("layers.1.mlp.down_proj:output"),
                           direct.means("layers.1.mlp.down_proj:output"))
+
+
+# -- review fixes ------------------------------------------------------------------
+
+
+def test_an_edit_can_be_saved_reopened_and_compared_on_record(llama, dataset, root, tmp_path):
+    from wse import WSE
+
+    edit = llama.edit("layers.0.mlp.down_proj[:, :8]", "scale_slice", factor=-2.0)
+    saved = edit.save(label="demo")
+    assert saved.patch_id is not None and saved.model.checkpoint_id not in (None, llama.checkpoint_id)
+    assert saved.model.weights_hash == edit.model.weights_hash and saved.verify() is True
+    again = edit.save(label="demo")
+    assert (again.patch_id, again.model.checkpoint_id) == (saved.patch_id, saved.model.checkpoint_id)
+    with WSE.open(saved.model.checkpoint_id, workspace=root / "workspace") as stored:
+        assert stored.weights_hash == edit.model.weights_hash
+    patch, blocks = llama.engine.read_imported_patch(saved.patch_id)
+    assert patch == edit.patch and dict(blocks) == dict(edit.blocks)
+    recorded = llama.compare(saved, dataset, problems=2, subset_seed=7, out_dir=tmp_path / "run", **EVAL)
+    assert recorded.out_dir == tmp_path / "run"
+
+
+def test_a_chained_edit_saves_once_its_base_is_stored(llama):
+    first = llama.edit("layers.0.mlp.down_proj[:, :8]", "scale_slice", factor=0.25)
+    second = first.model.edit("layers.1.mlp.down_proj[:4]", "scale_slice", factor=-1.0)
+    error = _expect(ErrorCode.INVALID_ARGUMENT, second.save)
+    assert "save" in str(error)
+    first.save()
+    stored = second.save()
+    assert stored.model.checkpoint_id is not None and stored.verify() is True
+
+
+def test_store_patch_refuses_a_patch_made_on_another_base(llama):
+    edit = llama.edit("layers.0.mlp.down_proj[:, :8]", "scale_slice", factor=0.75)
+    other = llama.edit("layers.0.mlp.down_proj[:, :8]", "scale_slice", factor=3.0).save()
+    _expect(ErrorCode.VERSION_CONFLICT, llama.engine.store_patch, edit.patch, edit.blocks,
+            base_checkpoint_id=other.model.checkpoint_id)
+
+
+def _sample(index, tokens, finished, prompt_sha="p"):
+    from wse.evaluators.generation import SampleOutput
+
+    return SampleOutput(index=index, sample=0, item_id=f"i{index}", seed=index, tokens=list(tokens),
+                        finished=finished, text="", prompt_sha256=prompt_sha)
+
+
+def _evaluation(outputs, prompts, max_new_tokens=6):
+    from wse.highlevel import Evaluation
+
+    return Evaluation(result=None, outputs=tuple(outputs), prompts=prompts, max_new_tokens=max_new_tokens)
+
+
+def test_probe_texts_leave_the_stop_token_out_and_can_bound_the_context():
+    evaluation = _evaluation([_sample(0, [7, 8, 9, 2], True), _sample(1, [7, 8, 9, 10, 11, 12], False)],
+                             {0: (1, 3, 4), 1: (1, 5)})
+    finished, looping = evaluation.probe_texts()
+    # A finished output's stop token (2) is neither read nor averaged.
+    assert (finished.tokens, finished.start, finished.stop) == ((1, 3, 4, 7, 8, 9), 3, 6)
+    assert (looping.tokens, looping.start, looping.stop) == ((1, 5, 7, 8, 9, 10, 11, 12), 2, 8)
+    assert [(t.start, t.stop) for t in evaluation.probe_texts(last=2)] == [(4, 6), (6, 8)]
+    # context keeps only the last positions before the window's end, which removes earlier context.
+    bounded = evaluation.probe_texts(context=4)
+    assert [(t.tokens, t.start, t.stop) for t in bounded] == [((4, 7, 8, 9), 1, 4), ((9, 10, 11, 12), 0, 4)]
+    for bad in ({"last": 0}, {"context": 0}, {"context": True}):
+        _expect(ErrorCode.INVALID_ARGUMENT, evaluation.probe_texts, **bad)
+
+
+def test_a_missing_local_path_is_not_looked_up_on_the_hub(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    from wse import WSE
+
+    calls = []
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda *args, **kwargs: calls.append(args))
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda *args, **kwargs: calls.append(args))
+    for source in (Path("missing-org/missing-model"), tmp_path / "nowhere", "./missing/model", "~/missing/model"):
+        error = _expect(ErrorCode.NOT_FOUND, WSE.from_pretrained, source, workspace=tmp_path / "ws")
+        assert "no such directory" in str(error) or "not a snapshot directory" in str(error), str(error)
+    assert calls == []
+
+
+def test_a_single_name_hub_cache_snapshot_is_recognized(hf_snapshots, tmp_path):
+    import shutil
+
+    from wse import WSE
+
+    sha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
+    snapshot = tmp_path / "hub" / "models--tinyllama" / "snapshots" / sha
+    shutil.copytree(hf_snapshots["llama_untied"], snapshot)
+    with WSE.from_pretrained(snapshot, workspace=tmp_path / "ws") as model:
+        assert (model.source.repository, model.source.revision) == ("tinyllama", sha)
+
+
+def test_compare_resolves_one_profile_before_generating(hf_snapshots, root, dataset, monkeypatch):
+    import wse.evaluators.generation as generation
+    from wse import WSE
+
+    calls = []
+    original = generation.run_generation
+    monkeypatch.setattr(generation, "run_generation", lambda *a, **k: calls.append(1) or original(*a, **k))
+    with WSE.from_pretrained(hf_snapshots["llama_untied"], repo="example-org/Other-Model", revision=REVISION,
+                             workspace=root / "workspace") as other:
+        options = {key: value for key, value in EVAL.items() if key != "profile"}
+        # Each import carries its own default profile; the base's does not exist for the other model.
+        _expect(ErrorCode.NOT_FOUND, other.compare, other.edit("layers.0.mlp.down_proj", "scale_slice",
+                                                                factor=0.5).model, dataset, problems=2,
+                **{**options, "profile": "llama_3_2_1b_instruct_default@1"})
+    assert calls == []
+
+
+def test_an_in_memory_comparison_keeps_both_evaluations_and_logs(llama, dataset):
+    lines = []
+    edit = llama.edit("layers.0.mlp.down_proj", "scale_slice", factor=-3.0)
+    comparison = llama.compare(edit, dataset, problems=2, subset_seed=7, log=lines.append, **EVAL)
+    base, candidate = comparison.evaluations
+    assert len(base.outputs) == len(candidate.outputs) == 2
+    assert len(lines) == 4 and lines[0].startswith("base ") and lines[-1].startswith("candidate ")
+
+
+def test_edit_accepts_numpy_parameters_and_role_targets(llama):
+    direction = np.random.default_rng(1).normal(size=16)
+    edit = llama.edit("layers.0.mlp.down_proj", "project_out", direction=direction, columns=np.array([2, 4]),
+                      alpha=np.float64(1.0))
+    assert edit.patch.steps[0].parameters["columns"] == [2, 4] and edit.verify() is True
+    role = llama.role("mlp.down", 0)
+    whole = llama.edit(role, "scale_slice", factor=0.5)
+    assert [(s.start, s.stop) for s in whole.patch.steps[0].selection] == [(0, 16), (0, 32)]
+    head = llama.role("attn.o", 1)
+    one_head = llama.edit((head, head.selection(head=1)), "scale_slice", factor=0.0)
+    assert [(s.start, s.stop) for s in one_head.patch.steps[0].selection] == [
+        tuple(entry.values())[:2] for entry in head.selection(head=1)]
+
+
+def test_name_and_target_edge_cases(llama):
+    assert llama.name("  layers.0.mlp.down_proj  ") == DOWN0
+    assert llama.target("layers.0.mlp.down_proj[0,]")[1][0] == {"start": 0, "stop": 1, "step": 1}
+    assert llama.target("layers.0.mlp.down_proj[..., :8]")[1] == [{"start": 0, "stop": 16, "step": 1},
+                                                                   {"start": 0, "stop": 8, "step": 1}]
+    _expect(ErrorCode.INVALID_ARGUMENT, llama.target, "layers.0.mlp.down_proj[\u0663]")
+    _expect(ErrorCode.INVALID_ARGUMENT, llama.target, "layers.0.mlp.down_proj[..., ..., 1]")
+
+
+def test_evaluate_defaults_the_grader_by_format(llama, root):
+    path = root / "gsm.jsonl"
+    path.write_text(json.dumps({"question": "1+1?", "answer": "1+1=2\n#### 2"}) + "\n", encoding="utf-8")
+    evaluation = llama.evaluate(path, format="gsm8k", profile="qwen35think@1", max_new_tokens=6, device="cpu")
+    assert evaluation.result.execution.parameters["grader"] == "gsm8k_numeric@1"
+
+
+def test_closing_frees_the_runtimes_and_refuses_store_use(hf_snapshots, tmp_path):
+    from wse import WSE
+
+    model = WSE.from_pretrained(hf_snapshots["llama_untied"], repo=REPO, revision=REVISION, workspace=tmp_path / "ws")
+    edit = model.edit("layers.0.mlp.down_proj[:, :8]", "scale_slice", factor=0.5)
+    model.generate("1+1?", max_new_tokens=2, device="cpu")
+    assert model.handle._runtimes
+    model.close()
+    assert not model.handle._runtimes
+    for call in (lambda: model.engine, lambda: edit.model.engine, edit.save):
+        _expect(ErrorCode.INVALID_ARGUMENT, call)
+    assert edit.verify() is True  # in-memory work needs no workspace
+
+
+def test_the_new_result_classes_are_exported():
+    import wse
+
+    assert {"Evaluation", "Probe", "Comparison", "Edit", "WSE"} <= set(wse.__all__)

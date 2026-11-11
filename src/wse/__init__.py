@@ -17,7 +17,7 @@ from wse.api import (
     load_model,
     read_bundle,
 )
-from wse.highlevel import WSE, Comparison, Edit
+from wse.highlevel import WSE, Comparison, Edit, Evaluation, Probe
 from wse.patches import materialize_patch, replay_patch
 from wse.policy import (
     BudgetLimits,
@@ -63,6 +63,7 @@ __all__ = [
     "Edit",
     "EditResult",
     "Engine",
+    "Evaluation",
     "ErrorCode",
     "EvalConfig",
     "EvaluationReport",
@@ -81,6 +82,7 @@ __all__ = [
     "OperatorSpec",
     "PatchPreview",
     "PatchSpec",
+    "Probe",
     "Registry",
     "RunGrant",
     "SuiteData",

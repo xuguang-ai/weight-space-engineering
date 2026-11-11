@@ -559,15 +559,20 @@ def run_generation(
     device: str | None = None,
     profile_overrides: Mapping[str, Any] | None = None,
     check: Callable[[], None] | None = None,
+    on_problem: Callable[[ProblemResult, list[SampleOutput]], None] | None = None,
 ) -> GenerationRun:
-    """``evaluate_generation``, also returning the plan and every sample's output (token IDs and text)."""
+    """``evaluate_generation``, also returning the plan and every sample's output (token IDs and text).
+
+    ``on_problem`` receives each problem's result and outputs as soon as it is graded (``run_problems``).
+    """
     plan = plan_generation(model, suite, config, registry=registry, profile_overrides=profile_overrides)
     if text_model is None:
         if files is None:
             raise _invalid("generation needs the model's stored tokenizer files (Engine.model_files)")
         text_model = load_text_model(model, files, device=device)
     start = time.perf_counter()
-    problems, outputs = run_problems(plan, text_model, range(len(plan.items)), batch_size=batch_size, check=check)
+    problems, outputs = run_problems(plan, text_model, range(len(plan.items)), batch_size=batch_size, check=check,
+                                     on_problem=on_problem)
     elapsed = time.perf_counter() - start
     batches = -(-len(plan.rows) // batch_size)
     steps = sum(max(len(o.tokens) for o in outputs[b * batch_size : (b + 1) * batch_size]) for b in range(batches))
