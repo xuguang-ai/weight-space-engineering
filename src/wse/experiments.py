@@ -1187,9 +1187,9 @@ class ExperimentService:
         raise WSEError(
             ErrorCode.INVALID_PATCH,
             f"the preview of these {len(spec.operations)} operations could exceed the inline-result limit of the "
-            f"experiment's policy ({max(bounds)} of {allowed} response bytes for its result at most); propose fewer "
-            "operations per patch, or shorten hypothesis and expected_behavior (quotes, backslashes, and control "
-            "characters take the most room)",
+            f"experiment's policy (its result could take {max(bounds)} response bytes, and the limit allows "
+            f"{allowed}); propose fewer operations per patch, or shorten hypothesis and expected_behavior (quotes, "
+            "backslashes, and control characters take the most room)",
             details={"limit_bytes": allowed, "preview_bound_bytes": bounds[0], "candidate_bound_bytes": bounds[1],
                      "operations": len(spec.operations)})
 
