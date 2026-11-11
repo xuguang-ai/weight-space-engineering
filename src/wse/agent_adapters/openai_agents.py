@@ -44,7 +44,10 @@ it fails with an actionable ``UNSUPPORTED_CAPABILITY`` error.
 ``Model`` interface whose tool calls are chosen by a registered stepwise
 ``Strategy`` from the tool outputs it receives. It makes no network call and
 lets the real SDK runner drive a real ``wse serve`` deterministically, for
-tests and offline demonstrations.
+tests and offline demonstrations. A function call has no field for the
+strategy's rationale, so the test double keeps each call's rationale by call
+ID (``rationales``), and the recorder attaches it to the call's event, as the
+runner does for a strategy it dispatches.
 """
 
 from __future__ import annotations
@@ -55,6 +58,7 @@ import logging
 import os
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
@@ -164,8 +168,9 @@ class _Session:
 class _Recorder:
     """Normalizes SDK hook callbacks into ``AgentEvent`` records and running usage totals."""
 
-    def __init__(self, sink: EventSink) -> None:
+    def __init__(self, sink: EventSink, rationales: Mapping[str, str] | None = None) -> None:
         self.sink = sink
+        self.rationales = rationales  # call ID -> rationale, from a model that states one (the strategy test double)
         self.started = time.monotonic()
         self.seq = 0
         self.turns = 0
@@ -222,8 +227,10 @@ class _Recorder:
             arguments = json.loads(raw) if isinstance(raw, str) and raw else raw
         except ValueError:
             arguments = raw
-        self.emit("tool_call", tool=getattr(tool, "name", None), call_id=getattr(context, "tool_call_id", None),
-                  arguments=arguments)
+        call_id = getattr(context, "tool_call_id", None)
+        rationale = (self.rationales or {}).get(call_id) if isinstance(call_id, str) else None
+        self.emit("tool_call", tool=getattr(tool, "name", None), call_id=call_id, arguments=arguments,
+                  details={"rationale": rationale} if rationale else {})
 
     def tool_result(self, context: Any, tool: Any, result: Any) -> None:
         text, ok, code, parsed = parse_tool_output(result)
@@ -373,7 +380,7 @@ class OpenAIAgentsAdapter(AgentAdapter):
         from agents.exceptions import MaxTurnsExceeded
         from openai import AsyncOpenAI
 
-        recorder = _Recorder(event_sink)
+        recorder = _Recorder(event_sink, rationales=getattr(self.model, "rationales", None))
 
         class Hooks(RunHooks):
             async def on_llm_start(self, context, agent, system_prompt, input_items):  # noqa: ANN001
@@ -467,8 +474,10 @@ def strategy_model(strategy: Any, *, experiment_id: str) -> Any:
     Its first call reads the experiment (``wse_get_experiment``); every later
     call turns the latest tool output into an ``Observation`` and asks the
     strategy for the next action. A ``stop`` action becomes the final
-    message. Token usage is synthetic (about four characters per token) and
-    the provider is reported as ``wse-test-double``.
+    message. Each call's rationale is kept by call ID (``rationales``) for the
+    adapter's events, and ``strategy`` is the strategy itself. Token usage is
+    synthetic (about four characters per token) and the provider is reported
+    as ``wse-test-double``.
     """
     _require_sdk()
     from agents.items import ModelResponse
@@ -493,12 +502,14 @@ def strategy_model(strategy: Any, *, experiment_id: str) -> Any:
         provider_name = TEST_DOUBLE_PROVIDER
 
         def __init__(self) -> None:
+            self.strategy = strategy
             self.observations: list[Observation] = []
             self.budget: dict[str, BudgetEntry] = {}
             self.objective: Any = None
             self.pending: tuple[str, Action] | None = None
             self.calls = 0
             self.requests: list[dict[str, Any]] = []
+            self.rationales: dict[str, str] = {}
 
         def _observe(self, call_id: str, action: Action, output: Any) -> None:
             text, ok, _, parsed = parse_tool_output(output)
@@ -523,7 +534,7 @@ def strategy_model(strategy: Any, *, experiment_id: str) -> Any:
                                   "tools": [{"name": t.name, "description": getattr(t, "description", None),
                                              "parameters": getattr(t, "params_json_schema", None)} for t in tools]})
             if self.pending is None:
-                action = Action.call("wse_get_experiment", experiment_id=experiment_id)
+                action = Action.call("wse_get_experiment", "Read the task and budget.", experiment_id=experiment_id)
             else:
                 call_id, previous = self.pending
                 self._observe(call_id, previous, last_output(input, call_id))
@@ -544,6 +555,8 @@ def strategy_model(strategy: Any, *, experiment_id: str) -> Any:
                 call_id = f"call_{self.calls}"
                 arguments = json.dumps(action.arguments, sort_keys=True)
                 self.pending = (call_id, action)
+                if action.rationale:
+                    self.rationales[call_id] = action.rationale
                 output = [ResponseFunctionToolCall(id=f"fc_{self.calls}", call_id=call_id, name=action.tool,
                                                    arguments=arguments, type="function_call", status="completed")]
                 produced = len(arguments)

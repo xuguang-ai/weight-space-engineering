@@ -219,6 +219,16 @@ def test_the_sdk_loop_repairs_through_wse_serve_and_the_runner_settles_and_freez
     results = [event for event in events if event["kind"] == "tool_result"]
     assert results and all(event["ok"] and event["output_hash"].startswith("sha256:") for event in results)
     assert [e["tool"] for e in events if e["kind"] == "tool_call"] == [e["tool"] for e in results]
+    # Each call the strategy explained carries its rationale, as through the runner's dispatch, and the record
+    # names the strategy that chose the calls, with its resolved configuration.
+    calls = [event for event in events if event["kind"] == "tool_call"]
+    assert [event["details"].get("rationale") for event in calls] == [model.rationales.get(event["call_id"])
+                                                                       for event in calls]
+    assert calls[0]["details"]["rationale"] == "Read the task and budget."
+    assert all(event["details"]["rationale"].startswith("Scaling output unit") for event in calls
+               if event["tool"] == "wse_preview_patch")
+    assert record["config"]["test_double"] == {"strategy": "scripted_search@1",
+                                               "resolved_config": ScriptedSearchStrategy().config()}
     # The model saw exactly the allow-listed WSE tools and instructions generated from task.json and the policy.
     policy = engine.get_policy(SMALL_MODEL_POLICY_ID)
     task = engine.get_task(prepared["task_id"])

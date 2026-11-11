@@ -941,6 +941,11 @@ class ReferenceRunner:
         serve_log = self.serve_log(run_id)
         recorded = {**config.model_dump(mode="json"), "allowed_tools": connection.allowed_tools,
                     "serve_env_names": sorted(connection.serve_env), "cwd": connection.cwd}
+        strategy = getattr(getattr(adapter, "model", None), "strategy", None)
+        if strategy is not None:  # a strategy test double: record the strategy that chooses the calls
+            resolve = getattr(strategy, "config", None)
+            recorded["test_double"] = {"strategy": f"{strategy.strategy_id}@{strategy.version}",
+                                       "resolved_config": resolve() if callable(resolve) else None}
         tracing = {"sdk_tracing_disabled": config.tracing_disabled, "benchmark": config.benchmark,
                    "trace_include_sensitive_data": not config.tracing_disabled and not config.benchmark,
                    "server_env_OPENAI_AGENTS_DISABLE_TRACING": "1"}
