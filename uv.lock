@@ -2379,6 +2379,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "safetensors" },
     { name = "torch" },
+    { name = "typing-extensions" },
 ]
 
 [package.optional-dependencies]
@@ -2405,6 +2406,7 @@ requires-dist = [
     { name = "safetensors", specifier = ">=0.8" },
     { name = "torch", specifier = ">=2.9" },
     { name = "transformers", marker = "extra == 'models-hf'", specifier = ">=5.22.2" },
+    { name = "typing-extensions", specifier = ">=4.6" },
 ]
 provides-extras = ["agents-openai", "models-hf"]
 
