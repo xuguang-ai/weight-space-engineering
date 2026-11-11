@@ -92,7 +92,8 @@ controller (cancelling the SDK run) when:
 - (`bounded_eval`) a full development evaluation of the **selected**
   checkpoint meets the task's target;
 - (`bounded_eval`) 3 consecutive evaluated candidates show no improvement
-  over the best development accuracy before them;
+  over the best checkpoint before them: a higher development accuracy or,
+  on a generation suite, a lower limit-hit rate at no lower accuracy;
 - 3 consecutive operations are denied by the policy;
 - (`weights_only`) the single permitted candidate is committed and selected;
   this mode has no development-score threshold.

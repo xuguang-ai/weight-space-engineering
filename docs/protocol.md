@@ -128,7 +128,7 @@ the text by default). Every result has the same envelope:
   "uris": ["wse://patches/patch_example"],
   "usage": {
     "call": {"compute_seconds": 0.0021, "artifact_bytes": 1532, "...": "..."},
-    "cumulative": {"candidate_commits": {"limit": 20, "consumed": 0, "reserved": 0, "remaining": 20}, "...": "..."}
+    "cumulative": {"patch_previews": {"limit": 50, "consumed": 1, "reserved": 0, "remaining": 49}, "...": "..."}
   },
   "result": {"patch_id": "patch_example", "...": "..."}
 }
