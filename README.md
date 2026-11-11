@@ -18,6 +18,8 @@ Install WSE with the extra for open-weight language models. It needs Python 3.11
 pip install "wse[models-hf]"
 ```
 
+### Reproduce a published weight edit
+
 Download the edit and the problems; `from_pretrained` downloads the model:
 
 ```bash
@@ -62,11 +64,32 @@ The patch table, with WSE's own hashes, which also cover each tensor's name, dty
 
 `apply_patch` refuses the edit unless every tensor matches the SHA-256 published with it in the article's logs. On an M4 Pro the download and import take about a minute. The two-problem comparison takes about 80 seconds and only checks that generation works: at 1,024 new tokens, the limit cuts off both models on both problems. The effect shows at the profile's full limit of 32,768 tokens, in the results below.
 
+### Run an agent experiment through MCP
+
+From a clone of this repository, one command runs a whole managed experiment on the small model of WSE's first milestone, a 22-parameter MLP with a planted fault. It grants a run, starts `wse serve` as the MCP server, runs the OpenAI Agents SDK agent against it, freezes the experiment, runs the hidden final evaluation, and exports and replays the result:
+
+```bash
+git clone https://github.com/xuguang-ai/weight-space-engineering && cd weight-space-engineering
+uv sync --extra agents-openai
+uv run --no-sync python examples/signed_sum/agent_api.py ~/wse-data/agent --model wse-test-double:scripted_search@1
+```
+
+`wse-test-double:scripted_search@1` stands in for the language model with a scripted strategy, so this runs offline, without an API key, in about 15 seconds; everything else is the real harness. It printed (IDs differ per run; the export path is shortened):
+
+```text
+experiment exp_16bf675040e94703766b41bc8ff30f9f (run run_3652b71bbea0711c4e73c5a69be29d63): CLOSED
+controller openai_agents@1 ended stopped: target_met: a full development evaluation of the selected checkpoint meets the target
+success: True; final: {"candidate_accuracy": 1.0, "clopper_pearson_lower": 0.9928210499737405, "clopper_pearson_upper": 1.0, "clusters": 512, "control_accuracy": 0.5, "difference": 0.5, "fully_correct_clusters": 512}
+export: ~/wse-data/agent/workspace/agent_runs/run_3652b71bbea0711c4e73c5a69be29d63/export; replay byte-identical: True
+```
+
+For a live agent, pass `--model MODEL_NAME`, a model that the OpenAI Agents SDK can reach with the credentials in your environment (for example `OPENAI_API_KEY`). In WSE's first milestone, `gpt-5.6-luna` repaired this fault in 5 of 5 trials. This task shows the harness at work, not what agents can do on language models: on Qwen3.5-0.8B, only scripted controllers have run so far.
+
 ## Results
 
 > **MATH-500 accuracy: 12% → 52%.** The published p50c edit against the unedited Qwen3.5-0.8B, on 25 problems with a paired evaluation. WSE reproduces and evaluates this intervention; it does not discover it.
 
-Passing `problems=25` and `out_dir=...` (which records every problem and resumes an interrupted run), and leaving out `max_new_tokens`, runs the Quick Start's comparison on 25 MATH-500 problems, one sample each, at the full 32,768-token limit. The recorded run used `wse compare-generation`, which calls the same runner with the same defaults, and took about six hours on an M4 Pro:
+Passing `problems=25` and `out_dir=...` (which records every problem and resumes an interrupted run), and leaving out `max_new_tokens`, runs the comparison of the first Quick Start example on 25 MATH-500 problems, one sample each, at the full 32,768-token limit. The recorded run used `wse compare-generation`, which calls the same runner with the same defaults, and took about six hours on an M4 Pro:
 
 | 25 MATH-500 problems | Base | p50c | Paired difference [95% interval] |
 | --- | --- | --- | --- |
@@ -107,7 +130,7 @@ curl -L --create-dirs -o ~/wse-data/gsm8k/train.jsonl \
   https://raw.githubusercontent.com/openai/grade-school-math/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/data/train.jsonl
 ```
 
-The four steps, on the model and the edit of the Quick Start:
+The four steps, on the model and the edit of the first Quick Start example:
 
 ```python
 GSM8K = M / "gsm8k/train.jsonl"
@@ -153,25 +176,34 @@ Answers cut off at the limit fell from 30 to 21 of 32, and accuracy rose from 2 
 
 ## Agent Harness & MCP
 
-### Use WSE with an AI agent
+### Connect an agent
 
-An operator grants a run, a permission for one experiment under one policy, and serves it over MCP. The agent connects to that server and works only through its tools:
+An operator grants a run, a permission for one experiment under one policy, and serves it over MCP; the agent connects to that server and works only through its tools. On the workspace that the Quick Start's agent experiment created:
 
 ```bash
-wse --workspace W grant-run TASK POLICY BASE_CHECKPOINT   # prints the run grant and its run ID
-wse --workspace W serve --run-id RUN                     # an MCP server over stdio, bound to that run
+A=~/wse-data/agent
+BASE=$(uv run --no-sync python -c "import json, sys; print(json.load(open(sys.argv[1]))['task_checkpoint_id'])" "$A/ids.json")
+RUN=$(uv run --no-sync wse --workspace "$A/workspace" grant-run signed_sum_v1 small_model_v1 "$BASE" \
+      | uv run --no-sync python -c "import json, sys; print(json.load(sys.stdin)['run_id'])")
+uv run --no-sync wse --workspace "$A/workspace" serve --run-id "$RUN"   # an MCP server over stdio, bound to that run
 ```
 
-From Python, `run_agent_experiment` does it in one call: it grants the run, runs the controller, and freezes the experiment when the controller stops. With `model=...`, the controller is the OpenAI Agents SDK reference agent, connected to the run's MCP server:
+From Python, `run_agent_experiment` does it in one call: it grants a run, runs the controller, and freezes the experiment when the controller stops. With `model=...`, the controller is the OpenAI Agents SDK agent, connected to the run's MCP server:
 
 ```python
+import json
+from pathlib import Path
+
 from wse.agent_runs import run_agent_experiment
 
-run = run_agent_experiment("W", task="TASK", base="BASE_CHECKPOINT", policy="POLICY", model="MODEL_NAME")
-print(run.state, run.summary["status"])
+A = Path("~/wse-data/agent").expanduser()   # written by the Quick Start's agent experiment
+ids = json.loads((A / "ids.json").read_text())
+run = run_agent_experiment(A / "workspace", task=ids["task_id"], base=ids["task_checkpoint_id"],
+                           policy=ids["policy_id"], model="wse-test-double:scripted_search@1")
+print(run.state, run.summary["status"])   # FROZEN stopped: the final evaluation is off by default
 ```
 
-[examples/signed_sum/agent_api.py](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/signed_sum/agent_api.py) is a complete example on the small model of WSE's first milestone. It runs offline with a scripted controller in a few seconds, or with a live agent and the model provider's credentials ([docs/experiments.md](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/experiments.md#one-experiment-in-one-call)).
+[examples/signed_sum/agent_api.py](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/signed_sum/agent_api.py) is the complete script, and [docs/experiments.md](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/experiments.md#one-experiment-in-one-call) explains the final evaluation, exports, and series of trials.
 
 ### What the agent gets
 
