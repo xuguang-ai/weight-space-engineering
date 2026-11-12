@@ -16,9 +16,9 @@ The experiment on Qwen3-0.6B by default, at a short token limit so that it runs 
 
 Status: written against the Experiment API before its first live run with an agent.
 
-Needs the Codex CLI (``codex`` on PATH, or its path in ``WSE_CODEX_PATH``) and your model provider's key and
-endpoint in ``.env``, copied from ``.env.example`` (git ignores ``.env``). With your model's name, or your Azure
-deployment's name, in place of ``YOUR_AGENT_MODEL``:
+Needs the Codex CLI (its path in ``WSE_CODEX_PATH``, else ``codex`` on PATH, else OpenAI's VS Code extension's)
+and your model provider's key and endpoint in ``.env``, copied from ``.env.example`` (git ignores ``.env``). With
+your model's name, or your Azure deployment's name, in place of ``YOUR_AGENT_MODEL``:
 
     cp .env.example .env
     uv run --extra models-hf --env-file .env \\

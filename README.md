@@ -288,7 +288,7 @@ The same calls run the full-size case on Qwen3.5-0.8B, which reconstructs a publ
 
 `Experiment` hands one model to an agent under a fixed evaluation. The agent is the [Codex CLI](https://github.com/openai/codex). WSE starts it in the experiment's working directory and connects it to the run's WSE tools over MCP; the agent can also write and run Python there, under Codex's sandbox, which WSE configures so that the agent can read the model's weights but not the test data, WSE's database, or your keys. WSE records each candidate the agent submits as an exact patch and evaluates the ones the agent asks it to; when the agent stops, WSE selects among the evaluated candidates by the rule and freezes the choice before any test. Because the agent's own code can compute anything from the weights it reads, WSE meters only its own calls and labels these runs `unverified`.
 
-**1. Install the Codex CLI.** WSE runs the `codex` on your `PATH`, or the executable that `WSE_CODEX_PATH` names; check that `codex --version` runs.
+**1. Install the Codex CLI.** WSE runs the binary that `WSE_CODEX_PATH` names, else the `codex` on your `PATH`, else the newest one bundled with OpenAI's VS Code extension; on macOS it first checks that the binary's code signature names OpenAI. Check that `codex --version` runs; WSE has been tested with codex-cli 0.167.0-alpha.4.1.
 
 **2. Add your key.** Copy the template, [.env.example](https://github.com/xuguang-ai/weight-space-engineering/blob/main/.env.example), and fill in your key and endpoint; git ignores `.env`:
 
