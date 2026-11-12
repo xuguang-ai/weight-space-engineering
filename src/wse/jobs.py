@@ -38,8 +38,13 @@ Rules implemented here (Sections 3, 4.1, 4.3, 6.2, and 7.2 of the plan):
   ``teacher_forced_tokens`` (the most its forwards can read), and its
   compute seconds; the worker settles the forward lengths it read. Retries
   and conflicts follow the same idempotency rules as evaluations.
-* ``get_job`` can hold the call for up to 10 seconds until the job is
-  terminal, so polling does not consume agent turns.
+* ``get_job`` can hold the call for up to 10 seconds (the policy's
+  ``max_job_wait_seconds`` when set) until the job is terminal, so polling
+  does not consume agent turns. A whole development evaluation of a
+  checkpoint (``wse.checkpoint_evaluation``) is queued through
+  ``evaluation_request`` and ``queue_evaluation``, the checks and the
+  reservation of ``submit_evaluation``, and waited for up to
+  ``evaluation_wait_cap``.
 * ``cancel_job`` releases a queued job's whole reservation. For a running job
   it only records the request: cancelling a request does not stop work by
   itself, so the worker stops the job and settles the work already executed.
@@ -64,7 +69,7 @@ import secrets
 import sqlite3
 import time
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from pydantic import ValidationError
 
@@ -113,6 +118,22 @@ def wait_cap(policy: Any) -> float:
     """How long one ``get_job`` call may wait under ``policy``: its ``max_job_wait_seconds``, or 10 seconds."""
     cap = getattr(policy, "max_job_wait_seconds", None)
     return MAX_WAIT_SECONDS if cap is None else float(cap)
+
+
+# How long a job that reached its time limit may take to stop and settle: the worker's grace period and the
+# settling transaction, with room to spare.
+EVALUATION_SETTLE_SECONDS = 15.0
+
+
+def evaluation_wait_cap(policy: Any) -> float:
+    """How long one blocking evaluation (``wse_evaluate``) waits for its job under ``policy``.
+
+    A job runs at most the policy's ``seconds_per_operation``; the wait adds
+    ``EVALUATION_SETTLE_SECONDS``, so that a job started at once is terminal
+    when the wait ends. A job that waited in the queue first may still be
+    running then; a later request for the checkpoint waits for it again.
+    """
+    return float(policy.budget.seconds_per_operation) + EVALUATION_SETTLE_SECONDS
 
 
 def _wait_seconds(value: Any, cap: float = MAX_WAIT_SECONDS) -> float:
@@ -289,6 +310,17 @@ def _probe_groups(groups: Any, count: int) -> dict[str, list[int]] | None:
         raise WSEError(ErrorCode.INVALID_ARGUMENT, "the groups need at least three texts together, so that the pooled "
                        "standard deviation of a contrast has a degree of freedom")
     return {"a": list(parsed.a), "b": list(parsed.b)}
+
+
+class EvaluationRequest(NamedTuple):
+    """A checked development evaluation (``JobService.evaluation_request``): what its job will reserve and run."""
+
+    checkpoint_id: str
+    suite: EvaluationSuite
+    config: EvalConfig
+    planned: dict[str, int]
+    batches: int
+    seconds_per_operation: float
 
 
 class JobService:
@@ -490,6 +522,27 @@ class JobService:
 
     def _submit(self, experiment_id: str, checkpoint_id: Any, suite_id: Any, raw_config: Any, key: str,
                 request_hash: str) -> Job:
+        request = self.evaluation_request(experiment_id, checkpoint_id, suite_id, raw_config)
+        job_id = _new_id("job")
+        with self.db.transaction() as conn:
+            again = self.experiments._lookup(conn, experiment_id, key, "submit_evaluation", request_hash)
+            if again is not None:
+                job_id = json.loads(again)["job_id"]
+            else:
+                self.queue_evaluation(conn, experiment_id, job_id, request)
+                self.experiments._remember(conn, experiment_id, key, "submit_evaluation", request_hash,
+                                           canonical_json({"job_id": job_id}))
+        return self._job(experiment_id, job_id)
+
+    def evaluation_request(self, experiment_id: str, checkpoint_id: Any, suite_id: Any,
+                           raw_config: Any) -> EvaluationRequest:
+        """Check a development evaluation before anything is reserved (module docstring); return what it plans.
+
+        Settles lost jobs first. The checks: an OPEN ``bounded_eval``
+        experiment, a checkpoint it owns, a development suite of its task, a
+        preregistered configuration, and, for a generation suite, the
+        policy's per-pass limits. ``queue_evaluation`` reserves and queues it.
+        """
         self.recover_lost_jobs()
         row = self.experiments._experiment_row(experiment_id)
         self.experiments._require_open(row)
@@ -528,35 +581,31 @@ class JobService:
             batches = -(-config.sample_count // per_batch)
             planned = {"evaluation_batches": batches, "evaluated_examples": config.sample_count,
                        "model_forward_calls": batches}
-        job_id = _new_id("job")
-        with self.db.transaction() as conn:
-            again = self.experiments._lookup(conn, experiment_id, key, "submit_evaluation", request_hash)
-            if again is not None:
-                job_id = json.loads(again)["job_id"]
-            else:
-                # The same transactional state check that freezing uses.
-                self.experiments._require_open(self.experiments._experiment_row(experiment_id, conn))
-                compute = min(policy.budget.seconds_per_operation,
-                              self.ledger.remaining(conn, experiment_id, "compute_seconds"))
-                if compute <= 0:
-                    raise budget_error(conn, experiment_id, "compute_seconds", policy.budget.seconds_per_operation)
-                reservation = self.ledger.reserve(experiment_id, job_id, {**planned, "compute_seconds": compute},
-                                                  conn=conn)
-                now = utc_now()
-                conn.execute(
-                    "INSERT INTO jobs (job_id, experiment_id, kind, checkpoint_id, suite_id, config_json, state, "
-                    "reservation_id, progress_json, created_at) VALUES (?, ?, 'evaluation', ?, ?, ?, 'queued', ?, ?, ?)",
-                    (job_id, experiment_id, checkpoint_id, suite.suite_id, config.canonical_json(),
-                     reservation.reservation_id, JobProgress(batches_total=batches).canonical_json(), now),
-                )
-                record_event(conn, "job.submitted", job_id,
-                             {"checkpoint_id": checkpoint_id, "suite_id": suite.suite_id,
-                              "suite_hash": suite.suite_hash, "config": config.model_dump(mode="json"),
-                              "reservation_id": reservation.reservation_id, "requested": reservation.requested},
-                             experiment_id=experiment_id)
-                self.experiments._remember(conn, experiment_id, key, "submit_evaluation", request_hash,
-                                           canonical_json({"job_id": job_id}))
-        return self._job(experiment_id, job_id)
+        return EvaluationRequest(checkpoint_id=checkpoint_id, suite=suite, config=config, planned=planned,
+                                 batches=batches, seconds_per_operation=policy.budget.seconds_per_operation)
+
+    def queue_evaluation(self, conn: sqlite3.Connection, experiment_id: str, job_id: str,
+                         request: EvaluationRequest) -> None:
+        """Reserve a checked evaluation's allowance and queue it as ``job_id``, in the caller's transaction."""
+        # The same transactional state check that freezing uses.
+        self.experiments._require_open(self.experiments._experiment_row(experiment_id, conn))
+        compute = min(request.seconds_per_operation, self.ledger.remaining(conn, experiment_id, "compute_seconds"))
+        if compute <= 0:
+            raise budget_error(conn, experiment_id, "compute_seconds", request.seconds_per_operation)
+        reservation = self.ledger.reserve(experiment_id, job_id, {**request.planned, "compute_seconds": compute},
+                                          conn=conn)
+        suite, config = request.suite, request.config
+        conn.execute(
+            "INSERT INTO jobs (job_id, experiment_id, kind, checkpoint_id, suite_id, config_json, state, "
+            "reservation_id, progress_json, created_at) VALUES (?, ?, 'evaluation', ?, ?, ?, 'queued', ?, ?, ?)",
+            (job_id, experiment_id, request.checkpoint_id, suite.suite_id, config.canonical_json(),
+             reservation.reservation_id, JobProgress(batches_total=request.batches).canonical_json(), utc_now()),
+        )
+        record_event(conn, "job.submitted", job_id,
+                     {"checkpoint_id": request.checkpoint_id, "suite_id": suite.suite_id,
+                      "suite_hash": suite.suite_hash, "config": config.model_dump(mode="json"),
+                      "reservation_id": reservation.reservation_id, "requested": reservation.requested},
+                     experiment_id=experiment_id)
 
     def generates_text(self, suite: EvaluationSuite) -> bool:
         """Whether ``suite`` runs as a generation pass: its evaluator generates text (``generation@1``)."""
@@ -820,9 +869,22 @@ class JobService:
                            "the output_uri of a sample of a generation pass's report", details={"text": index})
         output = GenerationOutput.model_validate(document)
         if output.experiment_id != experiment_id:
-            raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"text {index}: generation output {uri} names another "
-                           "experiment", details={"text": index})
+            suite_id = self._reusing_suite(experiment_id, output)
+            if suite_id is None:
+                raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"text {index}: generation output {uri} names another "
+                               "experiment", details={"text": index})
+            # The output of a reused pass is read as one of this run's suite, which holds the same problems.
+            output = output.model_copy(update={"suite_id": suite_id})
         return output
+
+    def _reusing_suite(self, experiment_id: str, output: GenerationOutput) -> str | None:
+        """The suite of the report of ``experiment_id`` that reused ``output``'s pass (``ensure_baseline``), if any."""
+        row = self.db.conn.execute(
+            "SELECT linked.suite_id FROM reports linked JOIN reports source "
+            "ON source.report_id = json_extract(linked.report_json, '$.reused_from.report_id') "
+            "WHERE linked.experiment_id = ? AND source.experiment_id = ? AND source.job_id = ?",
+            (experiment_id, output.experiment_id, output.job_id)).fetchone()
+        return None if row is None else row["suite_id"]
 
     # -- reading ----------------------------------------------------------------
 
@@ -1010,5 +1072,5 @@ class JobService:
         return lost
 
 
-__all__ = ["JobService", "MAX_WAIT_SECONDS", "lost_job_error", "lost_job_usage", "process_exists",
-           "queued_cancel_usage"]
+__all__ = ["EVALUATION_SETTLE_SECONDS", "EvaluationRequest", "JobService", "MAX_WAIT_SECONDS", "evaluation_wait_cap",
+           "lost_job_error", "lost_job_usage", "process_exists", "queued_cancel_usage"]

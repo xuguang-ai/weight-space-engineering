@@ -1797,6 +1797,19 @@ class ProblemResult(_Frozen):
     samples: list[SampleResult] = Field(min_length=1)
 
 
+class ReportSource(_Frozen):
+    """The report that a reused report repeats: another experiment's evaluation of the same model and problems.
+
+    ``Engine.ensure_baseline`` links such a report into an experiment as its
+    baseline instead of evaluating the base checkpoint again
+    (``wse.checkpoint_evaluation``); it names the report a job produced,
+    never another link.
+    """
+
+    experiment_id: str
+    report_id: str = Field(pattern=REPORT_ID_PATTERN.pattern)
+
+
 class EvaluationReport(_Frozen):
     """A persisted, managed evaluation bound to exact model, data, and configuration identities.
 
@@ -1810,6 +1823,13 @@ class EvaluationReport(_Frozen):
     Generation reports (M2) add ``problems`` (per-problem samples: grades,
     lengths, limit hits; development reports only) and ``runtime`` (the
     engine's device, stored dtypes, model class, and library versions).
+
+    ``reused_from`` is set only on a report that repeats another experiment's
+    report of the same model on a suite of the same content, at the same
+    configuration (a baseline linked by ``Engine.ensure_baseline``): it names
+    this experiment's suite and task, has no job, and its ``usage`` is what
+    its experiment was charged, without compute seconds. Unset, the field is
+    omitted, so other reports keep their content and hashes.
     """
 
     schema_version: Literal["1"] = SCHEMA_VERSION
@@ -1843,6 +1863,7 @@ class EvaluationReport(_Frozen):
     created_at: str
     problems: list[ProblemResult] | None = _optional()
     runtime: dict[str, Any] | None = _optional()
+    reused_from: ReportSource | None = _optional()
 
     @property
     def report_uri(self) -> str:
@@ -1972,6 +1993,74 @@ class FinalEvaluationReport(_Frozen):
     comparison: ComparisonReport
     attempts: int
     created_at: str
+    management: Management = "managed"
+
+
+class ReportSummary(_Frozen):
+    """A report without its per-example results: identity, metrics with their intervals, and errors."""
+
+    report_id: str
+    report_uri: str
+    checkpoint_id: str
+    suite_id: str
+    sample_count: int
+    seed: int
+    metrics: dict[str, float]
+    intervals: dict[str, IntervalEstimate]
+    target_met: bool | None = None
+    errors: list[str]
+    truncation_count: int = 0
+    reused_from: ReportSource | None = _optional()
+
+    @classmethod
+    def of(cls, report: EvaluationReport) -> ReportSummary:
+        return cls(report_id=report.report_id, report_uri=report.report_uri, checkpoint_id=report.checkpoint_id,
+                   suite_id=report.suite_id, sample_count=report.sample_count, seed=report.seed,
+                   metrics=dict(report.metrics), intervals=dict(report.intervals), target_met=report.target_met,
+                   errors=list(report.errors), truncation_count=report.truncation_count,
+                   reused_from=report.reused_from)
+
+
+# What a request of a checkpoint's whole development evaluation did (``CheckpointEvaluation.origin``).
+EvaluationOrigin = Literal["new_job", "existing_job", "existing_report", "reused_report"]
+
+
+class CheckpointEvaluation(_Frozen):
+    """One checkpoint's whole development evaluation, waited for by WSE (``Engine.evaluate_checkpoint``).
+
+    The MCP tool ``wse_evaluate`` returns it. ``suite_id`` and ``config`` are
+    fixed by the task: its development suite, all of it, at the suite's first
+    seed (``wse.checkpoint_evaluation``). ``origin`` says what the request
+    did: ``new_job`` queued a job, charged as
+    one development evaluation; ``existing_job`` waited for a job that an
+    earlier request of the checkpoint queued, and ``existing_report`` returned
+    the checkpoint's earlier report, neither charged again; ``reused_report``
+    (``Engine.ensure_baseline``) linked another experiment's identical report
+    of the base checkpoint, charged as one evaluation without compute
+    seconds. ``state`` is the job's state, ``succeeded`` for a report without
+    a job in this experiment; ``queued`` or ``running`` means the wait ended
+    first and the job continues. ``report`` summarizes a succeeded
+    evaluation; ``comparison`` pairs it with the base checkpoint's report
+    ``base_report_id`` on the same suite and configuration, and
+    ``comparison_unavailable`` says why there is none. ``usage`` is the job's
+    settled usage (a reused report's charge); ``error`` is a failed or
+    cancelled job's error.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    experiment_id: str
+    checkpoint_id: str
+    suite_id: str
+    config: EvalConfig
+    origin: EvaluationOrigin
+    state: JobState
+    job_id: str | None = None
+    report: ReportSummary | None = None
+    base_report_id: str | None = None
+    comparison: GenerationComparison | ComparisonReport | None = None
+    comparison_unavailable: str | None = None
+    usage: Usage | None = None
+    error: DomainError | None = None
     management: Management = "managed"
 
 

@@ -173,7 +173,7 @@ next_action(objective, observations, remaining_budget) -> Action
 
 `Action.call(tool, rationale, **arguments)` names one of the WSE tools
 (`wse_get_experiment`, `wse_inspect_model`, `wse_read_tensor`,
-`wse_analyze`, `wse_preview_patch`, `wse_apply_patch`,
+`wse_analyze`, `wse_preview_patch`, `wse_apply_patch`, `wse_evaluate`,
 `wse_submit_evaluation`, `wse_get_job`, `wse_cancel_job`, `wse_compare`,
 `wse_select_checkpoint`, `wse_list_models`) with the MCP tool's arguments;
 `Action.stop(reason)` ends the run. Each `Observation` carries the same
@@ -246,8 +246,8 @@ Agent SDKs are optional extras imported lazily inside the adapter module.
 
 ## Direct Python use
 
-For open-weight language models, the high-level entry point `wse.WSE`
-wraps the core and the operator `Engine` (see the README's Python example).
+For open-weight language models, the high-level entry point `wse.Model`
+wraps the core and the operator `Engine` ([models.md](models.md#the-model-api)).
 It accepts short names (`layers.15.mlp.down_proj` for
 `model.language_model.layers.15.mlp.down_proj.weight`), NumPy-style indices
 (`[:, :64]`), and roles that name tensors across families

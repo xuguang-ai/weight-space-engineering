@@ -72,6 +72,7 @@ def test_replace_weights_makes_an_exact_edit_and_save_fills_it_in(llama, root) -
     edit = llama.replace_weights({"layers.0.mlp.down_proj": new})
     assert llama.weights_hash == before and edit.model.checkpoint_id is None and edit.patch_id is None
     assert torch.equal(edit.model.tensor(DOWN0), new) and edit.verify()
+    assert edit.table().startswith("1 tensor changed, ")
     [step] = edit.patch.steps
     assert (str(step.operator), step.tensor) == ("replace_tensor@1", DOWN0)
     assert step.parameters["source"]["dtype"] == "bfloat16" and step.parameters["source"]["shape"] == [16, 32]

@@ -12,7 +12,8 @@ How WSE's parts fit together, for readers who want to extend WSE or contribute t
 | Sandbox | Under a policy that grants it, a fresh, network-less process per call for agent-written Python that reads only the run's inputs; arrays it saves become stored vectors that edits may name. WSE meters its calls, not what they compute, so such runs are unverified. | `Engine.run_python`, `wse_run_python` |
 | MCP server | A thin front end to the Engine for one run grant: each tool validates its arguments against the published schema and calls one Engine operation. | `wse serve --run-id RUN` |
 | Runner | Grants a run, runs one controller (a registered strategy, or an agent connected to `wse serve`), settles every outstanding job, and freezes the selected checkpoint. | `wse run`, `wse.agent_runs.run_agent_experiment` |
-| `WSE` | The high-level Python entry point for open-weight language models, over the core and the Engine. | `wse.WSE` |
+| `Model` | The high-level Python entry point for open-weight language models, over the core and the Engine: one model version to inspect, analyze, edit, evaluate, and export ([models.md](models.md#the-model-api)). | `wse.Model`, `wse.compare_models` |
+| `Experiment` | An agent experiment on one model: a goal, a fixed development evaluation, a selection rule, a freeze, and a test after it ([experiment-api.md](experiment-api.md)). | `wse.Experiment` |
 | CLI | Imports, run grants, serving, runs, final evaluation, export, replay, and reports, for operators. | `wse` |
 
 No MCP handler contains an editing, analysis, budget, or evaluation algorithm. The Python API, the CLI, and MCP therefore share the same operations, policy decisions, and usage accounting.
@@ -64,9 +65,11 @@ No developer outside the project has added a method or a task yet, so the cost o
 | Module | Role |
 | --- | --- |
 | `api.py` | Direct library functions and the managed `Engine` |
-| `highlevel.py` | `WSE`, one object per model for the four steps of an experiment |
+| `highlevel.py` | `Model`, one model version for the steps of an experiment, and `compare_models` |
+| `experiment.py` | `Experiment`: an agent experiment with its selection rule, freeze, and test |
 | `experiments.py`, `budget.py`, `policy.py` | The experiment state machine, atomic budget reservations, and policies |
 | `jobs.py`, `worker.py` | The job queue and the worker that runs jobs |
+| `checkpoint_evaluation.py` | A checkpoint's whole development evaluation, waited for in one call (`wse_evaluate`), and baselines reused across experiments |
 | `mcp_server.py` | The MCP tools, resources, and protocol mapping |
 | `runner.py`, `agent_runs.py` | The reference runner and the one-call experiment |
 | `registry.py` | Explicit, versioned extension registration |
@@ -76,6 +79,7 @@ No developer outside the project has added a method or a task yet, so the cost o
 | `analysis.py`, `probes.py` | Bounded tensor reads and analyses, and activation probes |
 | `sandbox.py`, `sandbox_runs.py` | The sandbox process and its profile, and code execution in a run: inputs, metering, records, and stored arrays |
 | `hf_snapshot.py` | Allow-listed reading of Hugging Face snapshots |
+| `model_proxy.py` | A per-run proxy on 127.0.0.1 that adds the operator's API key to an agent's model calls, so the agent's process holds only a run token |
 | `adapters/`, `engines/` | Model adapters and family descriptors, and the PyTorch inference engine for imported causal LMs |
 | `operators/`, `evaluators/`, `strategies/` | Built-in edit operators and analyses, evaluators and graders, and stepwise controllers |
 | `agent_adapters/` | The vendor-neutral agent adapter contract and the OpenAI Agents SDK adapter |

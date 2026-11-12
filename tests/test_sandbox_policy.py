@@ -148,4 +148,4 @@ def test_only_a_sandbox_policy_grants_wse_run_python() -> None:
         allowed_tools(policies["qwen_loop_v1"])
     for policy_id in ("qwen_loop_v1", SMALL_MODEL_POLICY_ID, "small_model_weights_only_v1"):
         assert not set(sandbox_tools) & set(allowed_tools(policies[policy_id]))
-    assert len(allowed_tools(policies[SMALL_MODEL_POLICY_ID])) == 13
+    assert len(allowed_tools(policies[SMALL_MODEL_POLICY_ID])) == 14  # the 13 earlier tools and wse_evaluate

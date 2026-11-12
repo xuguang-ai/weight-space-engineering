@@ -81,11 +81,17 @@ def test_the_published_schema_states_the_policy_cap(workspace, runs) -> None:
 
 
 def test_the_agent_session_timeout_exceeds_the_longest_call() -> None:
+    from wse.jobs import evaluation_wait_cap
+
     policies = builtin_experiment_policies()
-    assert agent_session_timeout(policies[SMALL_MODEL_POLICY_ID], 30.0) == 30.0
+    # wse_evaluate waits for its job up to the policy's seconds_per_operation and a settling margin.
+    small = policies[SMALL_MODEL_POLICY_ID]
+    assert agent_session_timeout(small, 30.0) > evaluation_wait_cap(small) > small.budget.seconds_per_operation == 30
     sandboxed = agent_session_timeout(policies[QWEN_LOOP_SANDBOX_POLICY_ID], 30.0)
-    assert sandboxed > 600 and sandboxed > 300 + 60
-    assert agent_session_timeout(policies[QWEN_LOOP_SANDBOX_POLICY_ID], 5000.0) == 5000.0
+    assert sandboxed > 600 and sandboxed > 300 + 60 and sandboxed > 2 * 3600
+    assert agent_session_timeout(policies[QWEN_LOOP_SANDBOX_POLICY_ID], 9000.0) == 9000.0
+    # Without development evaluations (weights_only), the longest call is still a wse_get_job wait.
+    assert agent_session_timeout(policies["small_model_weights_only_v1"], 30.0) == 30.0
 
 
 def test_instructions_describe_the_sandbox_and_the_wait_cap() -> None:

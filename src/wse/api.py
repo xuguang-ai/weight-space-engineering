@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -68,6 +68,7 @@ if TYPE_CHECKING:
     from wse.evaluators.datasets import DatasetStore
     from wse.schemas import (
         AnalysisResult,
+        CheckpointEvaluation,
         ComparisonReport,
         DatasetManifest,
         EvaluationReport,
@@ -662,8 +663,8 @@ class Engine:
     that experiment: listings omit every other checkpoint, and any other
     checkpoint ID fails with the same ``NOT_FOUND`` error as an ID that does
     not exist. Operator actions (imports, policy, task, dataset, and suite
-    registration, run grants, direct reservations and settlements, freezing,
-    and final evaluation) fail with ``POLICY_DENIED``. Its evaluator storage
+    registration, run grants, direct reservations and settlements, baseline
+    evaluations, freezing, and final evaluation) fail with ``POLICY_DENIED``. Its evaluator storage
     is sealed, so no agent-facing operation can read evaluation examples, and
     final reports stay withheld until the experiment is closed. Opening an
     engine with ``recover=True`` also settles jobs lost in a crash
@@ -1581,6 +1582,46 @@ class Engine:
     def recover_jobs(self) -> list[str]:
         """Settle jobs whose worker lease expired; return their IDs."""
         return self.jobs.recover_lost_jobs()
+
+    def evaluate_checkpoint(self, experiment_id: str, checkpoint_id: str, key: str, *,
+                            wait_seconds: float | None = None,
+                            stop: Callable[[], bool] | None = None) -> CheckpointEvaluation:
+        """Evaluate a checkpoint on the task's whole development suite and wait for the result (``wse_evaluate``).
+
+        The suite and configuration are fixed: the task's development suite,
+        all of it, at its first seed. The evaluation is a job, charged as one
+        development evaluation. The call waits until the job is terminal, at
+        most the policy's ``seconds_per_operation`` and a settling margin
+        (``wait_seconds`` shortens the wait, 0 does not wait, and ``stop()``
+        ends it early), and returns the report summary with the paired
+        comparison with the base checkpoint's report. A checkpoint is
+        evaluated once: a request for one with a report returns that report,
+        and a request for one whose evaluation is queued or running waits for
+        that job, neither charged again. A wait that ends first leaves the job
+        running, and a later request returns its result
+        (``wse.checkpoint_evaluation``).
+        """
+        from wse.checkpoint_evaluation import evaluate_checkpoint
+
+        return evaluate_checkpoint(self, experiment_id, checkpoint_id, key, wait_seconds=wait_seconds, stop=stop)
+
+    def ensure_baseline(self, experiment_id: str, *, device: str | None = None, wait_seconds: float | None = None,
+                        stop: Callable[[], bool] | None = None) -> CheckpointEvaluation:
+        """Give the experiment a succeeded whole development report of its base checkpoint (operator only).
+
+        The runner calls it before a controller starts. A report of another
+        experiment in the workspace of the same model on the same suite and
+        configuration is linked instead of evaluating again, charged as one
+        evaluation without compute seconds; otherwise the base is evaluated,
+        which needs a running worker (``wse.checkpoint_evaluation``). Returns
+        once the report exists; a failed or cancelled evaluation, or a report
+        with errors, raises ``WORKER_FAILED``. ``device`` is the engine device
+        of the run's worker for generation suites (default: the worker's
+        default); repeating the call charges nothing.
+        """
+        from wse.checkpoint_evaluation import ensure_baseline
+
+        return ensure_baseline(self, experiment_id, device=device, wait_seconds=wait_seconds, stop=stop)
 
     # -- tasks, datasets, reports, freezing, and final evaluation ------------------------
 
