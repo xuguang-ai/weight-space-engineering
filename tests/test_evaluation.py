@@ -420,7 +420,9 @@ def test_the_final_report_pairs_the_frozen_candidate_with_the_base_control(engin
     assert engine.final_evaluate(eid) == final == engine.get_final_report(eid)
     _expect(ErrorCode.POLICY_DENIED, engine.final_evaluate, eid, ids["task_checkpoint_id"])
     _expect(ErrorCode.POLICY_DENIED, engine.final_evaluate, eid, ids["reference_checkpoint_id"])
-    assert list(inspect.signature(engine.final_evaluate).parameters) == ["experiment_id", "checkpoint_id"]
+    parameters = inspect.signature(engine.final_evaluate).parameters  # nothing chooses what is evaluated
+    assert list(parameters) == ["experiment_id", "checkpoint_id", "device"]
+    assert parameters["device"].kind is inspect.Parameter.KEYWORD_ONLY  # where it runs, not what it runs
     assert engine.final_evaluate(eid, candidate.checkpoint_id) == final
     assert [r.split for r in engine.list_reports(eid)] == ["final", "final"]
 
