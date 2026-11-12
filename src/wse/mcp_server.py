@@ -16,7 +16,12 @@ decisions, and usage accounting.
   actions (imports, grants, freezing, final evaluation) are not exposed.
 * **Tools.** The 13 tools of Section 4.1 and, for language models (M2 plan
   Section 5.6), ``wse_probe`` (activation probes) and ``wse_get_report``
-  (whole reports). Names use only letters, digits, and ``_`` (at most 64
+  (whole reports). ``wse_evaluate`` evaluates a checkpoint on the task's
+  whole development suite and waits for the result in the server
+  (``wse.checkpoint_evaluation``), so an agent makes one call per
+  evaluation instead of polling; a wait whose request is cancelled (the
+  client's timeout) or whose server stops ends at once and leaves the job to
+  the worker. Names use only letters, digits, and ``_`` (at most 64
   characters), because OpenAI Agents SDK forwards MCP tool names verbatim as
   model function names. Every mutation takes an ``idempotency_key``. Every
   tool that names the experiment lets the agent omit ``experiment_id``: a
@@ -62,6 +67,7 @@ import time
 from collections.abc import Callable
 from typing import Annotated, Any, Generic, TypeVar
 
+import anyio.from_thread
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ResourceError, ResourceNotFoundError, ToolError
 from mcp_types import CallToolResult, TextContent, ToolAnnotations
@@ -69,9 +75,10 @@ from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema
 
 from wse.api import MODEL_PAGE_SIZE, Engine, model_list_page
 from wse.api import manifest_uri as _manifest_uri
+from wse.checkpoint_evaluation import poll_job
 from wse.jobs import MAX_WAIT_SECONDS
 from wse.jobs import _wait_seconds as wait_seconds_value
-from wse.jobs import wait_cap
+from wse.jobs import evaluation_wait_cap, wait_cap
 from wse.probes import DEFAULT_SUMMARY_TOP, MAX_PROBE_SITES, MAX_SITE_CHARACTERS, MAX_SUMMARY_TOP
 from wse.store import ANALYSIS_URI_PREFIX
 from wse.schemas import (
@@ -82,6 +89,7 @@ from wse.schemas import (
     AnalysisResult,
     AxisSlice,
     BudgetEntry,
+    CheckpointEvaluation,
     ComparisonReport,
     ErrorCode,
     EvalConfig,
@@ -286,6 +294,38 @@ def _patch_uri(patch_id: str) -> str:
     return f"wse://patches/{patch_id}"
 
 
+# How a wse_evaluate summary states what the request did (CheckpointEvaluation.origin).
+EVALUATION_ORIGINS = {
+    "new_job": "a new evaluation, charged as one development evaluation",
+    "existing_job": "the evaluation an earlier request of this checkpoint started, not charged again",
+    "existing_report": "the checkpoint's earlier report, not charged again",
+    "reused_report": "another experiment's identical evaluation, charged as one evaluation without compute time",
+}
+
+
+def _difference_text(comparison: GenerationComparison | ComparisonReport) -> str:
+    """Each paired difference of a comparison (candidate minus base) with its 95% interval."""
+    items = comparison.differences.items() if isinstance(comparison, GenerationComparison) else \
+        [("accuracy", comparison.difference_interval)]
+    return ", ".join(f"{name} {interval.estimate:+.4g} [{interval.lower:+.4g}, {interval.upper:+.4g}]"
+                     for name, interval in items)
+
+
+def _request_cancelled() -> bool:
+    """End a wait whose MCP request was cancelled: raise the cancellation, as AnyIO delivers it, or return False.
+
+    The client's timeout cancels its request, and a stopping server cancels
+    every request; ``check_cancelled`` then raises in the worker thread that
+    runs the handler, so the thread ends instead of holding the server open.
+    Outside such a thread (a direct call) nothing can cancel the wait.
+    """
+    try:
+        anyio.from_thread.check_cancelled()
+    except RuntimeError:  # NoEventLoopError: not an AnyIO worker thread
+        pass
+    return False
+
+
 def _report_uri(report_id: str) -> str:
     return f"wse://reports/{report_id}"
 
@@ -355,8 +395,8 @@ class WSEMCPServer:
 
     Engine calls are serialized with a lock: the SDK runs synchronous tool
     handlers on worker threads, and one Engine holds one SQLite connection.
-    Waiting in ``wse_get_job`` polls outside the lock, so it never blocks
-    other calls.
+    Waiting in ``wse_get_job`` and ``wse_evaluate`` polls outside the lock,
+    so it never blocks other calls.
     """
 
     def __init__(self, engine: Engine, *, constraint_status: str = "unverified") -> None:
@@ -366,6 +406,7 @@ class WSEMCPServer:
         self.constraint_status = constraint_status
         grant = engine.experiments.get_run_grant(engine.bound_run_id)
         self.wait_cap = wait_cap(engine.get_policy(grant.policy_id))
+        self.evaluation_wait = evaluation_wait_cap(engine.get_policy(grant.policy_id))
         self._lock = threading.Lock()
         self.server: MCPServer = MCPServer(SERVER_NAME, instructions=server_instructions(engine),
                                            version=_package_version(), log_level="INFO")
@@ -414,6 +455,7 @@ class WSEMCPServer:
             (self.wse_submit_candidate, MUTATION),
             (self.wse_preview_patch, MUTATION),
             (self.wse_apply_patch, MUTATION),
+            (self.wse_evaluate, MUTATION),
             (self.wse_submit_evaluation, MUTATION),
             (self._get_job_tool(), READ_ONLY),
             (self.wse_get_report, READ_ONLY),
@@ -658,6 +700,58 @@ class WSEMCPServer:
                 summary=summary, uris=[_manifest_uri(manifest.checkpoint_id), _patch_uri(patch_id)],
                 usage=self._usage(eid, None, APPLY_COUNTERS), result=manifest)
         return _respond(self._call(run))
+
+    def wse_evaluate(self, *, experiment_id: ExperimentIdArg = None, checkpoint_id: IdArg, idempotency_key: KeyArg,
+                     ) -> Annotated[CallToolResult, ToolResponse[CheckpointEvaluation]]:
+        """Evaluate a checkpoint on the task's whole development suite and wait for the result in this one call.
+
+        The suite, sample count, and seed are fixed by the task: you choose only the checkpoint. A new evaluation is
+        charged as one development evaluation (on a generation suite, one generation pass of all its problems). The
+        result is the report summary (metrics with intervals, report_id) and, for a candidate, the paired comparison
+        with the base checkpoint's report. A checkpoint is evaluated once: asking again returns its report, or waits
+        for its running evaluation, without charging again. If the call returns while the evaluation is still
+        running, call wse_evaluate again for the same checkpoint to keep waiting.
+        """
+        eid = self._call(self._experiment_id, experiment_id)
+        evaluation = self._call(self.engine.evaluate_checkpoint, eid, checkpoint_id, idempotency_key, wait_seconds=0)
+        job_id = evaluation.job_id
+        if job_id is not None and evaluation.state in ("queued", "running"):
+            # The wait happens here, polling outside the lock; a cancelled request ends it, and the job continues.
+            try:
+                poll_job(lambda: self._call(self.engine.get_job, eid, job_id, 0), self.evaluation_wait,
+                         _request_cancelled)
+            except ToolError:
+                raise
+            except BaseException:
+                logger.info("wse_evaluate: the request was cancelled while waiting for job %s; the job continues in "
+                            "the worker", job_id)
+                raise
+            evaluation = self._call(self.engine.evaluate_checkpoint, eid, checkpoint_id, idempotency_key,
+                                    wait_seconds=0)
+        return _respond(self._call(self._evaluation_response, eid, evaluation))
+
+    def _evaluation_response(self, experiment_id: str,
+                             evaluation: CheckpointEvaluation) -> ToolResponse[CheckpointEvaluation]:
+        config, report, comparison = evaluation.config, evaluation.report, evaluation.comparison
+        summary = (f"checkpoint {evaluation.checkpoint_id} on {evaluation.suite_id} (sample_count "
+                   f"{config.sample_count}, seed {config.seed}): ")
+        if report is not None:
+            summary += f"metrics {canonical_json(report.metrics)}" + ("; target met" if report.target_met else "")
+        else:
+            summary += f"job {evaluation.job_id} is {evaluation.state}"
+        if comparison is not None:
+            summary += "; difference from the base " + _difference_text(comparison)
+        summary += f"; {EVALUATION_ORIGINS[evaluation.origin]}"
+        if evaluation.state in ("queued", "running"):
+            summary += "; call wse_evaluate again for this checkpoint to keep waiting (not charged again)"
+        if evaluation.error is not None:
+            summary += f"; {evaluation.error.code.value}: {evaluation.error.message}"
+        uris = [report.report_uri] if report is not None else []
+        if comparison is not None and evaluation.base_report_id is not None:
+            uris.append(_report_uri(evaluation.base_report_id))
+        return ToolResponse[CheckpointEvaluation](summary=summary, uris=uris,
+                                                  usage=self._usage(experiment_id, evaluation.usage),
+                                                  result=evaluation)
 
     def wse_submit_evaluation(self, *, experiment_id: ExperimentIdArg = None, checkpoint_id: IdArg,
                               suite_id: Annotated[str, Field(description="A development suite of the experiment.")],

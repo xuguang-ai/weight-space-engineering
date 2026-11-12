@@ -131,7 +131,8 @@ __all__ = [
 
 logger = logging.getLogger("wse.runner")
 
-EVALUATION_TOOLS = ("wse_submit_evaluation", "wse_get_job", "wse_get_report", "wse_cancel_job", "wse_compare")
+EVALUATION_TOOLS = ("wse_evaluate", "wse_submit_evaluation", "wse_get_job", "wse_get_report", "wse_cancel_job",
+                    "wse_compare")
 PROBE_TOOLS = ("wse_probe",)
 SANDBOX_TOOLS = ("wse_run_python",)  # code execution: only under a policy that grants the sandbox
 SUBMISSION_TOOLS = ("wse_submit_candidate",)  # tensors from the sandbox: the sandbox and the replace_tensor edit
@@ -212,13 +213,17 @@ SANDBOX_CALL_MARGIN_SECONDS = 120.0  # exporting inputs before a call and storin
 def agent_session_timeout(policy: ExperimentPolicy, configured: float) -> float:
     """The agent's MCP session timeout: ``configured``, raised above the longest tool call of ``policy``.
 
-    The longest calls are a ``wse_get_job`` wait (the policy's cap) and,
-    under a sandbox policy, a ``wse_run_python`` call (its wall-clock limit,
-    plus the export of inputs before it and the storing of outputs after it).
+    The longest calls are a ``wse_get_job`` wait (the policy's cap), a
+    ``wse_evaluate`` call when development evaluations are permitted (it
+    waits for its job up to ``evaluation_wait_cap``), and, under a sandbox
+    policy, a ``wse_run_python`` call (its wall-clock limit, plus the export
+    of inputs before it and the storing of outputs after it).
     """
-    from wse.jobs import wait_cap
+    from wse.jobs import evaluation_wait_cap, wait_cap
 
     longest = wait_cap(policy) + SESSION_TIMEOUT_MARGIN_SECONDS
+    if policy.evaluation_available:
+        longest = max(longest, evaluation_wait_cap(policy) + SESSION_TIMEOUT_MARGIN_SECONDS)
     if sandbox_available(policy):
         assert policy.sandbox is not None
         longest = max(longest, policy.sandbox.seconds_per_call + SANDBOX_CALL_MARGIN_SECONDS)
@@ -233,9 +238,10 @@ def submissions_available(policy: ExperimentPolicy) -> bool:
 def allowed_tools(policy: ExperimentPolicy) -> list[str]:
     """The WSE tools a controller of this policy may use, in ``STRATEGY_TOOLS`` order.
 
-    Evaluation tools (``EVALUATION_TOOLS``: submission, reports, and
-    comparisons) when the policy permits development evaluations (evaluation
-    batches or generation passes, ``evaluation_available``), ``wse_probe``
+    Evaluation tools (``EVALUATION_TOOLS``: whole evaluations waited for,
+    submission, reports, and comparisons) when the policy permits
+    development evaluations (evaluation batches or generation passes,
+    ``evaluation_available``), ``wse_probe``
     when it grants probes, ``wse_run_python`` when it grants the sandbox, and
     the job tools for either.
     """
@@ -360,6 +366,11 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
         text = ("Evaluate checkpoints with wse_submit_evaluation on a development suite with a preregistered "
                 f"eval_config (sample_count, seed), wait with wse_get_job (wait_seconds up to {cap:g}), read a "
                 "whole report with wse_get_report, and compare two reports with wse_compare.")
+        if "wse_evaluate" in tools:
+            text = (f"wse_evaluate evaluates a checkpoint on all of development suite {task.development_suite_id} "
+                    "and returns its report and the comparison with the base checkpoint in one call, which waits "
+                    "until the evaluation ends; each checkpoint is evaluated once, so asking again returns the same "
+                    "result without charging again. " + text)
         if passes:
             text += (" A generation suite's report gives every output's grade, length, whether it reached the token "
                      "limit, the end of its text, and its output_uri; wse_compare pairs two such reports on accuracy, "
@@ -460,6 +471,8 @@ class ExperimentExecutor:
                 eid(experiment_id), patch_spec, idempotency_key),
             "wse_apply_patch": lambda *, patch_id, idempotency_key, experiment_id=None: e.apply_patch(
                 eid(experiment_id), patch_id, idempotency_key, bounded=True),
+            "wse_evaluate": lambda *, checkpoint_id, idempotency_key, experiment_id=None: e.evaluate_checkpoint(
+                eid(experiment_id), checkpoint_id, idempotency_key),
             "wse_submit_evaluation": lambda *, checkpoint_id, suite_id, eval_config, idempotency_key,
                 experiment_id=None: e.submit_evaluation(eid(experiment_id), checkpoint_id, suite_id, eval_config,
                                                         idempotency_key),
