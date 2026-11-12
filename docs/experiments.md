@@ -351,12 +351,17 @@ sandbox, `<workspace>/sandboxes/<run_id>/`:
 
 **Isolation.** On macOS the process runs under `sandbox-exec` with a
 profile that denies everything, imports Apple's `system.sb` (the system
-libraries and services every process needs), and then allows only reading
-the Python runtime and executing its interpreter, the sandbox directories
-above, and the metadata of their parent directories. The rest of the
-workspace (evaluator storage among it), the repository, the user's files,
-other executables, new processes, and the network are denied, and the
-environment is an allow-list, so no credential reaches the process. A call
+libraries and services every process needs), and then allows only:
+executing the interpreter; reading the Python installation and the
+environment without their `site-packages` directories; in those, only the
+files of NumPy, PyTorch, and safetensors and of their declared dependencies
+(a `site-packages` directory may be listed, not read, so WSE's own
+distribution, whose metadata holds its README, and every other installed
+package stay unreadable); the sandbox directories above; and the metadata
+of their parent directories. The rest of the workspace (evaluator storage
+among it), the repository, the user's files, other executables, new
+processes, and the network are denied, and the environment is an
+allow-list, so no credential reaches the process. A call
 is killed at its wall-clock limit (the policy's `seconds_per_call`, or the
 time left); CPU time is limited to that many seconds per core, and files to
 1 GiB each. Peak memory is recorded but not limited: macOS enforces no

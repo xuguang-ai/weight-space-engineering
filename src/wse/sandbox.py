@@ -6,8 +6,15 @@ directory and runs it with the environment's own Python under macOS
 ``system.sb`` (the system libraries, devices, and services every process
 needs), and then allows only:
 
-* reading and mapping the Python runtime (``sys.base_prefix`` and
-  ``sys.prefix``) and executing its interpreter;
+* reading and mapping the Python runtime and executing its interpreter:
+  the base installation (``sys.base_prefix``) and the environment
+  (``sys.prefix``) without their ``site-packages`` directories, and, in
+  those, only the files of the analysis libraries
+  (``ANALYSIS_DISTRIBUTIONS``: NumPy, PyTorch, safetensors) and of their
+  declared dependencies, as each distribution's record lists them. A
+  ``site-packages`` directory itself may be listed, not read, so WSE's own
+  distribution (whose metadata holds its README) and every other installed
+  package stay unreadable;
 * reading ``inputs/`` and ``calls/``, and the sandbox root itself, which
   Python needs to resolve its working directory;
 * reading and writing ``work/``, ``outputs/``, and ``tmp/``;
@@ -45,10 +52,13 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import importlib.metadata
 import json
 import os
+import re
 import shutil
 import signal
+import site
 import stat
 import subprocess
 import sys
@@ -65,6 +75,8 @@ SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
 STORED_OUTPUT_BYTES = 1 << 20
 TAIL_BYTES = 64 * 1024
 FILE_SIZE_LIMIT = 1 << 30
+# The libraries agent code may import; their declared dependencies come with them (``_analysis_entries``).
+ANALYSIS_DISTRIBUTIONS = ("numpy", "torch", "safetensors")
 KEPT_OUTPUT_BYTES = 1 << 20
 ENVIRONMENT_NAMES = ("HOME", "LANG", "MPLCONFIGDIR", "PATH", "PYTHONIOENCODING", "TMPDIR", "XDG_CACHE_HOME",
                      "__PYVENV_LAUNCHER__")
@@ -80,7 +92,7 @@ sys.argv = [path]
 runpy.run_path(path, run_name="__main__")
 """
 
-__all__ = ["ENVIRONMENT_NAMES", "KEPT_OUTPUT_BYTES", "OutputFile", "SandboxLayout", "SandboxResult", "available",
+__all__ = ["ANALYSIS_DISTRIBUTIONS", "ENVIRONMENT_NAMES", "KEPT_OUTPUT_BYTES", "OutputFile", "SandboxLayout", "SandboxResult", "available",
            "profile_text", "read_output", "run_python"]
 
 
@@ -165,17 +177,90 @@ class SandboxResult:
 class _Runtime:
     executable: Path
     launcher: Path | None
-    roots: tuple[Path, ...]
+    directories: tuple[Path, ...]  # readable and mappable subtrees
+    files: tuple[Path, ...]  # readable and mappable single paths: files, links, and directories that may be listed
 
 
+def _covering(root: Path, excluded: set[Path]) -> tuple[list[Path], list[Path]]:
+    """Subtrees and single paths that together cover ``root`` except the ``excluded`` directories in it."""
+    if root in excluded:
+        return [], []
+    if not any(path.is_relative_to(root) for path in excluded):
+        return [root], []
+    directories: list[Path] = []
+    files = [root]
+    with os.scandir(root) as entries:
+        for entry in sorted(entries, key=lambda e: e.name):
+            path = Path(entry.path)
+            if entry.is_dir(follow_symlinks=False):
+                more_directories, more_files = _covering(path, excluded)
+                directories += more_directories
+                files += more_files
+            elif path not in excluded:
+                files.append(path)
+    return directories, files
+
+
+def _requirements(distribution: importlib.metadata.Distribution) -> list[str]:
+    """The names a distribution requires outside its extras."""
+    names = []
+    for text in distribution.requires or ():
+        requirement, _, marker = text.partition(";")
+        match = re.match(r"\s*([A-Za-z0-9][A-Za-z0-9._-]*)", requirement)
+        if match and "extra" not in marker:
+            names.append(match.group(1))
+    return names
+
+
+def _analysis_entries(sites: set[Path]) -> tuple[list[Path], list[Path]]:
+    """The top-level entries, in ``sites``, of the analysis distributions and their declared dependencies."""
+    directories: list[Path] = []
+    files: list[Path] = []
+    pending, seen = list(ANALYSIS_DISTRIBUTIONS), set()
+    while pending:
+        name = pending.pop()
+        key = re.sub(r"[-_.]+", "-", name).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            distribution = importlib.metadata.distribution(name)
+        except importlib.metadata.PackageNotFoundError:
+            continue
+        pending += _requirements(distribution)
+        for record in distribution.files or ():
+            if not record.parts or record.parts[0] == "..":
+                continue
+            # A shared __pycache__ holds other modules' bytecode too, so only the distribution's own files in it.
+            top = record if record.parts[0] == "__pycache__" else Path(record.parts[0])
+            path = Path(distribution.locate_file(top))
+            if path.parent.resolve() not in sites and path.parent.parent.resolve() not in sites:
+                continue
+            if not os.path.lexists(path):
+                continue
+            path = path.parent.resolve() / path.name
+            if path.is_dir() and not path.is_symlink():
+                directories.append(path)
+            else:
+                files.append(path)
+    return sorted(set(directories)), sorted(set(files))
+
+
+@functools.cache
 def _runtime() -> _Runtime:
-    """The interpreter to run, the launcher path a framework build expects, and the runtime's directories."""
+    """The interpreter to run, the launcher path a framework build expects, and what of the runtime it may read."""
     environment_python = Path(sys.executable).absolute()
-    roots = tuple(dict.fromkeys(Path(p).resolve() for p in (sys.base_prefix, sys.prefix)))
+    sites = {Path(p).resolve() for p in site.getsitepackages([sys.base_prefix, sys.prefix]) if os.path.isdir(p)}
+    directories, files = _analysis_entries(sites)
+    files += sorted(sites)
+    for prefix in dict.fromkeys(Path(p).resolve() for p in (sys.base_prefix, sys.prefix)):
+        more_directories, more_files = _covering(prefix, sites)
+        directories += more_directories
+        files += more_files
     app = Path(sys.base_prefix).resolve() / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
-    if app.exists():
-        return _Runtime(app, environment_python, roots)
-    return _Runtime(environment_python, None, roots)
+    launcher = environment_python if app.exists() else None
+    return _Runtime(app if app.exists() else environment_python, launcher, tuple(dict.fromkeys(directories)),
+                    tuple(dict.fromkeys(files)))
 
 
 def _quoted(path: Path | str) -> str:
@@ -196,7 +281,7 @@ def profile_text(layout: SandboxLayout) -> str:
     executables = {runtime.executable, Path(os.path.realpath(runtime.executable))}
     if runtime.launcher is None:
         executables |= {Path(sys.executable).absolute(), Path(os.path.realpath(sys.executable))}
-    allowed = [*runtime.roots, layout.root]
+    allowed = [*runtime.directories, *runtime.files, layout.root]
 
     def group(kind: str, paths: list[Path] | set[Path]) -> str:
         return " ".join(f"({kind} {_quoted(p)})" for p in sorted(paths, key=str))
@@ -206,7 +291,8 @@ def profile_text(layout: SandboxLayout) -> str:
         "(deny default)",
         '(import "system.sb")',
         f"(allow process-exec {group('literal', executables)})",
-        f"(allow file-read* file-map-executable {group('subpath', list(runtime.roots))})",
+        f"(allow file-read* file-map-executable {group('subpath', list(runtime.directories))} "
+        f"{group('literal', list(runtime.files))})",
         f"(allow file-read* (literal {_quoted(layout.root)}) {group('subpath', [layout.inputs, layout.calls])})",
         f"(allow file-read* file-write* {group('subpath', [layout.work, layout.outputs, layout.tmp])})",
         f"(allow file-read-metadata {group('literal', _ancestors(allowed))})",

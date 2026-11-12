@@ -168,6 +168,41 @@ def test_each_call_is_a_fresh_process_and_files_persist(layout: SandboxLayout) -
     assert first.code_sha256 == "sha256:" + hashlib.sha256((layout.calls / "1" / "code.py").read_bytes()).hexdigest()
 
 
+def _metadata_file(name: str) -> Path:
+    import importlib.metadata
+
+    distribution = importlib.metadata.distribution(name)
+    [record] = [f for f in distribution.files or () if f.name == "METADATA" and f.parent.name.endswith(".dist-info")]
+    return Path(distribution.locate_file(record)).resolve()
+
+
+@needs_sandbox
+def test_sandbox_reads_only_the_analysis_libraries_of_its_environment(layout: SandboxLayout) -> None:
+    # WSE's own distribution (its metadata holds the README) and packages outside the analysis libraries'
+    # declared dependencies stay unreadable, though they are installed in the same environment.
+    paths = [_metadata_file(name) for name in ("wse", "pydantic", "numpy", "sympy")]
+    code = ("def readable(path):\n"
+            "    try:\n"
+            "        open(path, 'rb').read(1)\n"
+            "        return 'read'\n"
+            "    except OSError:\n"
+            "        return 'denied'\n"
+            f"print(*[readable(p) for p in {[str(p) for p in paths]!r}])\n"
+            "for name in ('wse', 'pydantic', 'safetensors.torch'):\n"
+            "    try:\n"
+            "        __import__(name)\n"
+            "        print(name, 'imported')\n"
+            "    except Exception as exc:\n"
+            "        print(name, type(exc).__name__)\n")
+    result = run_python(layout, code, **LIMITS)
+    assert result.exit_code == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[0] == "denied denied read read"
+    assert lines[1].startswith("wse ") and lines[1] != "wse imported"
+    assert lines[2].startswith("pydantic ") and lines[2] != "pydantic imported"
+    assert lines[3] == "safetensors.torch imported"
+
+
 @needs_sandbox
 def test_outputs_start_empty_and_each_call_keeps_its_small_files(layout: SandboxLayout) -> None:
     first = run_python(layout, "open('outputs/a.txt', 'w').write('a')\n"

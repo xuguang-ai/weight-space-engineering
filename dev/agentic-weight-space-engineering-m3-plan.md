@@ -40,7 +40,7 @@ The [M2 plan](./agentic-weight-space-engineering-m2-plan.md) listed "a sandboxed
 
 - **One process per call.** `wse_run_python` writes the agent's code to `<sandbox>/calls/<n>/code.py` and starts `sandbox-exec -f <profile> <python> -I -B <code.py>` with the sandbox directory as its working directory. Files persist between calls in `work/`; the process does not. WSE empties `outputs/` before each call, so a call's outputs are exactly the files it wrote there, and keeps each call's output files of at most 1 MiB in `calls/<n>/outputs/`.
 - **Profile.** `(deny default)`, then allow:
-  - reading the Python runtime (`sys.base_prefix` and the environment's `sys.prefix`) and the system libraries Python, NumPy, and PyTorch load at import;
+  - reading the Python runtime (`sys.base_prefix` and the environment's `sys.prefix`) without their `site-packages` directories, and in those only the files of NumPy, PyTorch, safetensors, and their declared dependencies (a `site-packages` directory may be listed, not read: WSE's own distribution metadata holds the README, which names p50c and the signed-sum fault), and the system libraries they load at import;
   - reading `<sandbox>/inputs/`, and reading and writing `<sandbox>/work/` and `<sandbox>/outputs/`;
   - starting threads, but no other executables.
 
