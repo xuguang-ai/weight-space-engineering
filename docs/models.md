@@ -56,7 +56,7 @@ uv run --extra models-hf python examples/model_quickstart.py \
 The edit and the comparison printed:
 
 ```text
-1 tensors changed, 131,072 entries; weights 92865a3c8750 -> 092773d60909
+1 tensor changed, 131,072 entries; weights 92865a3c8750 -> 092773d60909
   model.layers.14.self_attn.o_proj.weight: 131,072 of 2,097,152 entries, relative L2 change 0.2756, 70e83e3c4328 -> ad2d2c42779e
 the patch replays to the edited weights: True
 ```
