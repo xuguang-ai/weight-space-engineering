@@ -27,7 +27,7 @@ print(report.compare())
 result.export("artifacts/fix-loops")
 ```
 
-This is the README's example, [examples/experiment_quickstart.py](../examples/experiment_quickstart.py). With Codex and `gpt-5.6-luna`, this configuration ran twice on 2026-11-12 ([results](results.md#6-a-live-llm-agent-edits-a-language-model-through-experiment)): each run's choice improved the 16 development problems and did not improve the 16 test problems.
+This is the README's example, [examples/experiment_quickstart.py](../examples/experiment_quickstart.py). With Codex and `gpt-5.6-luna`, this configuration ran three times on 2026-11-12 ([results](results.md#6-a-live-llm-agent-edits-a-language-model-through-experiment)): each run's choice improved the 16 development problems and did not improve the 16 test problems.
 
 | Argument | What it sets |
 | --- | --- |
@@ -54,11 +54,11 @@ pip install "wse[models-hf]"
 npm install -g @openai/codex
 ```
 
-WSE needs Python 3.11 or later; language models need the `models-hf` extra. The agent is OpenAI's [Codex CLI](https://github.com/openai/codex), release 0.167 or later. WSE runs the binary that the environment variable `WSE_CODEX_PATH` names, else the `codex` on your `PATH`, else the newest one bundled with OpenAI's VS Code extension. An npm install puts a Node launcher script on `PATH`; WSE runs the native binary that the launcher would start, from the same install. On macOS, WSE first checks that the binary's code signature verifies and names OpenAI (Team ID `2DC432GLL2`); it then reads `codex --version` and skips a release older than 0.167.0. A binary that `WSE_CODEX_PATH` names and that fails a check is an error. WSE has been tested with codex-cli 0.167.0-alpha.4.1.
+WSE needs Python 3.11 or later; language models need the `models-hf` extra. The agent is OpenAI's [Codex CLI](https://github.com/openai/codex), release 0.167 or later. WSE runs the binary that the environment variable `WSE_CODEX_PATH` names, else the `codex` on your `PATH`, else the newest one bundled with OpenAI's VS Code extension. An npm install puts a Node launcher script on `PATH`; WSE runs the native binary that the launcher would start, from the same install. On macOS, WSE first checks that the binary's code signature verifies and names OpenAI (Team ID `2DC432GLL2`); it then reads `codex --version` and skips a release older than 0.167.0. A binary that `WSE_CODEX_PATH` names and that fails a check is an error. WSE has been tested with codex-cli 0.167.0-alpha.4.1 (OpenAI's VS Code extension) and 0.167.2 (npm).
 
 ## Agent credentials
 
-The agent's model runs at your provider. WSE reads the key and the endpoint from its own environment:
+The agent's model runs at your provider. WSE reads two variables from its own environment: `OPENAI_API_KEY`, your API key, and `OPENAI_BASE_URL`, the provider's endpoint, the base URL of its API (`https://api.openai.com/v1` for OpenAI's own). WSE assumes no endpoint, so the key goes only where you say:
 
 ```bash
 export OPENAI_API_KEY=your-api-key
@@ -97,7 +97,7 @@ curl -fLO "https://raw.githubusercontent.com/xuguang-ai/weight-space-engineering
 python fix_loops.py
 ```
 
-It runs Qwen3-0.6B on the 16 development problems at 1,024 tokens, with up to 10 evaluations, and tests on the 16 test problems. One evaluation takes about a minute and a half on an M4 Pro (87 to 91 seconds of WSE-metered computation per evaluation in the recorded runs), and a whole run took 15 to 17 minutes there.
+It runs Qwen3-0.6B on the 16 development problems at 1,024 tokens, with up to 10 evaluations, and tests on the 16 test problems. One evaluation takes about a minute and a half on an M4 Pro, and a whole run took 15 to 20 minutes there, the model's download included.
 
 **Qwen3.5-0.8B's reasoning loops, not yet run with an agent.** [examples/experiment_qwen_loops.py](../examples/experiment_qwen_loops.py) sets up the full-size case: the 32 development problems of the recorded diagnosis, on which the original answered 2 correctly and ran 30 to the limit, at 8,192 tokens with the article's sampling profile, `qwen35think@1`. From a source checkout:
 
@@ -185,9 +185,9 @@ These rules were measured with codex-cli 0.167.0-alpha.4.1 on macOS, with the ru
 
 ## Current limits
 
-- **Two live runs** (above), on a small model with 16 development and 16 test problems: too few to show that an edit generalizes.
+- **Three live runs** (above), on a small model with 16 development and 16 test problems: too few to show that an edit generalizes.
 - **macOS only.** The agent's sandbox has been configured and tested on macOS only.
-- **One Codex version tested.** WSE writes its Codex config with `--strict-config`, using keys of codex-cli 0.167.0-alpha.4.1 (permission profiles among them); another version may reject a key or treat it differently. On macOS, WSE runs a Codex binary only after its code signature names OpenAI (Team ID `2DC432GLL2`). It runs the binary that `WSE_CODEX_PATH` names, else the `codex` on your `PATH`, else the newest one bundled with OpenAI's VS Code extension.
+- **Two Codex releases tested,** 0.167.0-alpha.4.1 and 0.167.2. WSE writes its Codex config with `--strict-config`, using keys of codex-cli 0.167 (permission profiles among them); another version may reject a key or treat it differently, and WSE skips releases older than 0.167.0. On macOS, WSE runs a Codex binary only after its code signature names OpenAI (Team ID `2DC432GLL2`). It runs the binary that `WSE_CODEX_PATH` names, else the `codex` on your `PATH`, else the newest one bundled with OpenAI's VS Code extension.
 - **The turn limit can be passed by one request.** WSE counts model requests from Codex's session record, so a fast loop can make one request more than `max_turns` before it is stopped.
 - **Apple MPS or the CPU.** Generation runs on MPS or the CPU; CUDA support is planned ([handover](../dev/handover-cuda.md)). On the CPU, a decoding step of Qwen3.5 takes about 5 to 10 seconds, about 170 times slower than on MPS ([models.md](models.md#known-limits)).
 - **Slow evaluations.** On an M4 Pro, 32 problems at 8,192 tokens took 37 to 40 minutes for Qwen3.5-0.8B.

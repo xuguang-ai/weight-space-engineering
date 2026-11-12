@@ -32,14 +32,14 @@ An agent edits Qwen3-0.6B's weights so that it finishes more of its math answers
 curl -fLO "https://raw.githubusercontent.com/xuguang-ai/weight-space-engineering/main/examples/data/math_{dev,test}.jsonl"
 ```
 
-**2. Set your key.** WSE reads your model provider's key and endpoint from the environment. Codex reaches the provider through a local proxy that WSE runs and that adds the key, so neither Codex nor the agent's code holds it.
+**2. Set your key and endpoint.** The agent's model runs at your provider. `OPENAI_API_KEY` is your API key, and `OPENAI_BASE_URL` is the provider's endpoint, the base URL of its API. WSE assumes no endpoint, so the key goes only where you say:
 
 ```bash
 export OPENAI_API_KEY=your-api-key
 export OPENAI_BASE_URL=https://api.openai.com/v1
 ```
 
-For Azure OpenAI, set `OPENAI_BASE_URL` to your resource's endpoint, `https://YOUR-RESOURCE.services.ai.azure.com/openai/v1`, and use your deployment's name in step 3.
+`https://api.openai.com/v1` is OpenAI's own API. For Azure OpenAI, use your resource's endpoint, `https://YOUR-RESOURCE.services.ai.azure.com/openai/v1`, and your deployment's name in step 3. Codex reaches the provider through a local proxy that WSE runs and that adds the key, so neither Codex nor the agent's code holds it.
 
 **3. Run it.** Save this code as `fix_loops.py` next to the problems, put your model's name, or your deployment's, in place of `YOUR_AGENT_MODEL` (the recorded runs used `gpt-5.6-luna`), and run `python fix_loops.py`:
 
@@ -68,16 +68,66 @@ print(report.compare())
 result.export("artifacts/fix-loops")
 ```
 
-**4. Read the result.** `result.summary()` reports what the agent tried, what WSE kept, and why; `report.compare()` reports the test. The run takes about 15 minutes on an M4 Pro. In the recorded run of this configuration on WSE's final code (2026-11-12, `gpt-5.6-luna`), the agent scaled half of the channels of a late MLP layer's down-projection, and WSE kept the candidate that scales layer 27's by 0.8:
+**4. Read the result.** `result.summary()` reports what the agent tried, what WSE kept, and why; `report.compare()` reports the test. This code ran on 2026-11-12 with `gpt-5.6-luna`, from a pip-installed build of this release and Codex 0.167.2 installed with npm, in 20 minutes on an M4 Pro, the model's download included. The agent computed candidates in Python that scale down half of the output rows of late MLP down-projections; WSE kept the one that scales rows 512 to 1,023 of the down-projection in layers 24 to 27 by 0.85. The table counts Qwen3-0.6B's own answers, before and after that edit; `gpt-5.6-luna` only drives the agent that proposes edits:
 
-| 16 problems in each set | Original | WSE's choice |
+| Qwen3-0.6B, 16 problems in each set | Original model | Edited model (WSE's choice) |
 | --- | --- | --- |
 | Development problems answered correctly | 5 | 7 |
 | Development answers cut off at 1,024 tokens | 10 | 8 |
-| Test problems answered correctly | 4 | 3 |
-| Test answers cut off at 1,024 tokens | 11 | 12 |
+| Test problems answered correctly | 4 | 4 |
+| Test answers cut off at 1,024 tokens | 11 | 11 |
 
-The choice improved the problems it was chosen on, not the new ones; the other recorded run ended the same way ([Results](https://github.com/xuguang-ai/weight-space-engineering#an-agent-edits-a-small-language-model)).
+The choice improved the problems it was chosen on and changed nothing on the new ones; in two earlier runs of this configuration, the choice answered one test problem fewer correctly ([Results](https://github.com/xuguang-ai/weight-space-engineering#an-agent-edits-a-small-language-model)).
+
+At 1,024 tokens, the answers that are cut off are unfinished reasoning, not loops: none of the 213 answers cut off in the development evaluations of the three runs ends in a loop, against 24 of 30 for Qwen3.5-0.8B at 8,192 tokens ([Results](https://github.com/xuguang-ai/weight-space-engineering#reconstructing-a-published-edit-on-qwen35-08b)). This run shows WSE's whole path working; it does not test whether an agent can fix looping.
+
+<details>
+<summary>What the script printed (the absolute path in the line that starts with <code>logs</code> is shortened)</summary>
+
+```text
+Experiment exp_ec090278e518ace06529280da8badb54 (FROZEN): Reduce repetitive reasoning so the model finishes more math answers.
+Rule: WSE keeps the candidate with the lowest limit_hit_rate on the full development set among those that improve on the baseline's limit_hit_rate, with accuracy no worse than the baseline's; when none does, it keeps the original model.
+
+Behavior on the development set (point estimates):
+  metric                    original  selected
+  accuracy                     0.312     0.438
+  limit_hit_rate               0.625     0.500
+  mean_generated_tokens        893.9     880.2
+Choice: ckpt_3cf652564f75d484275a7951359033f1 was kept: limit_hit_rate 0.625 -> 0.5, accuracy 0.3125 -> 0.4375; 3 of 7 evaluated candidates qualified
+
+Candidates (7 evaluated):
+  - ckpt_43e431e464ec1325a79506eb594f731f: accuracy 0.375, limit_hit_rate 0.5625, mean_generated_tokens 930.1; 6,291,456 elements in model.layers.24.mlp.down_proj.weight, model.layers.25.mlp.down_proj.weight, model.layers.26.mlp.down_proj.weight, model.layers.27.mlp.down_proj.weight; qualified; another candidate scored better
+    hypothesis: Late residual contrasts are strongest at layers 24-28; attenuating half of each final MLP output by 15% is a localized test of reducing the amplification without a prohibited whole-tensor rescale.
+  - ckpt_ede149224a14dc84e1a2f935bd66f12c: accuracy 0.25, limit_hit_rate 0.5625, mean_generated_tokens 936.3; 6,291,456 elements in model.layers.24.mlp.down_proj.weight, model.layers.25.mlp.down_proj.weight, model.layers.26.mlp.down_proj.weight, model.layers.27.mlp.down_proj.weight; did not qualify: accuracy 0.25 is worse than the baseline's 0.3125
+    hypothesis: The 15% localized attenuation improved both gates; a stronger 30% attenuation on the same late-layer MLP half tests whether more loop suppression is available while retaining a localized edit.
+  - ckpt_4c4c199988523bfd221d93eb77748721: accuracy 0.375, limit_hit_rate 0.5625, mean_generated_tokens 895.5; 3,145,728 elements in model.layers.26.mlp.down_proj.weight, model.layers.27.mlp.down_proj.weight; qualified; another candidate scored better
+    hypothesis: The strongest contrast is concentrated at residual layers 27-28; limiting the attenuation to MLP outputs in layers 26-27 tests whether the same loop suppression can be obtained with less disruption to earlier computation.
+  - ckpt_28245c63ef935bff5dd853ec17d3f776: accuracy 0.1875, limit_hit_rate 0.6875, mean_generated_tokens 940.4; 1,572,864 elements in model.layers.27.mlp.down_proj.weight; did not qualify: limit_hit_rate 0.6875 does not improve on the baseline's 0.625; accuracy 0.1875 is worse than the baseline's 0.3125
+    hypothesis: Layer 27 carries the largest late residual contrast; a focused 30% attenuation on one output half tests whether layer 27 alone controls repetition with minimal accuracy risk.
+  - ckpt_ad408e5aa4c3213f7d2f943fded32f11: accuracy 0.3125, limit_hit_rate 0.625, mean_generated_tokens 924.2; 6,291,456 elements in model.layers.24.mlp.down_proj.weight, model.layers.25.mlp.down_proj.weight, model.layers.26.mlp.down_proj.weight, model.layers.27.mlp.down_proj.weight; did not qualify: limit_hit_rate 0.625 does not improve on the baseline's 0.625
+    hypothesis: The 15% late-MLP attenuation improved the point estimates; a milder 10% attenuation tests whether it retains the accuracy gain while reducing a further subset of repetitive completions.
+  - ckpt_3cf652564f75d484275a7951359033f1: accuracy 0.4375, limit_hit_rate 0.5, mean_generated_tokens 880.2; 6,291,456 elements in model.layers.24.mlp.down_proj.weight, model.layers.25.mlp.down_proj.weight, model.layers.26.mlp.down_proj.weight, model.layers.27.mlp.down_proj.weight; selected
+    hypothesis: The first-half edit improved both gates; applying the same conservative attenuation to the complementary MLP output half tests whether the useful late residual subspace lies there instead.
+  - ckpt_bef745c72769d3027bee532cb80893d7: accuracy 0.3125, limit_hit_rate 0.625, mean_generated_tokens 875.9; 6,291,456 elements in model.layers.24.mlp.down_proj.weight, model.layers.25.mlp.down_proj.weight, model.layers.26.mlp.down_proj.weight, model.layers.27.mlp.down_proj.weight; did not qualify: limit_hit_rate 0.625 does not improve on the baseline's 0.625
+    hypothesis: The complementary-half 15% attenuation improved to 7/16 accuracy and 8/16 capped; a stronger 30% attenuation tests whether more repetition can be removed from that same empirically favorable subspace.
+
+The agent's final message: WSE-STOP: Best candidate is `ckpt_3cf652564f75d484275a7951359033f1`, with accuracy 0.4375 and limit-hit rate 0.5 versus baseline 0.3125 and 0.625.
+
+Audit:
+  controller codex_cli@1 model gpt-5.6-luna, ended completed (the agent stopped: WSE-STOP: Best candidate is `ckpt_3cf652564f75d484275a7951359033f1`, with accuracy 0.4375 and limit-hit rate 0.5 versus baseline 0.3125 and 0.625.)
+  evaluations 8 of 10 (the baseline included)
+  constraint status unverified (the agent runs its own commands (Codex's shell), whose computation WSE does not meter; sandbox code execution: WSE meters only its own calls)
+  WSE-metered computation 809.5 s; agent tokens 1,469,015 (input 1,462,483, output 6,532)
+  sandbox calls 8, 1.4 s of sandbox wall-clock time (not metered computation)
+  logs …/runs/fix-loops/experiments/run_1dfa6147ef43d91451a6e00d0eeb2cae/logs
+test data math_test.jsonl: 16 problems; selected ckpt_3cf652564f75d484275a7951359033f1, original ckpt_591958e3ba473f8cccc14a7d66c4107d
+metric                    original  selected   difference [95% interval]
+accuracy                     0.250     0.250   +0.000 [-0.188, +0.188] paired
+limit_hit_rate               0.688     0.688   +0.000 original [0.438, 0.875]; selected [0.438, 0.875]
+mean_generated_tokens        922.3     937.4   +15.1 original [823.2, 1001.6]; selected [852.6, 1008.2]
+```
+
+</details>
 
 - **`goal` guides; `minimize` and `preserve` decide.** A candidate qualifies when its development limit-hit rate is below the original's and its development accuracy is at least the original's; WSE keeps the qualifying candidate with the lowest limit-hit rate, and when none qualifies, `result.model` is the original. These are point estimates, not significance tests.
 - **The evaluation is fixed.** Every model is evaluated on the same problems, prompts, sampling settings, seeds, and token limit, and the agent cannot change the grading. `max_evaluations` counts the evaluations of whole models on the development problems, the original's included.
@@ -125,7 +175,7 @@ norm of head 7's input columns in layer 14's o_proj: 8.75
 <summary>What <code>inspect()</code> printed before these lines</summary>
 
 ```text
-model Qwen/Qwen3-0.6B@c1899de289a04d12100db370d81485cdf75e47ca, checkpoint ckpt_b67e9a97d644396f3cd4c1f151e48338, weights 92865a3c8750
+model Qwen/Qwen3-0.6B@c1899de289a04d12100db370d81485cdf75e47ca, checkpoint ckpt_af29837df3e0a784586296d3c0f38f12, weights 92865a3c8750
 adapter hf_causal_lm@1, family none (Level 0), model type qwen3, 28 layers
 596,049,920 parameters in 311 tensors (311 bfloat16)
 tensors:
@@ -225,7 +275,7 @@ print(f"saved: patch {edit.patch_id}, checkpoint {edited.checkpoint_id}")
 1 tensor changed, 131,072 entries; weights 92865a3c8750 -> 092773d60909
   model.layers.14.self_attn.o_proj.weight: 131,072 of 2,097,152 entries, relative L2 change 0.2756, 70e83e3c4328 -> ad2d2c42779e
 the patch replays to the edited weights: True
-saved: patch patch_bb8fab2e1dbaf10f02bd660b545d19c1, checkpoint ckpt_0da05bb923c740440677d84f26d003b5
+saved: patch patch_1b72d274dd6d21452dc3c83cb467b087, checkpoint ckpt_86aaf903cbdc469de9b18435bed25b30
 ```
 
 The registered operators scale, set, or fill a slice, remove a direction's projection, or add a low-rank term; `replace_weights` submits whole tensors computed any other way, after checking their names, shapes, dtypes, and values ([the Model API](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/models.md#the-model-api)).
@@ -318,7 +368,15 @@ An LLM agent, `gpt-5.6-luna` through the OpenAI Agents SDK runner that WSE used 
 
 ### An agent edits a small language model
 
-Through `Experiment`, Codex with `gpt-5.6-luna` worked on Qwen3-0.6B's answers to 16 GSM8K training problems at 1,024 new tokens, to cut fewer answers off at the limit without losing accuracy ([examples/experiment_quickstart.py](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/experiment_quickstart.py)). In 13 minutes it probed the residual stream, computed 8 candidates in Python, each scaling down 32 to 128 entries of the final RMSNorm weight (one also scaled layer 27's input norm), evaluated 7, and stopped itself. WSE's rule chose the one that halves 64 entries: on the development problems 5 → 7 correct and 10 → 7 cut off. On 16 GSM8K test problems, none of which appears in anything the agent was sent or wrote, it did not help: 4 → 3 correct and 11 → 12 cut off (accuracy difference −0.062 [−0.188, +0.000]). A second run on this version's code chose another edit, through WSE's `scale_slice` operator: half of layer 27's MLP down-projection channels scaled by 0.8, 5 → 7 correct and 10 → 8 cut off on the development problems, and again 4 → 3 correct and 11 → 12 cut off on the test problems. The runs show the whole path working with a live agent, not an edit that generalizes ([the runs](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/results.md#6-a-live-llm-agent-edits-a-language-model-through-experiment)).
+Through `Experiment`, Codex with `gpt-5.6-luna` worked three times on the [Quick start](https://github.com/xuguang-ai/weight-space-engineering#quick-start)'s task: Qwen3-0.6B's answers to 16 GSM8K training problems at 1,024 new tokens, to cut fewer of them off at the limit without losing accuracy. Each time, it probed the model, made 6 to 8 candidates, evaluated 6 or 7 of them, and stopped itself. WSE's rule then chose one, and only that choice and the original were tested, on 16 GSM8K test problems that appear in nothing the agent was sent or wrote:
+
+| Run | WSE's choice | Qwen3-0.6B on development problems: correct, cut off | Qwen3-0.6B on test problems: correct, cut off |
+| --- | --- | --- | --- |
+| 1 | 64 entries of the final RMSNorm weight halved, computed in Python | 5 → 7, 10 → 7 | 4 → 3, 11 → 12 |
+| 2 | half of layer 27's MLP down-projection channels scaled by 0.8, with WSE's `scale_slice` | 5 → 7, 10 → 8 | 4 → 3, 11 → 12 |
+| 3 | half of the MLP down-projection's output rows in layers 24 to 27 scaled by 0.85, computed in Python | 5 → 7, 10 → 8 | 4 → 4, 11 → 11 |
+
+Run 3 is the Quick start's code, from a pip-installed build of this release with Codex 0.167.2 from npm. The runs show the whole path working with a live agent, not an edit that generalizes ([the runs](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/results.md#6-a-live-llm-agent-edits-a-language-model-through-experiment)).
 
 ### What has been demonstrated
 
@@ -328,20 +386,20 @@ Through `Experiment`, Codex with `gpt-5.6-luna` worked on Qwen3-0.6B's answers t
 | Apply published p50c to Qwen3.5-0.8B | Command line, same runner as Python | 3/25 → 13/25 correct on MATH-500, with a 32,768-token limit |
 | Reconstruct p50c's projection edit with WSE operators | Direct Python | 2/32 → 10/32 correct on GSM8K practice problems; answers cut off at the limit fell from 30/32 to 21/32 |
 | Apply that reconstruction through MCP | Scripted controller | Answers cut off at the limit fell from 30/32 to 19/32 on another practice set |
-| An agent edits a language model (`Experiment` with Codex) | Live LLM agent | Two runs on Qwen3-0.6B: 5/16 → 7/16 correct on the development problems each choice was made on, 4/16 → 3/16 on test problems |
+| An agent edits a language model (`Experiment` with Codex) | Live LLM agent | Three runs on Qwen3-0.6B: 5/16 → 7/16 correct on the development problems each choice was made on; on the test problems, 4/16 → 3/16 twice and 4/16 → 4/16 once |
 
-The article's three Qwen3.5-0.8B edits import to their published hashes, and WSE's own `fill_slice@1` operator reproduces one of them, p25c, hash-exactly. The reconstruction takes its direction and columns from p50c's published change; a scripted search that used its form without its values found no repair. Two live agent runs have edited a language model, and in both the gain on the development problems did not carry over to the test problems.
+The article's three Qwen3.5-0.8B edits import to their published hashes, and WSE's own `fill_slice@1` operator reproduces one of them, p25c, hash-exactly. The reconstruction takes its direction and columns from p50c's published change; a scripted search that used its form without its values found no repair. Three live agent runs have edited a language model, and in none did the gain on the development problems carry over to the test problems.
 
 ## Current support
 
 | Area | Status |
 | --- | --- |
-| Agent interface | `Experiment` with the Codex CLI (two live runs, on Qwen3-0.6B); the MCP server for other MCP clients |
+| Agent interface | `Experiment` with the Codex CLI (three live runs, on Qwen3-0.6B); the MCP server for other MCP clients |
 | Language-model weights | Unquantized safetensors for causal models implemented natively by `transformers` |
 | Verified model imports | Qwen3.5-0.8B, Llama-3.2-1B-Instruct, Qwen3-0.6B, and gemma-3-1b-it |
 | Generation and activation probes | Apple MPS and CPU, tested on macOS with Apple silicon |
 | Agent sandbox | macOS |
-| Tested versions | Python 3.14, PyTorch 2.15, and `transformers` 5.22.2; WSE requires Python 3.11 or later |
+| Tested versions | Python 3.14, PyTorch 2.15, `transformers` 5.22.2, and codex-cli 0.167.0-alpha.4.1 and 0.167.2; WSE requires Python 3.11 or later |
 | Patch replay | Exact replay of stored edits, verified by hashes |
 | Model export | Hugging Face model directories; Qwen3.5 exports its language model only, without its vision encoder |
 | Next work | Live agent runs on Qwen3.5-0.8B with `Experiment`, larger development and test sets, and CUDA support ([handover](https://github.com/xuguang-ai/weight-space-engineering/blob/main/dev/handover-cuda.md)) |

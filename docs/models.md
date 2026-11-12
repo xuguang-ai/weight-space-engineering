@@ -51,7 +51,7 @@ curl -fLO https://raw.githubusercontent.com/xuguang-ai/weight-space-engineering/
 python model_quickstart.py
 ```
 
-On an M4 Pro with MPS, an earlier version of the script, which took the model from a local copy of the same commit, ran in 140 to 149 seconds in each of three runs. The edit and the comparison printed:
+On an M4 Pro with MPS, with the model already downloaded, it ran in 152 seconds; an earlier version, which took the model from a local copy of the same commit, ran in 140 to 149 seconds in each of three runs. The edit and the comparison printed:
 
 ```text
 1 tensor changed, 131,072 entries; weights 92865a3c8750 -> 092773d60909
@@ -67,7 +67,7 @@ limit_hit_rate               0.750       0.625   -0.125 [-0.375, +0.000]
 mean_generated_tokens        915.6       866.5   -49.1 [-157.4, +24.5]
 ```
 
-Each model answered the 8 problems in one batch of 46 to 49 seconds. Both answered 1 of the 8 correctly; 6 of the original's answers and 5 of the edited model's reached the limit, and that interval includes zero. The ablation shows how the API works; it is not evidence that the head matters. The three runs, each in a new directory, printed the same hashes and the same table.
+Each model answered the 8 problems in one batch of 46 to 49 seconds. Both answered 1 of the 8 correctly; 6 of the original's answers and 5 of the edited model's reached the limit, and that interval includes zero. The ablation shows how the API works; it is not evidence that the head matters. All four runs, each in a new directory, printed the same hashes and the same table.
 
 ## Support levels
 
