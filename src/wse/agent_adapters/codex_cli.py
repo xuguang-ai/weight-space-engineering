@@ -111,9 +111,12 @@ JSONL events into the normalized ``AgentEvent`` records of
 
 The Codex binary comes from ``codex_path``, else ``WSE_CODEX_PATH``, else a
 search of ``PATH`` and then of the VS Code extension bundles
-(``~/.vscode*/extensions/openai.chatgpt-*/bin/*/codex``, newest first). On
-macOS a binary is used only after ``codesign`` verifies its signature and
-reports OpenAI's Team ID ``2DC432GLL2``.
+(``~/.vscode*/extensions/openai.chatgpt-*/bin/*/codex``, newest first). An
+npm install (``npm install -g @openai/codex``) puts a Node launcher script on
+``PATH``; WSE runs the native binary that the launcher would start, from the
+same install. On macOS a binary is used only after ``codesign`` verifies its
+signature and reports OpenAI's Team ID ``2DC432GLL2``. A binary older than
+codex-cli 0.167.0, the oldest WSE has been tested with, is skipped.
 
 ``CodexCLIAdapter.test_double(strategy)`` runs
 ``wse.agent_adapters.codex_test_double`` instead of Codex: a toolchain check
@@ -129,6 +132,7 @@ import json
 import logging
 import math
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -162,6 +166,7 @@ __all__ = [
     "worker_arguments",
     "CODEX_PATH_ENV",
     "CODEX_TEAM_IDENTIFIER",
+    "MIN_CODEX_VERSION",
     "PROFILE_NAME",
     "PROXY_TOKEN_ENV",
     "RUN_MARKER_ENV",
@@ -171,6 +176,8 @@ __all__ = [
     "PythonAccess",
     "codex_config",
     "find_codex",
+    "npm_native_binary",
+    "npm_target",
     "parse_mcp_result",
     "python_access",
     "skill_text",
@@ -208,6 +215,16 @@ MESSAGE_EXCERPT_CHARS = 2000
 ERROR_PREFIX = "Error executing tool "
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 VSCODE_EXTENSION_DIRS = ("~/.vscode/extensions", "~/.vscode-insiders/extensions")
+MIN_CODEX_VERSION = (0, 167, 0)  # the oldest codex-cli release that WSE's configuration has been tested with
+NPM_PACKAGE = "@openai/codex"
+# The platform package and target triple of OpenAI's npm launcher (bin/codex.js) for (sys.platform, machine).
+NPM_TARGETS = {
+    ("darwin", "arm64"): ("codex-darwin-arm64", "aarch64-apple-darwin"),
+    ("darwin", "x86_64"): ("codex-darwin-x64", "x86_64-apple-darwin"),
+    ("linux", "x86_64"): ("codex-linux-x64", "x86_64-unknown-linux-musl"),
+    ("linux", "aarch64"): ("codex-linux-arm64", "aarch64-unknown-linux-musl"),
+    ("linux", "arm64"): ("codex-linux-arm64", "aarch64-unknown-linux-musl"),
+}
 # Codex features that a WSE run does not use; each would add tools, context, or network access.
 DISABLED_FEATURES = ("apps", "browser_use", "computer_use", "goals", "hooks", "image_generation", "in_app_browser",
                      "memories", "multi_agent", "plugins", "remote_plugin", "shell_snapshot", "tool_suggest",
@@ -267,6 +284,57 @@ def codex_candidates() -> list[tuple[str, Path]]:
     return found
 
 
+def npm_target() -> tuple[str, str] | None:
+    """``(platform package, target triple)`` that OpenAI's npm launcher uses on this machine, or ``None``."""
+    system = "linux" if sys.platform.startswith("linux") else sys.platform
+    return NPM_TARGETS.get((system, platform.machine().lower()))
+
+
+def _npm_package(launcher: Path) -> Path | None:
+    """The ``@openai/codex`` package whose launcher script ``bin/codex.js`` is ``launcher``, or ``None``."""
+    if launcher.name != "codex.js" or launcher.parent.name != "bin":
+        return None
+    package = launcher.parent.parent
+    try:
+        name = json.loads((package / "package.json").read_text(encoding="utf-8")).get("name")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return package if name == NPM_PACKAGE else None
+
+
+def npm_native_binary(launcher: Path) -> Path | None:
+    """The native binary that the npm launcher ``launcher`` starts, found where the launcher looks for it.
+
+    The launcher resolves the platform package (``@openai/codex-darwin-arm64``
+    and so on) from its own package's ``node_modules``, then from the
+    directory that holds its package (an install that hoists the dependency),
+    and falls back to its package's own ``vendor`` directory; the binary is
+    ``vendor/<target triple>/bin/codex`` there. Nothing is executed.
+    """
+    package, target = _npm_package(launcher), npm_target()
+    if package is None or target is None:
+        return None
+    platform_package, triple = target
+    for vendor in (package / "node_modules" / "@openai" / platform_package / "vendor",
+                   package.parent / platform_package / "vendor",
+                   package / "vendor"):
+        binary = vendor / triple / "bin" / "codex"
+        if binary.is_file():
+            return binary
+    return None
+
+
+def _version_problem(version: str | None) -> str | None:
+    """Why ``codex --version``'s output rules the binary out, or ``None`` when its release is recent enough."""
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", version or "")
+    if match is None:
+        return "its version could not be read (codex --version)"
+    if tuple(int(part) for part in match.groups()) < MIN_CODEX_VERSION:
+        oldest = ".".join(str(part) for part in MIN_CODEX_VERSION)
+        return f"{version} is older than {oldest}, the oldest codex-cli release WSE has been tested with"
+    return None
+
+
 def code_signature(path: Path) -> tuple[str | None, str | None]:
     """``(team_identifier, problem)`` of a macOS code signature; ``problem`` is ``None`` when it verifies."""
     codesign = "/usr/bin/codesign"
@@ -299,10 +367,12 @@ def _codex_version(path: Path) -> str | None:
 def find_codex(explicit: str | os.PathLike[str] | None = None, *, verify: bool | None = None) -> CodexBinary:
     """The Codex binary to run: ``explicit``, else ``WSE_CODEX_PATH``, else the search of ``codex_candidates``.
 
-    On macOS (``verify`` defaults to ``sys.platform == "darwin"``) a binary is
-    accepted only when its code signature verifies and names OpenAI's Team ID;
-    a searched candidate that fails is skipped, a named one is an error.
-    Nothing is executed before it is verified.
+    An npm launcher script is replaced by the native binary it starts
+    (``npm_native_binary``). On macOS (``verify`` defaults to
+    ``sys.platform == "darwin"``) a binary is accepted only when its code
+    signature verifies and names OpenAI's Team ID; nothing is executed before
+    that. Then ``codex --version`` must report ``MIN_CODEX_VERSION`` or later.
+    A searched candidate that fails is skipped, a named one is an error.
     """
     verify = sys.platform == "darwin" if verify is None else verify
     named = explicit if explicit is not None else os.environ.get(CODEX_PATH_ENV) or None
@@ -311,6 +381,13 @@ def find_codex(explicit: str | os.PathLike[str] | None = None, *, verify: bool |
     rejected: list[str] = []
     for source, candidate in candidates:
         path = candidate.resolve() if candidate.exists() else candidate
+        if _npm_package(path) is not None:
+            native = npm_native_binary(path)
+            if native is None:
+                rejected.append(f"{candidate} ({source}): the npm launcher of {NPM_PACKAGE} without its native binary "
+                                f"for this platform; reinstall with npm install -g {NPM_PACKAGE}")
+                continue
+            path = native.resolve()
         if not (path.is_file() and os.access(path, os.X_OK)):
             rejected.append(f"{candidate} ({source}): not an executable file")
             continue
@@ -320,12 +397,18 @@ def find_codex(explicit: str | os.PathLike[str] | None = None, *, verify: bool |
             if problem is not None:
                 rejected.append(f"{candidate} ({source}): {problem}")
                 continue
-        return CodexBinary(command=(str(path),), source=source, path=str(path), version=_codex_version(path),
+        version = _codex_version(path)
+        problem = _version_problem(version)
+        if problem is not None:
+            rejected.append(f"{candidate} ({source}): {problem}")
+            continue
+        return CodexBinary(command=(str(path),), source=source, path=str(path), version=version,
                            team_identifier=team)
     where = "; ".join(rejected) if rejected else "no codex binary on PATH or in the VS Code extension bundles"
+    oldest = ".".join(str(part) for part in MIN_CODEX_VERSION)
     raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY,
-                   f"no usable Codex CLI: {where}. Install OpenAI's Codex CLI or VS Code extension, or set "
-                   f"{CODEX_PATH_ENV} to a codex binary"
+                   f"no usable Codex CLI: {where}. Install OpenAI's Codex CLI {oldest} or later "
+                   f"(npm install -g {NPM_PACKAGE}) or VS Code extension, or set {CODEX_PATH_ENV} to a codex binary"
                    + (f" signed by OpenAI (Team ID {CODEX_TEAM_IDENTIFIER})" if verify else ""),
                    details={"rejected": rejected[:16]})
 

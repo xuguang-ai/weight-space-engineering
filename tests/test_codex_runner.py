@@ -733,6 +733,70 @@ def test_an_unsigned_binary_is_refused_on_macos(tmp_path, monkeypatch):
         find_codex(tmp_path / "missing", verify=False)
 
 
+def _fake_codex(path: Path, version: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!/bin/sh\necho 'codex-cli {version}'\n")
+    path.chmod(0o755)
+    return path
+
+
+def _npm_install(prefix: Path, layout: str, version: str = "0.167.2") -> Path:
+    """A global npm install of ``@openai/codex`` as npm lays it out: ``bin/codex`` links to the launcher script."""
+    package = prefix / "lib" / "node_modules" / "@openai" / "codex"
+    (package / "bin").mkdir(parents=True)
+    (package / "package.json").write_text(json.dumps({"name": "@openai/codex", "version": version}))
+    launcher = package / "bin" / "codex.js"
+    launcher.write_text("#!/usr/bin/env node\n")
+    launcher.chmod(0o755)
+    (prefix / "bin").mkdir()
+    (prefix / "bin" / "codex").symlink_to(Path("..") / "lib" / "node_modules" / "@openai" / "codex" / "bin" / "codex.js")
+    target = codex_cli.npm_target()
+    if target is None:
+        pytest.skip("OpenAI's npm launcher has no native binary for this platform")
+    platform_package, triple = target
+    vendor = {"nested": package / "node_modules" / "@openai" / platform_package / "vendor",
+              "hoisted": package.parent / platform_package / "vendor",
+              "bundled": package / "vendor"}[layout]
+    return _fake_codex(vendor / triple / "bin" / "codex", version)
+
+
+@pytest.mark.parametrize("layout", ["nested", "hoisted", "bundled"])
+def test_an_npm_install_runs_the_native_binary_that_its_launcher_starts(tmp_path, monkeypatch, layout):
+    """``npm install -g @openai/codex`` puts a Node script on PATH; WSE runs (and on macOS verifies) the binary it starts."""
+    native = _npm_install(tmp_path / "npm", layout)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PATH", f"{tmp_path / 'npm' / 'bin'}:/usr/bin:/bin")
+    monkeypatch.delenv(codex_cli.CODEX_PATH_ENV, raising=False)
+    binary = find_codex(verify=False)
+    assert binary.command == (str(native.resolve()),) and binary.source == "PATH"
+    assert binary.version == "codex-cli 0.167.2"
+    named = find_codex(tmp_path / "npm" / "bin" / "codex", verify=False)  # WSE_CODEX_PATH may name the launcher too
+    assert named.command == (str(native.resolve()),)
+
+
+def test_an_npm_launcher_without_its_native_binary_is_refused(tmp_path, monkeypatch):
+    native = _npm_install(tmp_path / "npm", "nested")
+    native.unlink()
+    with pytest.raises(codex_cli.WSEError, match="npm launcher.*native binary"):
+        find_codex(tmp_path / "npm" / "bin" / "codex", verify=False)
+
+
+def test_codex_older_than_the_tested_version_is_skipped(tmp_path, monkeypatch):
+    """An old Codex on PATH does not shadow a current one further on; a named old one is an error."""
+    old = _fake_codex(tmp_path / "old" / "codex", "0.138.0")
+    current = _fake_codex(tmp_path / "current" / "codex", "0.167.0-alpha.4.1")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("PATH", f"{old.parent}:{current.parent}:/usr/bin:/bin")
+    monkeypatch.delenv(codex_cli.CODEX_PATH_ENV, raising=False)
+    assert find_codex(verify=False).command == (str(current.resolve()),)
+    with pytest.raises(codex_cli.WSEError, match=r"codex-cli 0\.138\.0 is older than 0\.167\.0"):
+        find_codex(old, verify=False)
+    silent = _fake_codex(tmp_path / "silent" / "codex", "")
+    silent.write_text("#!/bin/sh\nexit 3\n")
+    with pytest.raises(codex_cli.WSEError, match="version could not be read"):
+        find_codex(silent, verify=False)
+
+
 def test_the_search_prefers_path_then_the_newest_extension_bundle(tmp_path, monkeypatch):
     home = tmp_path / "home"
     for version in ("26.1007.21434", "26.1106.51428", "26.1021.22027"):
