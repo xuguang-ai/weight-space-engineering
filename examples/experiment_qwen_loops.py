@@ -85,6 +85,8 @@ result = experiment.run(
     wall_clock_hours=args.wall_clock_hours,
 )
 print(result.summary())
+if not result.agent_started:  # nothing to test: the test set stays unused for a run that can use it
+    raise SystemExit(f"The agent never started: {result.ending['reason']}")
 selected = result.model
 if selected.checkpoint_id == original.checkpoint_id:
     print("No candidate met the selection rule; the original model is kept.")

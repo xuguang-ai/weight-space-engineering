@@ -1670,14 +1670,16 @@ class Engine:
         """Freeze the selected checkpoint once no job or reservation is outstanding (operator only)."""
         return self.experiments.freeze(experiment_id, expected_selected_id)
 
-    def final_evaluate(self, experiment_id: str, checkpoint_id: str | None = None) -> FinalEvaluationReport:
+    def final_evaluate(self, experiment_id: str, checkpoint_id: str | None = None, *,
+                       device: str | None = None) -> FinalEvaluationReport:
         """Evaluate the frozen candidate and the base-checkpoint control on the final set, then close (operator only).
 
         ``checkpoint_id``, when given, must be the frozen selection: final
         evaluation accepts no other checkpoint. A generation task's final
-        suite runs on the host's engine device (``mps`` when available).
+        suite runs on ``device``, by default the host's engine device (``mps``
+        when available).
         """
-        return self.evaluation.final_evaluate(experiment_id, checkpoint_id)
+        return self.evaluation.final_evaluate(experiment_id, checkpoint_id, device=device)
 
     def get_final_report(self, experiment_id: str) -> FinalEvaluationReport:
         """The sealed final report of a closed experiment."""

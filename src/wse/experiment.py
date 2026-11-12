@@ -32,13 +32,18 @@ registry, and MCP stay internal.
 run alone), builds a policy from ``max_evaluations`` and the data (other
 limits take the defaults of ``experiment_policy``, which the result
 records), grants a run, and runs the agent through the reference runner:
-the base checkpoint is evaluated first (``max_evaluations`` counts it, and
-an identical earlier evaluation in the workspace is reused when the engine
-supports it), the agent works through the run's MCP server, and when it
+the base checkpoint is evaluated first (``max_evaluations`` counts it; an
+identical earlier evaluation of the same model and development data in the
+workspace is linked instead, ``wse.checkpoint_evaluation``), the agent works
+through the run's MCP server, and when it
 stops the runner applies the selection rule (``wse.selection``) and freezes
 the choice, the original model when no candidate qualifies. The protocol
 (examples, prompts, sampling, seeds, token limit, grader) is fixed by the
-suite: the agent cannot change it.
+suite: the agent cannot change it. Before anything is registered, ``run``
+checks that the agent and the sandbox can start (``_preflight``: the Codex
+binary and its signature, ``OPENAI_BASE_URL`` and ``OPENAI_API_KEY``, and
+macOS's ``sandbox-exec`` for ``sandbox="python"``), so a missing
+prerequisite costs no evaluation.
 
 **After the run.** ``ExperimentResult.summary`` reports the behavior change,
 every candidate (where it changed the weights, its development metrics,
@@ -46,9 +51,13 @@ whether the rule kept it, and why), and then the audit details.
 ``ExperimentResult.model`` is the frozen choice as a ``Model``.
 ``ExperimentResult.test`` evaluates only the frozen choice and the original
 model, on test data registered at that moment as the run's final suite
-(rejected if it overlaps the development data); the agent never had a path
-to it. The same request returns the stored report; a different test set
-needs a new run. ``ExperimentResult.export`` writes the exact patches, the
+(rejected, and not stored, if it overlaps development data); the agent's
+sandbox cannot read the workspace where it is stored. When an earlier run of
+the workspace already registered the same test set, it was on disk during
+this run, and the report says so (``TestReport.previously_registered``).
+The same request returns the stored report; a different test set needs a
+new run; a run whose agent never started is not tested
+(``ExperimentResult.agent_started``). ``ExperimentResult.export`` writes the exact patches, the
 reports, the agent's trace and code records, the selected model, and the
 summary. ``ExperimentResult.open`` reopens a finished experiment from its
 workspace.
@@ -169,6 +178,36 @@ def parse_agent(agent: str, *, max_turns: int | None = None, wall_clock_seconds:
 
 
 
+def _preflight(config: Any, sandbox: str | None) -> None:
+    """Refuse, before anything is registered or evaluated, a run whose agent or sandbox cannot start."""
+    import os
+
+    from wse.agent_adapters.base import AgentConfig
+    from wse.runner import TEST_DOUBLE_PREFIX
+
+    if sandbox is not None:
+        from wse.sandbox import available
+
+        usable, why = available()
+        if not usable:
+            raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY, f"sandbox='python' cannot run here: {why}; run with "
+                           "sandbox=None, or on macOS")
+    if not isinstance(config, AgentConfig) or config.model.startswith(TEST_DOUBLE_PREFIX):
+        return
+    from wse.agent_adapters.codex_cli import find_codex
+    from wse.model_proxy import _checked_key, _checked_upstream
+
+    find_codex()  # the binary, verified (on macOS, OpenAI's signature) before it ever runs
+    missing = [name for name in ("OPENAI_BASE_URL", "OPENAI_API_KEY") if not os.environ.get(name)]
+    if missing:
+        raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY,
+                       f"the Codex agent reaches its model through WSE's local proxy, which needs {' and '.join(missing)} "
+                       "in this process's environment, for example with `uv run --env-file .env`",
+                       details={"missing": missing})
+    _checked_upstream(os.environ["OPENAI_BASE_URL"])
+    _checked_key(os.environ["OPENAI_API_KEY"])
+
+
 # ---------------------------------------------------------------------------
 # Experiment
 # ---------------------------------------------------------------------------
@@ -250,12 +289,19 @@ class Experiment:
         lets the agent run its own Python on the run's inputs (the run is then
         unverified); ``max_evaluations`` counts the baseline; ``max_turns``
         and ``wall_clock_hours`` bound the agent (defaults 400 turns and 12
-        hours, its waits for evaluations included); ``device`` is the worker's engine device (default: MPS when
+        hours, its waits for evaluations included); ``device`` is the engine
+        device of the run's evaluations and of ``test`` (default: MPS when
         available); ``out_dir`` receives the runner's logs (default
-        ``<workspace>/experiments/<run_id>``).
+        ``<workspace>/experiments/<run_id>``). The agent and the sandbox are
+        checked before anything is loaded or registered (``_preflight``).
+        When the run raises, the error names the experiment, which
+        ``ExperimentResult.open`` reopens.
         """
         from wse.runner import ReferenceRunner
 
+        config = parse_agent(agent, max_turns=max_turns if max_turns is not None else DEFAULT_MAX_TURNS,
+                             wall_clock_seconds=3600.0 * (wall_clock_hours or DEFAULT_WALL_CLOCK_HOURS))
+        _preflight(config, sandbox)
         model = self.model
         engine = model.engine
         data, count = self._development_data()
@@ -287,30 +333,35 @@ class Experiment:
             "output_description": "Reasoning, then the final answer within \\boxed{}.",
             "objective": {"task_id": task_id,
                           "description": (f"{'Lower' if self.rule.minimize else 'Raise'} the development {target}"
-                                          + (f" while keeping {', '.join(self.rule.preserve)} at least at the "
-                                             "baseline's" if self.rule.preserve else "") + "."),
+                                          + (", with " + " and ".join(f"{name} no worse than the baseline's"
+                                                                      for name in self.rule.preserve)
+                                             if self.rule.preserve else "") + "."),
                           "gates": gates, "selection": self.rule.model_dump(mode="json")},
             "development_suite_id": suite_id, "development_examples": count})
         grant = engine.grant_run(task_id, policy.policy_id, model.checkpoint_id)
-        config = parse_agent(agent, max_turns=max_turns if max_turns is not None else DEFAULT_MAX_TURNS,
-                             wall_clock_seconds=3600.0 * (wall_clock_hours or DEFAULT_WALL_CLOCK_HOURS))
         root = Path(engine.store.workspace)
         out = (Path(out_dir).expanduser() if out_dir is not None else root / "experiments" / grant.run_id).resolve()
         runner = ReferenceRunner(root, registry=engine.registry, log_dir=out / "logs", baseline=True,
                                  worker_args=["--device", device] if device else ())
         try:
             runner.run_experiment(grant.run_id, task_id, policy.policy_id, config)
+        except BaseException as exc:
+            if runner.last_experiment_id is not None:
+                exc.add_note(f"WSE experiment {runner.last_experiment_id} (workspace {root}); reopen it with "
+                             f"ExperimentResult.open({runner.last_experiment_id!r}, workspace={str(root)!r})")
+            raise
         finally:
             if runner.last_experiment_id is not None:
                 (out / "experiment.json").parent.mkdir(parents=True, exist_ok=True)
                 (out / "experiment.json").write_text(json.dumps({
                     "experiment_id": runner.last_experiment_id, "run_id": grant.run_id, "task_id": task_id,
                     "suite_id": suite_id, "policy_id": policy.policy_id, "agent": agent, "sandbox": sandbox,
-                    "max_evaluations": max_evaluations, "dev": str(self.dev), "workspace": str(root)},
+                    "max_evaluations": max_evaluations, "dev": str(self.dev), "workspace": str(root),
+                    "device": device},
                     indent=2, sort_keys=True) + "\n", encoding="utf-8")
         if runner.last_experiment_id is None:  # pragma: no cover - run_experiment raises before an experiment exists
             raise WSEError(ErrorCode.WORKER_FAILED, "the run ended before its experiment existed")
-        return ExperimentResult(model, runner.last_experiment_id, out_dir=out)
+        return ExperimentResult(model, runner.last_experiment_id, out_dir=out, device=device)
 
 
 # ---------------------------------------------------------------------------
@@ -326,12 +377,15 @@ class TestReport:
 
     report: Any
     data: Path | None = None
+    previously_registered: tuple[dict[str, Any], ...] = ()
 
     def compare(self) -> str:
         """The original and the selected model on the test data: each metric, the difference, and its interval.
 
         Accuracy's interval is the paired 95% interval of the difference; the
-        other metrics give each model's own 95% interval.
+        other metrics give each model's own 95% interval. When an earlier run
+        of the workspace registered the same test data before this run was
+        frozen (``previously_registered``), a last line says so.
         """
         report = self.report
         selected, original, paired = report.candidate, report.control, report.comparison
@@ -352,20 +406,27 @@ class TestReport:
                                      for label, b in zip(("original", "selected"), bounds) if b is not None)
             lines.append(f"{name:<24}{before:>10.{digits}f}{after:>10.{digits}f}   {after - before:+.{digits}f} "
                          f"{interval}")
+        if self.previously_registered:
+            first = self.previously_registered[0]
+            lines.append(f"note: this test data was registered before this run was frozen, as {first['suite_id']} "
+                         f"at {first['registered_at']}, so it was on disk, outside the agent's sandbox, during the run")
         return "\n".join(lines)
 
 
 class ExperimentResult:
     """A frozen experiment of a run (module docstring): ``summary``, ``model``, ``test``, and ``export``."""
 
-    def __init__(self, original: Model, experiment_id: str, *, out_dir: Path | None = None) -> None:
+    def __init__(self, original: Model, experiment_id: str, *, out_dir: Path | None = None,
+                 device: str | None = None) -> None:
         self.original = original
         self.experiment_id = experiment_id
         self.out_dir = out_dir
+        self.device = device  # the run's engine device, which test() uses by default
+        self._selected: Model | None = None
 
     @classmethod
     def open(cls, experiment_id: str, *, workspace: str | Path) -> ExperimentResult:
-        """Reopen a finished experiment of ``workspace``."""
+        """Reopen a finished experiment of ``workspace``, for example after ``Experiment.run`` raised."""
         from wse.api import Engine
 
         with Engine(workspace) as engine:
@@ -390,11 +451,35 @@ class ExperimentResult:
 
     @property
     def model(self) -> Model:
-        """The frozen choice as a ``Model``: a candidate the rule kept, or the original model."""
+        """The frozen choice as a ``Model``: a candidate the rule kept, or the original model.
+
+        It shares the original's workspace and is opened once: closing it
+        closes nothing, also when it is the original model's checkpoint.
+        """
         selected = self.selected_checkpoint_id
-        if selected == self.original.checkpoint_id:
-            return self.original
-        return Model._open(self.engine, selected)
+        if self._selected is None or self._selected.checkpoint_id != selected:
+            self._selected = self.original._sibling(selected)
+        return self._selected
+
+    @property
+    def ending(self) -> dict[str, Any]:
+        """How the controller's run ended: ``kind``, ``status``, ``reason``, ``stop_condition``, ``requests``, ``tool_calls``.
+
+        ``requests`` counts an agent's model requests (a strategy's steps).
+        """
+        record = self._controller()
+        result = record.get("result") or {}
+        return {"kind": record.get("kind"), "status": result.get("status"), "reason": result.get("reason"),
+                "stop_condition": result.get("stop_condition"), "requests": result.get("turns"),
+                "tool_calls": result.get("tool_calls")}
+
+    @property
+    def agent_started(self) -> bool:
+        """Whether the controller worked: a strategy that ran, or an agent that made at least one model request."""
+        ending = self.ending
+        if ending["status"] is None:
+            return False
+        return ending["kind"] != "agent" or bool(ending["requests"])
 
     def _controller(self) -> dict[str, Any]:
         from wse.audit import controller_record
@@ -498,14 +583,18 @@ class ExperimentResult:
         return [c.checkpoint_id for c in self.engine.list_experiment_checkpoints(self.experiment_id)
                 if c.role == "candidate" and c.checkpoint_id not in judged]
 
-    def test(self, data: str | Path) -> TestReport:
+    def test(self, data: str | Path, *, device: str | None = None) -> TestReport:
         """Evaluate the frozen choice and the original model on independent test data (module docstring).
 
         The data is registered now, as this run's final suite, with the
         development suite's protocol and grader (the evaluator reads its
-        format); a test set that shares a problem with the development data
-        is refused. The same request again returns the stored report; another
-        test set for the same run is refused.
+        format). A test set that shares a problem with any development data
+        of the workspace is refused and not stored. The same request again
+        returns the stored report; another test set for the same run is
+        refused; a run whose agent never started (``agent_started``) is
+        refused, since its test would compare the original with itself and
+        use up the test set. ``device`` is the engine device (default: the
+        run's, else MPS when available).
         """
         from wse.evaluators.text_suites import read_jsonl
 
@@ -513,12 +602,17 @@ class ExperimentResult:
         experiment = engine.get_experiment(eid)
         if experiment.state == "OPEN":
             raise WSEError(ErrorCode.VERSION_CONFLICT, "the experiment is still open; test it after its run froze it")
+        if not self.agent_started:
+            ending = self.ending
+            raise WSEError(ErrorCode.VERSION_CONFLICT,
+                           f"the agent never started ({ending['status']}: {str(ending['reason'])[:300]}); a test would "
+                           "only compare the original model with itself and use up this test set. Fix the cause and "
+                           "start a new run", details={"status": ending["status"]})
         path = Path(data).expanduser()
         task = engine.get_task(experiment.task_id)
         development = engine.get_suite(task.development_suite_id)
-        test_format = _evaluation_format(path, "math", None)
+        test_format = _evaluation_format(path, self._evaluator(), None)
         items, _ = read_jsonl(path, format=test_format, id_prefix="test_")
-        dataset = engine.register_dataset(items)
         suite_id = f"{experiment.task_id.removesuffix('_task')}_test"
         try:
             existing = engine.evaluation.final_suite(experiment.task_id)
@@ -526,19 +620,43 @@ class ExperimentResult:
             if exc.code != ErrorCode.NOT_FOUND:
                 raise
             existing = None
-        if existing is not None and existing.dataset.data_hash != dataset.data_hash:
+        if existing is not None and existing.dataset.data_hash != items.data_hash:
             raise WSEError(ErrorCode.VERSION_CONFLICT, "this run was tested on other data; a new test set needs a new "
                            "run", details={"tested_data_hash": existing.dataset.data_hash})
+        earlier = self._earlier_registrations(items.data_hash, experiment)
         if existing is None:
+            stored_before = engine.datasets.exists(items.data_hash)
+            dataset = engine.register_dataset(items)
             parameters = dict(development.parameters)
             parameters["grader"] = GRADERS[test_format]
-            engine.register_suite({
-                "suite_id": suite_id, "task_id": experiment.task_id, "split": "final",
-                "evaluator": development.evaluator, "parameters": parameters,
-                "sample_counts": [len(items.items)], "seeds": [development.seeds[0]],
-                "dataset": dataset.model_dump(mode="json")})
-        report = engine.final_evaluate(eid)
-        return TestReport(report=report, data=path)
+            try:
+                engine.register_suite({
+                    "suite_id": suite_id, "task_id": experiment.task_id, "split": "final",
+                    "evaluator": development.evaluator, "parameters": parameters,
+                    "sample_counts": [len(items.items)], "seeds": [development.seeds[0]],
+                    "dataset": dataset.model_dump(mode="json")})
+            except BaseException:
+                if not stored_before:  # a refused test set leaves nothing in the workspace
+                    engine.datasets.discard(items.data_hash)
+                raise
+        report = engine.final_evaluate(eid, device=device or self.device)
+        return TestReport(report=report, data=path, previously_registered=earlier)
+
+    def _evaluator(self) -> str:
+        """The evaluator name of the run's development data (``math``, today the only one)."""
+        return "math"
+
+    def _earlier_registrations(self, data_hash: str, experiment: Any) -> tuple[dict[str, Any], ...]:
+        """Suites of other tasks that hold the same data and were registered before this experiment was frozen."""
+        from wse.database import utc_now
+
+        frozen_at = experiment.frozen_at or utc_now()
+        rows = self.engine.store.db.conn.execute(
+            "SELECT suite_id, task_id, split, created_at FROM suites WHERE task_id != ? "
+            "AND json_extract(suite_json, '$.dataset.data_hash') = ? AND created_at <= ? ORDER BY created_at",
+            (experiment.task_id, data_hash, frozen_at)).fetchall()
+        return tuple({"suite_id": row["suite_id"], "task_id": row["task_id"], "split": row["split"],
+                      "registered_at": row["created_at"]} for row in rows)
 
     def export(self, path: str | Path) -> Path:
         """Write the experiment's record, the selected model, and the summary into ``path`` (new or empty).

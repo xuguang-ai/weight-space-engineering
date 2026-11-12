@@ -92,6 +92,12 @@ class DatasetStore:
             self._write(self._path(manifest.data_hash, ".generation.json"), canonical_json(dict(generation)))
         return manifest
 
+    def discard(self, data_hash: str) -> None:
+        """Remove a stored dataset and its generation record (operator only), for a registration that failed."""
+        self._require_open("removing evaluation data")
+        for path in (self._path(data_hash), self._path(data_hash, ".generation.json")):
+            path.unlink(missing_ok=True)
+
     def exists(self, data_hash: str) -> bool:
         self._require_open("reading evaluation data")
         return self._path(data_hash).is_file()

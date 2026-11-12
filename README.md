@@ -47,7 +47,7 @@ result.export("artifacts/fix-loops")
 <details>
 <summary>What the same calls printed on Qwen3-0.6B (examples/experiment_quickstart.py, 2026-11-12)</summary>
 
-`result.summary()`, as this version prints it for that run (two of the seven candidates shown):
+`result.summary()` for that run, as this version prints it after the test (so the state reads CLOSED; at the end of `run` it reads FROZEN and ends with the path of the run's logs), with two of the seven candidates shown:
 
 ```text
 Experiment exp_0a0f8280e629ba70fdab1083806fcdee (CLOSED): Reduce repetitive reasoning so the model finishes more math answers.
@@ -403,7 +403,7 @@ An LLM agent, `gpt-5.6-luna` through the OpenAI Agents SDK runner that WSE used 
 
 ### An agent edits a small language model
 
-Through `Experiment`, Codex with `gpt-5.6-luna` worked on Qwen3-0.6B's answers to 16 GSM8K training problems at 1,024 new tokens, to cut fewer answers off at the limit without losing accuracy ([examples/experiment_quickstart.py](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/experiment_quickstart.py)). In 13 minutes it probed the residual stream, computed 8 candidates in Python, each scaling down 32 to 128 entries of the final RMSNorm weight, evaluated 7, and stopped itself. WSE's rule chose the one that halves 64 entries: on the development problems 5 → 7 correct and 10 → 7 cut off. On 16 GSM8K test problems registered after the freeze it did not help: 4 → 3 correct and 11 → 12 cut off (accuracy difference −0.062 [−0.188, +0.000]). The run shows the whole path working with a live agent, not an edit that generalizes ([the run](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/results.md#6-a-live-llm-agent-edits-a-language-model-through-experiment)).
+Through `Experiment`, Codex with `gpt-5.6-luna` worked on Qwen3-0.6B's answers to 16 GSM8K training problems at 1,024 new tokens, to cut fewer answers off at the limit without losing accuracy ([examples/experiment_quickstart.py](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/experiment_quickstart.py)). In 13 minutes it probed the residual stream, computed 8 candidates in Python, each scaling down 32 to 128 entries of the final RMSNorm weight (one also scaled layer 27's input norm), evaluated 7, and stopped itself. WSE's rule chose the one that halves 64 entries: on the development problems 5 → 7 correct and 10 → 7 cut off. On 16 GSM8K test problems, none of which appears in anything the agent was sent or wrote, it did not help: 4 → 3 correct and 11 → 12 cut off (accuracy difference −0.062 [−0.188, +0.000]). The run shows the whole path working with a live agent, not an edit that generalizes ([the run](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/results.md#6-a-live-llm-agent-edits-a-language-model-through-experiment)).
 
 ### What has been demonstrated
 

@@ -713,6 +713,14 @@ class Model:
     def _child(self, handle: ModelHandle, checkpoint_id: str | None) -> Model:
         return Model(self._engine, handle, self.files, checkpoint_id=checkpoint_id, owner=self._owner or self)
 
+    def _sibling(self, checkpoint_id: str) -> Model:
+        """Another stored checkpoint of this workspace, sharing this model's workspace: closing it closes nothing."""
+        engine = self.engine
+        manifest = engine.load_manifest(checkpoint_id)
+        files = engine.model_files(checkpoint_id) if manifest.source is not None else {}
+        return Model(engine, engine.open_checkpoint(checkpoint_id), files, checkpoint_id=checkpoint_id,
+                     owner=self._owner or self)
+
     def close(self) -> None:
         """Free this model's device copies and, if this object opened the workspace, close it.
 

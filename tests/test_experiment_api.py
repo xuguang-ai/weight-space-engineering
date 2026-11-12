@@ -205,3 +205,150 @@ def test_a_second_run_on_the_same_data_reuses_the_baseline_on_the_workers_device
     text = render_instructions(task, policy, experiment_id=second.experiment_id, tools=["wse_evaluate"],
                                baseline={"report_id": baseline.report_id, "metrics": dict(baseline.metrics)})
     assert "wse_evaluate on the original model returns this report without charging again" in text
+
+
+# -- preflight, endings, and the review's other cases ------------------------------------------------------------
+
+
+def _counts(engine) -> tuple[int, int, int]:
+    conn = engine.store.db.conn
+    return tuple(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                 for table in ("suites", "tasks", "experiments"))
+
+
+def test_a_run_that_cannot_start_its_agent_or_sandbox_is_refused_before_anything_runs(experiment_setup,
+                                                                                       monkeypatch) -> None:
+    import wse.sandbox
+
+    model, experiment, tmp_path = experiment_setup
+    before = _counts(model.engine)
+    monkeypatch.setenv("WSE_CODEX_PATH", str(tmp_path / "no-such-codex"))
+    with pytest.raises(WSEError) as caught:
+        experiment.run(agent="codex:some-model", sandbox=None, device="cpu")
+    assert caught.value.code == ErrorCode.UNSUPPORTED_CAPABILITY and "no-such-codex" in caught.value.message
+    monkeypatch.setattr(wse.sandbox, "available", lambda: (False, "this platform has no sandbox-exec"))
+    with pytest.raises(WSEError) as caught:
+        experiment.run(agent="strategy:experiment_check@1", sandbox="python", device="cpu")
+    assert caught.value.code == ErrorCode.UNSUPPORTED_CAPABILITY and "sandbox-exec" in caught.value.message
+    assert _counts(model.engine) == before  # no suite, task, or experiment was registered, nothing was evaluated
+
+
+def test_a_run_without_its_model_endpoint_is_refused_before_anything_runs(experiment_setup, monkeypatch) -> None:
+    from wse.agent_adapters.codex_cli import find_codex
+
+    try:
+        binary = find_codex()
+    except WSEError:
+        pytest.skip("needs a Codex CLI signed by OpenAI")
+    model, experiment, tmp_path = experiment_setup
+    monkeypatch.setenv("WSE_CODEX_PATH", binary.path)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://example.invalid/openai/v1")
+    before = _counts(model.engine)
+    with pytest.raises(WSEError) as caught:
+        experiment.run(agent="codex:some-model", sandbox=None, device="cpu")
+    assert caught.value.code == ErrorCode.UNSUPPORTED_CAPABILITY and "OPENAI_API_KEY" in caught.value.message
+    assert _counts(model.engine) == before
+
+
+def test_a_run_whose_agent_never_started_freezes_and_is_not_tested(experiment_setup, monkeypatch) -> None:
+    import wse.experiment
+
+    model, experiment, tmp_path = experiment_setup
+    monkeypatch.setattr(wse.experiment, "_preflight", lambda config, sandbox: None)  # past the checks on purpose
+    monkeypatch.setenv("WSE_CODEX_PATH", str(tmp_path / "no-such-codex"))
+    result = experiment.run(agent="codex:some-model", sandbox=None, max_evaluations=3, device="cpu")
+    assert result.state == "FROZEN" and not result.agent_started
+    assert result.ending["status"] == "connection_failed" and not result.ending["requests"]
+    test_data = tmp_path / "test.jsonl"
+    test_data.write_text("".join(json.dumps(row) + "\n" for row in TEST_ROWS), encoding="utf-8")
+    with pytest.raises(WSEError) as caught:
+        result.test(test_data)
+    assert caught.value.code == ErrorCode.VERSION_CONFLICT and "never started" in caught.value.message
+    task_id = model.engine.get_experiment(result.experiment_id).task_id
+    with pytest.raises(WSEError):
+        model.engine.evaluation.final_suite(task_id)  # nothing was registered
+
+
+def test_a_refused_test_set_is_not_stored_and_an_earlier_registration_is_reported(experiment_setup) -> None:
+    from wse import Experiment
+    from wse.evaluators.text_suites import read_jsonl
+
+    model, experiment, tmp_path = experiment_setup
+    first = experiment.run(agent="strategy:experiment_check@1", sandbox=None, max_evaluations=3, device="cpu")
+    overlapping = tmp_path / "overlap.jsonl"
+    overlapping.write_text("".join(json.dumps(row) + "\n" for row in ROWS[1:3]), encoding="utf-8")
+    refused, _ = read_jsonl(overlapping, format="math", id_prefix="test_")
+    with pytest.raises(WSEError):
+        first.test(overlapping)
+    assert not model.engine.datasets.exists(refused.data_hash)
+    test_data = tmp_path / "test.jsonl"
+    test_data.write_text("".join(json.dumps(row) + "\n" for row in TEST_ROWS), encoding="utf-8")
+    assert first.test(test_data, device="cpu").previously_registered == ()
+    again = Experiment(model, "Make the model finish more answers.", tmp_path / "dev.jsonl", evaluator="math",
+                       minimize="limit_hit_rate", preserve=["accuracy"], max_new_tokens=6, profile="qwen35think@1")
+    second = again.run(agent="strategy:experiment_check@1", sandbox=None, max_evaluations=3, device="cpu")
+    report = second.test(test_data)
+    [earlier] = report.previously_registered
+    assert earlier["task_id"] == model.engine.get_experiment(first.experiment_id).task_id
+    assert "registered before this run was frozen" in report.compare()
+    assert report.report.candidate.execution.device == "cpu"  # the run's device, not the host's default
+
+
+def test_under_a_rule_the_run_ends_when_no_evaluation_remains_and_the_instructions_agree(experiment_setup) -> None:
+    from wse.runner import allowed_tools, render_instructions
+
+    model, experiment, tmp_path = experiment_setup
+    result = experiment.run(agent="strategy:experiment_check@1", sandbox=None, max_evaluations=2, device="cpu")
+    assert result.ending["stop_condition"].startswith("no_evaluations")
+    engine = model.engine
+    task = engine.get_task(engine.get_experiment(result.experiment_id).task_id)
+    policy = engine.experiments.experiment_policy(result.experiment_id)
+    tools = [tool for tool in allowed_tools(policy) if tool != "wse_select_checkpoint"]
+    text = render_instructions(task, policy, experiment_id=result.experiment_id, tools=tools)
+    assert "wse_select_checkpoint" not in text and "consecutive evaluated candidates" not in text
+    assert "Acceptance:" not in text and "you do not select a checkpoint yourself" in text
+    assert "no development evaluation remains" in text
+
+
+def test_the_objective_says_no_worse_for_metrics_where_lower_is_better(hf_snapshots, tmp_path) -> None:
+    from wse import Experiment, Model
+
+    dev = tmp_path / "dev.jsonl"
+    dev.write_text("".join(json.dumps(row) + "\n" for row in ROWS[:4]), encoding="utf-8")
+    with Model.from_pretrained(hf_snapshots["llama_untied"], repo=REPO, revision=REVISION,
+                               workspace=tmp_path / "workspace") as model:
+        model.engine.registry.register("strategy", "experiment_check", "1", _OneCandidate)
+        experiment = Experiment(model, "Make answers right.", dev, evaluator="math", maximize="accuracy",
+                                preserve=["limit_hit_rate"], max_new_tokens=6, profile="qwen35think@1")
+        result = experiment.run(agent="strategy:experiment_check@1", sandbox=None, max_evaluations=2, device="cpu")
+        task = model.engine.get_task(model.engine.get_experiment(result.experiment_id).task_id)
+        assert task.objective.description == ("Raise the development accuracy, with limit_hit_rate no worse than the "
+                                               "baseline's.")
+
+
+def test_closing_the_selected_model_keeps_the_workspace_open(experiment_setup) -> None:
+    model, experiment, tmp_path = experiment_setup
+    result = experiment.run(agent="strategy:experiment_check@1", sandbox=None, max_evaluations=3, device="cpu")
+    chosen = result.model
+    assert chosen is result.model  # opened once
+    with chosen:
+        pass
+    assert result.summary().startswith(f"Experiment {result.experiment_id}")  # the workspace is still open
+
+
+def test_a_failure_before_the_agent_starts_still_freezes_and_names_the_experiment(experiment_setup,
+                                                                                    monkeypatch) -> None:
+    import wse.sandbox_runs
+
+    model, experiment, tmp_path = experiment_setup
+
+    def broken(service, experiment_id):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(wse.sandbox_runs, "refresh_inputs", broken)
+    with pytest.raises(OSError) as caught:
+        experiment.run(agent="strategy:experiment_check@1", sandbox="python", max_evaluations=3, device="cpu")
+    [note] = caught.value.__notes__
+    experiment_id = note.split()[2]
+    assert model.engine.get_experiment(experiment_id).state == "FROZEN" and "ExperimentResult.open" in note
