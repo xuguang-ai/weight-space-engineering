@@ -103,6 +103,7 @@ with `NOT_FOUND` and says to create the experiment first.
 | `wse_run_python` | `experiment_id` (optional), `code, idempotency_key` | One run of the code in the run's sandbox, only under a policy that grants it (below): its ending, exit code, times, bounded standard output and error, its output files with their hashes, and a pointer for each stored array. Charges one `sandbox_calls` and its wall-clock seconds to `sandbox_seconds`. |
 | `wse_preview_patch` | `experiment_id` (optional), `patch_spec, idempotency_key` | An immutable preview with `patch_id`; the selected checkpoint does not change. Each new preview charges one `patch_previews`, because its deltas reveal the base values of the edited region. |
 | `wse_apply_patch` | `experiment_id` (optional), `patch_id, idempotency_key` | The candidate's manifest; charges one `candidate_commits`. |
+| `wse_evaluate` | `experiment_id` (optional), `checkpoint_id, idempotency_key` | The checkpoint's whole development evaluation on the task's development suite, waited for in the server: the report summary (metrics with intervals, `report_id`) and, for a candidate, the paired comparison with the base checkpoint's report (below). Each checkpoint is evaluated once. |
 | `wse_submit_evaluation` | `experiment_id` (optional), `checkpoint_id, suite_id, eval_config, idempotency_key` | The queued job, returned immediately; development suites only. A generation suite's evaluation is a generation pass (below). |
 | `wse_get_job` | `experiment_id` (optional), `job_id, wait_seconds` (0 to the policy's `max_job_wait_seconds`, 10 when unset; the run's server publishes its cap in the schema) | The job; `wait_seconds` holds the call until the job is terminal or the wait expires. A succeeded evaluation carries its report summary (metrics, sample count, errors, `target_met`, report URI) inline and its `report_id`; a succeeded probe carries its summary and `result_uri`. |
 | `wse_get_report` | `experiment_id` (optional), `report_id` | A report of the experiment, within the inline-result limit (below); not charged. Final reports only after the experiment is closed. |
@@ -172,6 +173,56 @@ its JSON's size. The bounded results of the next section therefore measure
 both copies (`wse.policy.response_size`) against twice the inline-result
 limit (62 KiB under the default policies). M1 results fit whole and keep
 their M1 forms.
+
+### Whole evaluations in one call
+
+`wse_evaluate(experiment_id, checkpoint_id, idempotency_key)` evaluates one
+checkpoint on the task's development suite with the suite's full
+preregistered configuration: the task's `development_examples` as the
+sample count (the suite's largest sample count when that is not
+preregistered) and the suite's first seed. The agent names only the
+checkpoint; prompts, sampling, seeds, and grading are the suite's. The
+evaluation is the job `wse_submit_evaluation` would queue, with its checks
+and charges (on a generation suite, one generation pass of every problem),
+and the server waits for it outside its lock, at most the policy's
+`seconds_per_operation` and 15 s, so the agent makes one call instead of
+polling `wse_get_job`. The result, `CheckpointEvaluation`, holds `origin`,
+the job's `state`, `report` (metrics with their intervals, `report_id`,
+`target_met`), `usage`, and for a candidate the paired `comparison` with
+the base checkpoint's first report on the same suite and configuration
+(`base_report_id`; `compare_generation` for generation passes), or
+`comparison_unavailable` saying why there is none.
+
+A checkpoint is evaluated once. A request for a checkpoint that has a
+report on the suite at that configuration returns it (`origin`
+`existing_report`), however it was produced; a request for one whose
+evaluation is queued or running waits for that job (`existing_job`);
+neither creates a job or charges anything. A key repeats its original
+outcome (`new_job` for the request that queued the job), a failed or
+cancelled job included; a new key after a failure evaluates again and is
+charged again. When the call returns before the job ends (`state` `queued`
+or `running`), calling it again for the checkpoint keeps waiting.
+
+A wait that is interrupted leaves the job to the worker: the client's
+timeout cancels the request, which ends the wait in the server at once; a
+killed server's worker finishes the job it runs before it stops. A later
+`wse_evaluate` for the checkpoint, or `wse_get_job`, returns the result. The
+OpenAI Agents SDK abandons a call it stops without cancelling it, so the
+server's wait then ends when the runner's finalization cancels the job.
+
+Before a controller starts, the runner can give the experiment its base
+checkpoint's whole development report (`Engine.ensure_baseline`, operator
+only). When another experiment of the workspace holds a report that a job
+produced of the same model (the base's whole identity) on a development
+suite with the same content (data, evaluator, parameters), at the same
+sample count and seed, with this run's batch size and engine device and
+without errors, the report is linked instead of evaluating again: it
+becomes this experiment's report of its own suite, with a new ID,
+`reused_from` naming the source, and its generation outputs readable and
+probe-able by the run. The link is charged as the evaluation it stands for
+(the same passes or batches, examples, forward calls, and generated
+tokens) without compute seconds, so a policy's evaluation budget counts the
+baseline either way.
 
 ### Language-model tools
 

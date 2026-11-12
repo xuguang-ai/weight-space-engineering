@@ -67,6 +67,7 @@ No developer outside the project has added a method or a task yet, so the cost o
 | `highlevel.py` | `WSE`, one object per model for the four steps of an experiment |
 | `experiments.py`, `budget.py`, `policy.py` | The experiment state machine, atomic budget reservations, and policies |
 | `jobs.py`, `worker.py` | The job queue and the worker that runs jobs |
+| `checkpoint_evaluation.py` | A checkpoint's whole development evaluation, waited for in one call (`wse_evaluate`), and baselines reused across experiments |
 | `mcp_server.py` | The MCP tools, resources, and protocol mapping |
 | `runner.py`, `agent_runs.py` | The reference runner and the one-call experiment |
 | `registry.py` | Explicit, versioned extension registration |

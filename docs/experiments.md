@@ -87,6 +87,12 @@ Keep tool arguments and messages to brief hypotheses and observable evidence; do
 Available tools: wse_list_models, wse_get_experiment, wse_inspect_model, wse_read_tensor, wse_analyze, wse_preview_patch, wse_apply_patch, wse_submit_evaluation, wse_get_job, wse_get_report, wse_cancel_job, wse_compare, wse_select_checkpoint.
 ```
 
+Runs since then are also offered `wse_evaluate`, which evaluates a
+checkpoint on the whole development suite in one call and waits for the
+result ([protocol](protocol.md#whole-evaluations-in-one-call)); step 4
+begins with one sentence on it, and the tool list names it after
+`wse_apply_patch`.
+
 A stepwise strategy receives the same task, objective, budget, operations,
 and suites as its first observation ([Stepwise strategies](#stepwise-strategies)).
 
@@ -202,7 +208,7 @@ read, recorded, or passed to the WSE server.
 | --- | --- |
 | SDK loop | the SDK's own `Agent` and `Runner.run`; no second tool loop around it |
 | Tools | only the allow-listed WSE MCP tools (static tool filter); evaluation tools only when the policy permits evaluation; no hosted, shell, file, or code tools |
-| MCP connection | `MCPServerStdio` running `wse serve --run-id RUN` on the same workspace, started in the workspace directory with an allow-listed environment (`PATH`, `HOME`, locale, `TMPDIR`, `PYTHONPATH`, `VIRTUAL_ENV`; names that look like credentials are refused); `client_session_timeout_seconds` 30 |
+| MCP connection | `MCPServerStdio` running `wse serve --run-id RUN` on the same workspace, started in the workspace directory with an allow-listed environment (`PATH`, `HOME`, locale, `TMPDIR`, `PYTHONPATH`, `VIRTUAL_ENV`; names that look like credentials are refused); `client_session_timeout_seconds` 30, raised above the longest call the policy permits (`wse.runner.agent_session_timeout`: a `wse_evaluate` wait of up to the policy's `seconds_per_operation` and 15 s, a `wse_get_job` wait, or a sandbox call) |
 | Scheduler | the `wse serve` process owns the run's job scheduler (one worker); the runner starts none |
 | Turn limit | `max_turns=100`, always passed explicitly (the SDK default is 10) |
 | Wall clock | 900 s per trial, independent of WSE's 300 s computation budget |
