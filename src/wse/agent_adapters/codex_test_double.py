@@ -7,9 +7,10 @@ adapter's whole path runs without a model or the network:
 
 * it reads ``$CODEX_HOME/config.toml`` that the adapter wrote and starts the
   configured stdio MCP server (``mcp_servers.wse``: the run's ``wse serve``,
-  with its command, arguments, working directory, and environment), using
-  the legacy MCP handshake as Codex 0.167 does, and refuses a tool outside
-  ``enabled_tools``;
+  with its command, arguments, working directory, and environment) and
+  talks to it with a small JSON-RPC client of its own (the legacy MCP
+  handshake, as Codex 0.167 does; the MCP SDK stays in ``wse.mcp_server``
+  only), and refuses a tool outside ``enabled_tools``;
 * the model name ``wse-test-double:<strategy>@<version>`` names a registered
   stepwise strategy (resolved with the built-in registry and the server's
   ``--setup`` hooks), which chooses every tool call from the tool results so
@@ -29,9 +30,10 @@ adapter's whole path runs without a model or the network:
 stopping), ``fail_first`` (end the first segment with ``turn.failed``),
 ``hang`` (after the first call, wait for a signal: ``"sleep"``;
 ``"ignore-sigint"``, which ignores SIGINT; or ``"ignore-signals"``, which also
-ignores SIGTERM), ``request_seconds`` (the latency of each model request), ``grandchild`` (start a
-long-running process in a session of its own, to test that no process
-outlives the run), and ``no_rollout`` (keep no session record).
+ignores SIGTERM), ``request_seconds`` (the latency of each model
+request), ``grandchild`` (start a long-running process in a session of its
+own, to test that no process outlives the run), and ``no_rollout`` (keep no
+session record).
 """
 
 from __future__ import annotations
@@ -178,29 +180,100 @@ def next_action(strategy: Any, observations: list[dict[str, Any]]) -> Any:
     return strategy.next_action(objective, history, budget)
 
 
-async def drive(options: dict[str, Any], config: dict[str, Any], session: Session, behavior: dict[str, Any]) -> int:
-    from mcp import Client, StdioServerParameters
-    from mcp.client.stdio import stdio_client
+class StdioClient:
+    """A minimal MCP client over stdio (JSON-RPC 2.0, one message per line), as a host other than the SDK speaks it.
 
+    It performs the legacy ``initialize`` handshake (protocol 2025-06-18, as
+    Codex 0.167 does), lists tools, and calls them. The server runs in a
+    session of its own, as Codex starts it, and gets exactly the configured
+    environment.
+    """
+
+    PROTOCOL = "2025-06-18"
+
+    def __init__(self, server: dict[str, Any]) -> None:
+        self.server = server
+        self.process: asyncio.subprocess.Process | None = None
+        self.next_id = 0
+
+    async def start(self) -> set[str]:
+        self.process = await asyncio.create_subprocess_exec(
+            self.server["command"], *list(self.server.get("args") or []), cwd=self.server.get("cwd"),
+            env=dict(self.server.get("env") or {}), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=sys.stderr, start_new_session=True, limit=64 << 20)
+        await self.request("initialize", {"protocolVersion": self.PROTOCOL, "capabilities": {},
+                                          "clientInfo": {"name": "wse-codex-test-double", "version": "1"}})
+        await self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        names, cursor = set(), None
+        while True:
+            listed = await self.request("tools/list", {"cursor": cursor} if cursor else {})
+            names |= {tool["name"] for tool in listed.get("tools", [])}
+            cursor = listed.get("nextCursor")
+            if not cursor:
+                return names
+
+    async def send(self, message: dict[str, Any]) -> None:
+        assert self.process is not None and self.process.stdin is not None
+        self.process.stdin.write((json.dumps(message) + "\n").encode())
+        await self.process.stdin.drain()
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        assert self.process is not None and self.process.stdout is not None
+        self.next_id += 1
+        ident = self.next_id
+        await self.send({"jsonrpc": "2.0", "id": ident, "method": method, "params": params})
+        while True:
+            line = await self.process.stdout.readline()
+            if not line:
+                raise ConnectionError(f"the MCP server closed its output during {method}")
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if message.get("id") == ident and "method" not in message:
+                if "error" in message:
+                    raise ConnectionError(f"{method} failed: {message['error']}")
+                return message.get("result") or {}
+            if "method" in message and "id" in message:  # a request from the server: this host supports none
+                await self.send({"jsonrpc": "2.0", "id": message["id"],
+                                 "error": {"code": -32601, "message": "method not found"}})
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> tuple[str, bool, Any]:
+        """``(text, is_error, structured_content)`` of one tool call."""
+        result = await self.request("tools/call", {"name": name, "arguments": arguments})
+        text = "".join(str(part.get("text", "")) for part in result.get("content") or [] if isinstance(part, dict))
+        return text, bool(result.get("isError")), result.get("structuredContent")
+
+    async def close(self) -> None:
+        process, self.process = self.process, None
+        if process is None:
+            return
+        if process.stdin is not None:
+            process.stdin.close()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=10)
+        except TimeoutError:
+            process.kill()
+            await process.wait()
+
+
+async def drive(options: dict[str, Any], config: dict[str, Any], session: Session, behavior: dict[str, Any]) -> int:
     server = config["mcp_servers"]["wse"]
     enabled = set(server.get("enabled_tools") or [])
     strategy = strategy_for(options["model"], server)
-    params = StdioServerParameters(command=server["command"], args=list(server.get("args") or []),
-                                   env=dict(server.get("env") or {}), cwd=server.get("cwd"))
     record = not behavior.get("no_rollout")
     first_segment = session.segments == 1
+    client = StdioClient(server)
     try:
-        client_context = Client(stdio_client(params, errlog=sys.stderr), mode="legacy")
-        client = await client_context.__aenter__()
-        listed = {tool.name for tool in (await client.list_tools()).tools}
-    except Exception as exc:  # noqa: BLE001 - reported the way Codex reports a failed MCP start
-        print(f"Error: thread/start failed: required MCP servers failed to initialize: wse: {exc!r}",
-              file=sys.stderr)
-        return 1
-    try:
+        try:
+            listed = await client.start()
+        except Exception as exc:  # noqa: BLE001 - reported the way Codex reports a failed MCP start
+            print(f"Error: thread/start failed: required MCP servers failed to initialize: wse: {exc!r}",
+                  file=sys.stderr)
+            return 1
         return await converse(client, listed, enabled, strategy, options, session, behavior, first_segment, record)
     finally:
-        await client_context.__aexit__(None, None, None)
+        await client.close()
 
 
 async def converse(client: Any, listed: set[str], enabled: set[str], strategy: Any, options: dict[str, Any],
@@ -251,11 +324,9 @@ async def converse(client: Any, listed: set[str], enabled: set[str], strategy: A
             text, is_error = f"Error executing tool {action.tool}: unknown tool", True
             result = {"content": [{"type": "text", "text": text}], "structured_content": None}
         else:
-            outcome = await client.call_tool(action.tool, action.arguments)
-            text = "".join(getattr(part, "text", "") for part in outcome.content)
-            is_error = bool(outcome.is_error)
+            text, is_error, structured = await client.call_tool(action.tool, action.arguments)
             result = {"content": [{"type": "text", "text": text}],
-                      "structured_content": None if is_error else outcome.structured_content}
+                      "structured_content": None if is_error else structured}
         emit({"type": "item.completed", "item": {**item, "result": result,
                                                  "status": "failed" if is_error else "completed"}})
         session.observations.append(observe(action.tool, action.arguments, text, is_error))
