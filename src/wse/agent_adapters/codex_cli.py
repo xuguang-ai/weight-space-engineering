@@ -41,10 +41,10 @@ JSONL events into the normalized ``AgentEvent`` records of
   own distribution, whose metadata holds its README, stays unreadable.
   ``/tmp`` is denied, because Codex otherwise grants writes there, and
   network access for commands is off. The shell environment is set
-  explicitly (``shell_environment_policy.inherit = "none"``), and commands run
-  in a non-login shell (``allow_login_shell = false``), so macOS's
-  ``path_helper`` cannot put ``/usr/bin/python3`` before the environment's
-  interpreter.
+  explicitly (``shell_environment_policy.inherit = "none"``) and carries the
+  run's random marker ``WSE_CODEX_RUN``, and commands run in a non-login
+  shell (``allow_login_shell = false``), so macOS's ``path_helper`` cannot put
+  ``/usr/bin/python3`` before the environment's interpreter.
 * **Tools.** The WSE MCP tools are exposed as direct function tools with
   their schemas (``features.code_mode.direct_only_tool_namespaces``); Codex's
   sub-agent tools are removed (``excluded_tool_namespaces``). The WSE tools
@@ -70,9 +70,34 @@ JSONL events into the normalized ``AgentEvent`` records of
 * **Limits and cancellation.** The wall-clock limit spans all segments; the
   turn limit counts model requests. ``cancel`` (any thread), the wall-clock
   limit, and the turn limit stop Codex's process group with SIGINT, then
-  SIGTERM and SIGKILL after grace periods; afterwards every descendant
-  process seen while Codex ran (its MCP server among them) is waited for and,
-  if still alive, terminated, so nothing outlives the run.
+  SIGTERM and SIGKILL after grace periods.
+* **Leftover processes.** After every segment, each descendant of Codex
+  that a process snapshot saw (snapshots every ``SNAPSHOT_SECONDS``; its MCP
+  server among them) is waited for and, if still alive, terminated. A command
+  can also start a process in a session of its own and exit between two
+  snapshots, handing it to launchd, where it would keep running under
+  Codex's sandbox (writing ``work/``, ``outputs/``, and ``tmp/``) with no
+  limit. So, on macOS, the current user's processes that started after the
+  run began are then scanned for what survives that reparenting: the marker
+  in the environment they were started with (``KERN_PROCARGS2``), a working
+  directory under the run's sandbox directory, or else a file there held
+  open for writing. Each one found gets SIGTERM, then SIGKILL after
+  ``terminate_grace_seconds``, and is recorded in the segment's
+  ``reaped_processes`` with ``found_by`` (``snapshot``, ``marker``, ``cwd``,
+  or ``open_file``); ``close`` scans once more and writes what it ended to
+  ``reaped-at-close.json`` in the run's log directory. The adapter's own
+  process, its ancestors, and its descendants (the evaluation worker) are
+  never touched, nor is another user's process or one older than the run;
+  but a process of the user that started during the run and works in the
+  sandbox directory (a shell whose working directory it is, an editor holding
+  a file there open for writing) is taken for the run's. Not covered: a
+  process whose environment hides the marker (cleared, as with ``env -i``, or
+  an Apple platform binary such as ``/bin/sh``, whose environment macOS does
+  not show to other processes) and that keeps neither its working directory
+  nor a file open for writing in the sandbox directory (it can still write
+  there by path, opening files only briefly); a process started through
+  launchd or another service rather than by Codex's commands; and platforms
+  other than macOS, where only the snapshots apply.
 * **Events, usage, and logs.** Each segment's raw JSONL stream and standard
   error are kept in the run's log directory. ``mcp_tool_call`` items become
   ``tool_call``/``tool_result`` events (``ok`` or the WSE error code);
@@ -105,9 +130,11 @@ import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import signal
 import site
+import struct
 import subprocess
 import sys
 import threading
@@ -137,6 +164,7 @@ __all__ = [
     "CODEX_TEAM_IDENTIFIER",
     "PROFILE_NAME",
     "PROXY_TOKEN_ENV",
+    "RUN_MARKER_ENV",
     "STOP_MARKER",
     "CodexBinary",
     "CodexCLIAdapter",
@@ -169,6 +197,9 @@ DEFAULT_INTERRUPT_GRACE_SECONDS = 10.0
 DEFAULT_TERMINATE_GRACE_SECONDS = 5.0
 DEFAULT_ORPHAN_GRACE_SECONDS = 5.0
 SNAPSHOT_SECONDS = 2.0
+RUN_MARKER_ENV = "WSE_CODEX_RUN"  # a random per-run value in the commands' environment; see run_processes
+SCAN_BUDGET_SECONDS = 10.0  # one scan of the user's processes for the run's leftovers
+RESCAN_SECONDS = 0.25
 ROLLOUT_POLL_SECONDS = 0.5
 STREAM_DRAIN_SECONDS = 5.0
 STREAM_LIMIT_BYTES = 64 << 20
@@ -430,10 +461,14 @@ def filesystem_rules(sandbox_root: Path, skill_dir: Path, python: PythonAccess) 
     return rules
 
 
-def shell_environment(sandbox_root: Path, python: PythonAccess) -> dict[str, str]:
-    """The complete environment of the agent's commands (``shell_environment_policy.set``; nothing is inherited)."""
+def shell_environment(sandbox_root: Path, python: PythonAccess, run_marker: str | None = None) -> dict[str, str]:
+    """The complete environment of the agent's commands (``shell_environment_policy.set``; nothing is inherited).
+
+    ``run_marker`` becomes ``RUN_MARKER_ENV``, by which ``run_processes`` finds
+    the run's processes after they have left Codex's process tree.
+    """
     work = sandbox_root / "work"
-    return {
+    environment = {
         "PATH": f"{python.bin_dir}:{SYSTEM_PATH}",
         "HOME": str(work),
         "TMPDIR": str(sandbox_root / "tmp") + "/",
@@ -445,11 +480,15 @@ def shell_environment(sandbox_root: Path, python: PythonAccess) -> dict[str, str
         "MPLCONFIGDIR": str(work / ".matplotlib"),
         "XDG_CACHE_HOME": str(work / ".cache"),
     }
+    if run_marker:
+        environment[RUN_MARKER_ENV] = run_marker
+    return environment
 
 
 def codex_config(*, model: str, connection: RunConnection, sandbox_root: Path, skill_dir: Path,
                  python: PythonAccess, provider_config: Mapping[str, Any] | None, startup_timeout_seconds: float,
-                 tool_timeout_seconds: float, model_settings: Mapping[str, Any] | None = None) -> dict[str, Any]:
+                 tool_timeout_seconds: float, model_settings: Mapping[str, Any] | None = None,
+                 run_marker: str | None = None) -> dict[str, Any]:
     """The ``config.toml`` of a run (see the module docstring); every key is one Codex 0.167 accepts strictly."""
     command = list(connection.serve_command)
     config: dict[str, Any] = {
@@ -478,7 +517,7 @@ def codex_config(*, model: str, connection: RunConnection, sandbox_root: Path, s
                      "code_mode": {"direct_only_tool_namespaces": [MCP_NAMESPACE],
                                    "excluded_tool_namespaces": list(EXCLUDED_TOOL_NAMESPACES)}},
         "skills": {"bundled": {"enabled": False}},
-        "shell_environment_policy": {"inherit": "none", "set": shell_environment(sandbox_root, python)},
+        "shell_environment_policy": {"inherit": "none", "set": shell_environment(sandbox_root, python, run_marker)},
         "permissions": {PROFILE_NAME: {"filesystem": filesystem_rules(sandbox_root, skill_dir, python),
                                        "network": {"enabled": False}}},
         "mcp_servers": {MCP_SERVER_NAME: {
@@ -820,13 +859,260 @@ def reap_orphans(seen: Mapping[int, str], grace_seconds: float) -> list[dict[str
             except ProcessLookupError:
                 alive.pop(pid)
                 continue
-            stopped.append({"pid": pid, "command": command[:200], "signal": signal.Signals(signum).name})
+            stopped.append({"pid": pid, "command": command[:200], "signal": signal.Signals(signum).name,
+                            "found_by": ["snapshot"]})
         end = time.monotonic() + 2.0
         while alive and time.monotonic() < end:
             time.sleep(0.05)
             alive = {pid: command for pid, command in alive.items() if _alive_as(pid, command)}
         if not alive:
             break
+    return stopped
+
+
+# Processes that no snapshot saw (macOS): a command can start a process in a session of its own and exit between two
+# snapshots, so the process is handed to launchd and its ancestry is gone. What survives reparenting is what the
+# process was started with (the run's marker in its environment) and where it works (its working directory and open
+# files). The layouts are those of <sys/proc_info.h>; the environment comes from KERN_PROCARGS2, which macOS leaves
+# empty for Apple platform binaries (/bin/sh, /bin/sleep) when the caller is not root.
+_PROC_UID_ONLY = 4
+_PROC_PIDTBSDINFO, _BSDINFO_SIZE = 3, 136  # struct proc_bsdinfo
+_PROC_PIDVNODEPATHINFO, _VNODEPATHINFO_SIZE, _CWD_PATH_AT = 9, 2352, 152  # struct proc_vnodepathinfo
+_PROC_PIDLISTFDS, _FDINFO_SIZE = 1, 8  # struct proc_fdinfo
+_PROC_PIDFDVNODEPATHINFO, _FDVNODEPATHINFO_SIZE, _FD_PATH_AT = 2, 1200, 176  # struct vnode_fdinfowithpath
+_PROX_FDTYPE_VNODE = 1
+_FWRITE = 0x2
+_SZOMB = 5
+_CTL_KERN, _KERN_PROCARGS2 = 1, 49
+_libsystem: Any = None
+
+
+def _libproc() -> Any:
+    """libSystem's ``proc_*`` calls and ``sysctl`` through ctypes; ``None`` off macOS or when they do not load."""
+    global _libsystem
+    if _libsystem is None:
+        _libsystem = False
+        if sys.platform == "darwin":
+            import ctypes
+
+            int_, uint, pointer = ctypes.c_int, ctypes.c_uint32, ctypes.c_void_p
+            try:
+                lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+                for name, argtypes in (("proc_listpids", [uint, uint, pointer, int_]),
+                                       ("proc_pidinfo", [int_, int_, ctypes.c_uint64, pointer, int_]),
+                                       ("proc_pidfdinfo", [int_, int_, int_, pointer, int_]),
+                                       ("sysctl", [ctypes.POINTER(int_), ctypes.c_uint, pointer,
+                                                   ctypes.POINTER(ctypes.c_size_t), pointer, ctypes.c_size_t])):
+                    function = getattr(lib, name)
+                    function.argtypes, function.restype = argtypes, int_
+                _libsystem = lib
+            except (OSError, AttributeError) as exc:
+                logger.warning("process information is unavailable, so only snapshots find leftovers: %s", exc)
+    return _libsystem or None
+
+
+def _c_string(raw: bytes, offset: int, length: int = 1024) -> str:
+    return raw[offset:offset + length].split(b"\0", 1)[0].decode("utf-8", "surrogateescape")
+
+
+@dataclass(frozen=True)
+class _ProcessFacts:
+    pid: int
+    ppid: int
+    uid: int
+    ruid: int
+    started: int  # the kernel's start time, in microseconds since the epoch
+    zombie: bool
+    name: str
+
+
+def _process_facts(pid: int) -> _ProcessFacts | None:
+    import ctypes
+
+    lib = _libproc()
+    buffer = ctypes.create_string_buffer(_BSDINFO_SIZE)
+    if lib is None or lib.proc_pidinfo(pid, _PROC_PIDTBSDINFO, 0, buffer, _BSDINFO_SIZE) != _BSDINFO_SIZE:
+        return None
+    raw = buffer.raw
+    fields = struct.unpack_from("=12I", raw)
+    seconds, microseconds = struct.unpack_from("=2Q", raw, 120)
+    return _ProcessFacts(pid=fields[3], ppid=fields[4], uid=fields[5], ruid=fields[7],
+                         started=seconds * 1_000_000 + microseconds, zombie=fields[1] == _SZOMB,
+                         name=_c_string(raw, 48, 16))
+
+
+def _process_cwd(pid: int) -> str | None:
+    import ctypes
+
+    buffer = ctypes.create_string_buffer(_VNODEPATHINFO_SIZE)
+    if _libproc().proc_pidinfo(pid, _PROC_PIDVNODEPATHINFO, 0, buffer, _VNODEPATHINFO_SIZE) != _VNODEPATHINFO_SIZE:
+        return None
+    return _c_string(buffer.raw, _CWD_PATH_AT)
+
+
+def _files_open_for_writing(pid: int) -> list[str]:
+    """The paths of the files ``pid`` holds open for writing (vnode descriptors with ``FWRITE``)."""
+    import ctypes
+
+    lib = _libproc()
+    size = lib.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, None, 0)
+    if size <= 0:
+        return []
+    buffer = ctypes.create_string_buffer(size + 64 * _FDINFO_SIZE)
+    size = lib.proc_pidinfo(pid, _PROC_PIDLISTFDS, 0, buffer, len(buffer))
+    raw, info, paths = buffer.raw, ctypes.create_string_buffer(_FDVNODEPATHINFO_SIZE), []
+    for offset in range(0, max(0, size) // _FDINFO_SIZE * _FDINFO_SIZE, _FDINFO_SIZE):
+        descriptor, kind = struct.unpack_from("=iI", raw, offset)
+        if kind == _PROX_FDTYPE_VNODE and lib.proc_pidfdinfo(pid, descriptor, _PROC_PIDFDVNODEPATHINFO, info,
+                                                             _FDVNODEPATHINFO_SIZE) == _FDVNODEPATHINFO_SIZE:
+            entry = info.raw
+            if struct.unpack_from("=I", entry)[0] & _FWRITE:  # proc_fileinfo.fi_openflags
+                paths.append(_c_string(entry, _FD_PATH_AT))
+    return paths
+
+
+def _process_arguments(pid: int) -> tuple[list[str], list[str]] | None:
+    """``(argv, strings)`` of ``pid`` (``KERN_PROCARGS2``): its arguments, and every string after its executable's
+    path (the arguments, then the environment it was started with, then the kernel's own)."""
+    import ctypes
+
+    lib = _libproc()
+    mib = (ctypes.c_int * 3)(_CTL_KERN, _KERN_PROCARGS2, pid)
+    size = ctypes.c_size_t(0)
+    if lib.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0 or size.value <= 4:
+        return None
+    buffer = ctypes.create_string_buffer(size.value)
+    if lib.sysctl(mib, 3, buffer, ctypes.byref(size), None, 0) != 0 or size.value <= 4:
+        return None
+    argc = struct.unpack_from("=i", buffer.raw)[0]
+    strings = buffer.raw[4:size.value].split(b"\0")[1:]
+    first = next((index for index, item in enumerate(strings) if item), len(strings))  # past the path's padding
+    decoded = [item.decode("utf-8", "replace") for item in strings[first:]]
+    return decoded[:max(0, argc)], decoded
+
+
+def _user_pids(uid: int) -> list[int]:
+    import ctypes
+
+    lib = _libproc()
+    size = lib.proc_listpids(_PROC_UID_ONLY, uid, None, 0)
+    if size <= 0:
+        return []
+    buffer = (ctypes.c_int * (2 * size // ctypes.sizeof(ctypes.c_int) + 256))()  # room for processes started meanwhile
+    size = lib.proc_listpids(_PROC_UID_ONLY, uid, buffer, ctypes.sizeof(buffer))
+    return [pid for pid in buffer[:max(0, size) // ctypes.sizeof(ctypes.c_int)] if pid > 0]
+
+
+def _under(path: str | None, roots: Sequence[str]) -> bool:
+    return bool(path) and any(path == root or path.startswith(root.rstrip("/") + "/") for root in roots)
+
+
+def path_forms(path: Path) -> tuple[str, ...]:
+    """``path`` as given and as the kernel names it (``F_GETPATH``), the form that process information reports."""
+    forms = [str(path)]
+    try:
+        import fcntl
+
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            forms.append(_c_string(fcntl.fcntl(descriptor, fcntl.F_GETPATH, bytes(1024)), 0))
+        finally:
+            os.close(descriptor)
+    except (ImportError, AttributeError, OSError):
+        pass
+    return tuple(dict.fromkeys(form for form in forms if form))
+
+
+def run_processes(roots: Sequence[str], marker: str | None, since: float, *,
+                  budget_seconds: float = SCAN_BUDGET_SECONDS) -> dict[int, dict[str, Any]]:
+    """The current user's processes, started at or after ``since``, that carry a trace of the run.
+
+    A trace is ``found_by``: ``marker`` (``RUN_MARKER_ENV=<marker>`` among the
+    arguments and environment the process was started with), ``cwd`` (its
+    working directory lies under one of ``roots``), or, when neither holds,
+    ``open_file`` (it holds a file under one of them open for writing; files
+    open only for reading are left out, because the user's Spotlight and
+    Quick Look workers start on demand and read new files wherever they are).
+    This process, its descendants (the adapter's evaluation worker among
+    them), and its ancestors are never returned, nor is a process of another
+    user. The scan stops after ``budget_seconds``. Returns ``pid ->
+    {"started", "command", "found_by"}``; empty off macOS.
+    """
+    if _libproc() is None or not (roots or marker):
+        return {}
+    uid, own, stop_at = os.getuid(), os.getpid(), time.monotonic() + budget_seconds
+    facts = {pid: info for pid in _user_pids(uid) if (info := _process_facts(pid)) is not None}
+    children: dict[int, list[int]] = {}
+    for info in facts.values():
+        children.setdefault(info.ppid, []).append(info.pid)
+    family, stack = {own}, [own]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            if child not in family:
+                family.add(child)
+                stack.append(child)
+    ancestor = facts.get(own) or _process_facts(own)
+    while ancestor is not None and ancestor.ppid > 1 and ancestor.ppid not in family:
+        family.add(ancestor.ppid)
+        ancestor = facts.get(ancestor.ppid) or _process_facts(ancestor.ppid)
+    since_us, wanted, found = int(since * 1_000_000), f"{RUN_MARKER_ENV}={marker}" if marker else None, {}
+    for pid, info in sorted(facts.items()):
+        if (pid <= 1 or pid in family or info.zombie or info.started < since_us or info.uid != uid
+                or info.ruid != uid):
+            continue
+        if time.monotonic() > stop_at:
+            logger.warning("the scan for leftover processes of the run stopped after %.1f s", budget_seconds)
+            break
+        argv, strings = _process_arguments(pid) or ([], [])
+        how = (["marker"] if wanted and wanted in strings else []) + (["cwd"] if _under(_process_cwd(pid), roots)
+                                                                       else [])
+        if not how and roots and any(_under(path, roots) for path in _files_open_for_writing(pid)):
+            how = ["open_file"]
+        if how:
+            found[pid] = {"started": info.started, "command": " ".join(argv)[:2000] or info.name, "found_by": how}
+    return found
+
+
+def _still_running(pid: int, started: int) -> bool:
+    info = _process_facts(pid)
+    return info is not None and info.started == started and not info.zombie
+
+
+def reap_run_processes(roots: Sequence[str], marker: str | None, since: float, grace_seconds: float, *,
+                       budget_seconds: float = SCAN_BUDGET_SECONDS) -> list[dict[str, Any]]:
+    """End what ``run_processes`` finds: SIGTERM, then SIGKILL after ``grace_seconds``; one record per signal sent.
+
+    Rescans until none is left pick up processes that the found ones start
+    meanwhile. A process is identified by its ID and start time, so a reused
+    process ID is never signalled.
+    """
+    if _libproc() is None:
+        return []
+    known: dict[tuple[int, int], dict[str, Any]] = {}
+    sent: dict[tuple[int, int], int] = {}
+    stopped: list[dict[str, Any]] = []
+    for signum, wait in ((signal.SIGTERM, grace_seconds), (signal.SIGKILL, 2.0)):
+        deadline = time.monotonic() + wait
+        while True:
+            for pid, found in run_processes(roots, marker, since, budget_seconds=budget_seconds).items():
+                known.setdefault((pid, found["started"]), found)
+            alive = [key for key in known if _still_running(*key)]
+            if not alive:
+                return stopped
+            for key in alive:
+                if sent.get(key) == signum:
+                    continue
+                try:
+                    os.kill(key[0], signum)
+                except (ProcessLookupError, PermissionError):
+                    continue
+                sent[key] = signum
+                stopped.append({"pid": key[0], "command": known[key]["command"][:200],
+                                "signal": signal.Signals(signum).name, "found_by": known[key]["found_by"]})
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(RESCAN_SECONDS)
+    logger.warning("leftover processes of the run are still running after SIGKILL: %s", [key[0] for key in alive])
     return stopped
 
 
@@ -860,6 +1146,8 @@ class _Session:
     proxy: Any = None
     token: str | None = None
     worker: Any = None
+    started_at: float = field(default_factory=time.time)  # processes started before it are never the run's
+    marker: str = field(default_factory=lambda: secrets.token_hex(16))  # RUN_MARKER_ENV of the agent's commands
 
 
 @dataclass
@@ -905,10 +1193,11 @@ class CodexCLIAdapter(AgentAdapter):
     token; without them the adapter starts ``wse.model_proxy.ModelProxy`` on
     the operator's ``OPENAI_BASE_URL`` and ``OPENAI_API_KEY`` and stops it in
     ``close``. ``max_resumes`` bounds the resumed segments; the grace periods
-    bound the stop sequence (SIGINT, SIGTERM, SIGKILL) and the wait for
-    descendant processes. ``log_dir`` defaults to the directory of the run's
-    server log (``--log-file`` of the serve command), else
-    ``<workspace>/logs``. ``extra_env`` adds variables to Codex's own
+    bound the stop sequence (SIGINT, SIGTERM, SIGKILL), the wait for
+    descendant processes, and (``terminate_grace_seconds``) the time a
+    leftover process gets between SIGTERM and SIGKILL. ``log_dir`` defaults
+    to the directory of the run's server log (``--log-file`` of the serve
+    command), else ``<workspace>/logs``. ``extra_env`` adds variables to Codex's own
     environment (not its commands'); names that look like credentials are
     refused. ``tool_timeout_seconds`` overrides how long one WSE tool call
     may take (default: the run's wall-clock limit, at least the runner's
@@ -1061,7 +1350,8 @@ class CodexCLIAdapter(AgentAdapter):
             config = codex_config(model=agent_config.model, connection=connection, sandbox_root=sandbox,
                                   skill_dir=session.paths.skill, python=python, provider_config=provider,
                                   startup_timeout_seconds=agent_config.connect_timeout_seconds,
-                                  tool_timeout_seconds=tool_timeout, model_settings=agent_config.model_settings)
+                                  tool_timeout_seconds=tool_timeout, model_settings=agent_config.model_settings,
+                                  run_marker=session.marker)
             (session.paths.home / "config.toml").write_text(toml_dumps(config), encoding="utf-8")
             session.settings = {"worker": "adapter" if session.worker is not None else "runner",
                                 "tool_timeout_sec": config["mcp_servers"][MCP_SERVER_NAME]["tool_timeout_sec"],
@@ -1115,8 +1405,28 @@ class CodexCLIAdapter(AgentAdapter):
         with self._lock:
             session = self._sessions.pop(experiment_id, None)
         if session is not None:
+            reaped = await asyncio.to_thread(self._reap_leftovers, session)
+            if reaped and session.paths is not None:  # the run's result is already recorded: log and keep a file
+                logger.warning("ended %d leftover processes of run %s at close", len(reaped),
+                               session.connection.run_id)
+                try:
+                    (session.paths.root / "reaped-at-close.json").write_text(json.dumps(reaped, indent=2) + "\n",
+                                                                            encoding="utf-8")
+                except OSError:
+                    logger.exception("recording the processes ended at close failed")
             await self._stop_proxy(session)
             await self._stop_worker(session)
+
+    def _reap_leftovers(self, session: _Session) -> list[dict[str, Any]]:
+        """End the run's processes that no snapshot saw (``reap_run_processes`` on the run's sandbox directory)."""
+        if session.paths is None:
+            return []
+        try:
+            return reap_run_processes(path_forms(session.paths.sandbox), session.marker, session.started_at,
+                                      self.terminate_grace_seconds)
+        except Exception:  # noqa: BLE001 - ending leftovers must not mask the run's outcome
+            logger.exception("ending the run's leftover processes failed")
+            return []
 
     @staticmethod
     async def _stop_worker(session: _Session) -> None:
@@ -1428,6 +1738,7 @@ class CodexCLIAdapter(AgentAdapter):
                 await asyncio.to_thread(decider.close)
             rollout.poll(translator.session_id, index)
             segment.reaped = await asyncio.to_thread(reap_orphans, seen, self.orphan_grace_seconds)
+            segment.reaped += await asyncio.to_thread(self._reap_leftovers, session)
         segment.session_id = translator.session_id
         segment.ending = translator.ending
         segment.errors = translator.errors or ([] if segment.ending == "turn_completed" or segment.signals
