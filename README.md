@@ -427,7 +427,7 @@ cd weight-space-engineering
 uv run --all-extras pytest -q
 ```
 
-Bug reports should include the command, model revision, platform, and relevant error output. [Open an issue](https://github.com/xuguang-ai/weight-space-engineering/issues)
+[CONTRIBUTING.md](https://github.com/xuguang-ai/weight-space-engineering/blob/main/CONTRIBUTING.md) says what a bug report needs, how to report a security problem privately, and how to make a change; everyone who takes part follows the [Code of Conduct](https://github.com/xuguang-ai/weight-space-engineering/blob/main/CODE_OF_CONDUCT.md). [Open an issue](https://github.com/xuguang-ai/weight-space-engineering/issues)
 
 ## License
 
