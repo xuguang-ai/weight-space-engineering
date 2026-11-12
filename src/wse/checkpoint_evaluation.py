@@ -38,20 +38,20 @@
   starts, the execution layer evaluates the experiment's base checkpoint
   once. When another experiment of the workspace holds a report that a job
   produced of the same model (the base's whole identity: adapter,
-  configuration, weights, and tokenizer files) on the same registered suite,
-  at the same sample count and seed, with the batch size and device of this
-  experiment's evaluations and without errors, that report is linked into
-  this experiment instead: a new report ID, ``reused_from`` naming the
-  report it repeats, and its generation outputs readable, and probe-able, by
-  this run. Reuse is limited to the same registered suite (suites are
-  immutable, so the same suite hash is the same content), because only such
-  reports pair with the run's other reports in comparisons. The link is
-  charged as the evaluation it stands for (the same passes or batches,
-  examples, forward calls, and generated tokens), without compute seconds,
-  and carries that charge as its usage. Otherwise the base is evaluated as
-  above. The call returns once the experiment has the succeeded report and
-  raises otherwise; repeating it returns the same report without charging
-  again.
+  configuration, weights, and tokenizer files) on a development suite with
+  the same content (data, evaluator, and parameters), at the same sample
+  count and seed, with the batch size and device of this experiment's
+  evaluations and without errors, that report is linked into this
+  experiment instead. The link is this experiment's report of its own suite
+  and task (a new report ID, so that it pairs with the run's other reports
+  and meets the task's target as they do), ``reused_from`` names the report
+  it repeats, and the run reads, and probes, its generation outputs as its
+  own pass's. It is charged as the evaluation it stands for (the same
+  passes or batches, examples, forward calls, and generated tokens),
+  without compute seconds, and carries that charge as its usage. Otherwise
+  the base is evaluated as above. The call returns once the experiment has
+  the succeeded report and raises otherwise; repeating it returns the same
+  report without charging again.
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ from typing import TYPE_CHECKING, Any
 
 from wse.audit import record_event
 from wse.database import utc_now
-from wse.evaluation import _new_report_id
+from wse.evaluation import _new_report_id, development_target_met
 from wse.experiments import _check_key, _hashable, _new_id
 from wse.jobs import JOB_COUNTERS, _wait_seconds, evaluation_wait_cap, job_counters, unused_counters
 from wse.schemas import (
@@ -242,9 +242,9 @@ def evaluate_checkpoint(engine: Engine, experiment_id: str, checkpoint_id: str, 
     policy; 0 does not wait) bounds the wait, and ``stop()``, when given,
     ends it early; either leaves the job running for a later request.
     """
-    suite, config, started = _begin(engine, experiment_id, checkpoint_id, key)
     cap = evaluation_wait_cap(engine.experiments.experiment_policy(experiment_id))
-    wait = cap if wait_seconds is None else _wait_seconds(wait_seconds, cap)
+    wait = cap if wait_seconds is None else _wait_seconds(wait_seconds, cap)  # checked before anything is queued
+    suite, config, started = _begin(engine, experiment_id, checkpoint_id, key)
     if started["job_id"] is not None and wait > 0:
         poll_job(lambda: engine.jobs.get_job(experiment_id, started["job_id"]), wait, stop)
     return _result(engine, experiment_id, checkpoint_id, suite, config, started)
@@ -253,22 +253,31 @@ def evaluate_checkpoint(engine: Engine, experiment_id: str, checkpoint_id: str, 
 # -- baselines (operator) -----------------------------------------------------------------------------------------
 
 
-def _reusable_report(conn: sqlite3.Connection, experiment_id: str, identity: ModelIdentity, suite: EvaluationSuite,
-                     config: EvalConfig, batch_size: int, device: str) -> EvaluationReport | None:
+def _same_content(engine: Engine, suite_id: str, suite: EvaluationSuite) -> bool:
+    """Whether registered suite ``suite_id`` holds ``suite``'s problems with its evaluator and parameters."""
+    other = engine.jobs._read_suite(suite_id)
+    return (other.split == "development" and other.data_hash == suite.data_hash
+            and other.evaluator == suite.evaluator and other.parameters == suite.parameters)
+
+
+def _reusable_report(engine: Engine, conn: sqlite3.Connection, experiment_id: str, identity: ModelIdentity,
+                     suite: EvaluationSuite, config: EvalConfig, batch_size: int,
+                     device: str) -> EvaluationReport | None:
     """The first report of another experiment that this experiment may link as its baseline, or ``None``."""
     rows = conn.execute(
         "SELECT report_hash, report_json FROM reports WHERE experiment_id != ? AND split = 'development' "
-        "AND suite_id = ? AND job_id IS NOT NULL AND json_extract(report_json, '$.sample_count') = ? "
+        "AND job_id IS NOT NULL AND json_extract(report_json, '$.sample_count') = ? "
         "AND json_extract(report_json, '$.seed') = ? AND json_extract(report_json, '$.model.weights_hash') = ? "
         "ORDER BY created_at, rowid",
-        (experiment_id, suite.suite_id, config.sample_count, config.seed, identity.weights_hash)).fetchall()
+        (experiment_id, config.sample_count, config.seed, identity.weights_hash)).fetchall()
     for row in rows:
         report = EvaluationReport.model_validate_json(row["report_json"])
         if json_hash(report.model_dump(mode="json")) != row["report_hash"]:
             continue  # a report that does not match its hash is never repeated
-        if (report.model == identity and report.suite_hash == suite.suite_hash and report.data_hash == suite.data_hash
-                and report.evaluator == suite.evaluator and report.execution.batch_size == batch_size
-                and report.execution.device == device and not report.errors and report.reused_from is None):
+        if (report.model == identity and report.data_hash == suite.data_hash and report.evaluator == suite.evaluator
+                and report.execution.batch_size == batch_size and report.execution.device == device
+                and not report.errors and report.reused_from is None
+                and _same_content(engine, report.suite_id, suite)):
             return report
     return None
 
@@ -292,6 +301,7 @@ def _link_baseline(engine: Engine, experiment_id: str, base: str, suite: Evaluat
         batch_size = service.experiment_policy(experiment_id).budget.examples_per_batch
         shown_device = EVALUATION_DEVICE
     identity = engine.store.load_manifest(base).identity
+    task = engine.evaluation._task_definition(suite.task_id)
     with engine.store.db.transaction() as conn:
         again = service._lookup(conn, experiment_id, BASELINE_KEY, OPERATION, request_hash)
         if again is not None:
@@ -299,7 +309,7 @@ def _link_baseline(engine: Engine, experiment_id: str, base: str, suite: Evaluat
         service._require_open(service._experiment_row(experiment_id, conn))
         if _existing(conn, experiment_id, base, suite, config) is not None:
             return None
-        source = _reusable_report(conn, experiment_id, identity, suite, config, batch_size, shown_device)
+        source = _reusable_report(engine, conn, experiment_id, identity, suite, config, batch_size, shown_device)
         if source is None:
             return None
         charge = {counter: amount for counter in JOB_COUNTERS if (amount := getattr(source.usage, counter) or 0)}
@@ -310,9 +320,14 @@ def _link_baseline(engine: Engine, experiment_id: str, base: str, suite: Evaluat
                       peak_memory_bytes=None,
                       unavailable={"peak_memory_bytes": f"reused report {source.report_id} of experiment "
                                                         f"{source.experiment_id}; nothing was computed here"})
-        linked = source.model_copy(update={"report_id": _new_report_id(), "experiment_id": experiment_id,
-                                           "job_id": None, "checkpoint_id": base, "usage": usage,
-                                           "created_at": utc_now(), "reused_from": origin})
+        # The link is this experiment's report of its own suite, which holds the same problems, evaluator, and
+        # parameters, so that it pairs with the run's other reports and meets the task's target as they do.
+        linked = source.model_copy(update={
+            "report_id": _new_report_id(), "experiment_id": experiment_id, "job_id": None, "checkpoint_id": base,
+            "task_id": suite.task_id, "task_hash": task.task_hash if task is not None else None,
+            "suite_id": suite.suite_id, "suite_hash": suite.suite_hash,
+            "target_met": development_target_met(task, suite, source.sample_count, source.metrics, source.errors),
+            "usage": usage, "created_at": utc_now(), "reused_from": origin})
         engine.evaluation.insert_report(conn, linked)
         outputs = [sample.output_uri for problem in linked.problems or [] for sample in problem.samples
                    if sample.output_uri]

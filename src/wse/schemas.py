@@ -1798,7 +1798,7 @@ class ProblemResult(_Frozen):
 
 
 class ReportSource(_Frozen):
-    """The report that a reused report repeats: another experiment's evaluation of the same model and suite.
+    """The report that a reused report repeats: another experiment's evaluation of the same model and problems.
 
     ``Engine.ensure_baseline`` links such a report into an experiment as its
     baseline instead of evaluating the base checkpoint again
@@ -1825,9 +1825,10 @@ class EvaluationReport(_Frozen):
     engine's device, stored dtypes, model class, and library versions).
 
     ``reused_from`` is set only on a report that repeats another experiment's
-    report of the same model, suite, and configuration (a baseline linked by
-    ``Engine.ensure_baseline``): it has no job, and its ``usage`` is what its
-    experiment was charged, without compute seconds. Unset, the field is
+    report of the same model on a suite of the same content, at the same
+    configuration (a baseline linked by ``Engine.ensure_baseline``): it names
+    this experiment's suite and task, has no job, and its ``usage`` is what
+    its experiment was charged, without compute seconds. Unset, the field is
     omitted, so other reports keep their content and hashes.
     """
 

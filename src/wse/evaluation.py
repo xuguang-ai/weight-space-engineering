@@ -114,6 +114,21 @@ def _shorter_tails(report: EvaluationReport, budget: int) -> EvaluationReport | 
     return cut(low)
 
 
+def development_target_met(task: TaskDefinition | None, suite: EvaluationSuite, sample_count: int,
+                           metrics: Mapping[str, float], errors: Any) -> bool | None:
+    """A report's ``target_met``: ``None`` without an accuracy target, else whether this result meets it.
+
+    The development target is a property of the task's own development suite
+    only: a report of another (for example smaller) suite cannot meet it, and
+    final reports carry no development-target verdict at all.
+    """
+    if suite.split != "development" or task is None or task.target_accuracy is None or "accuracy" not in metrics:
+        return None
+    return (suite.suite_id == task.development_suite_id
+            and sample_count == suite.example_count == task.development_examples
+            and metrics["accuracy"] >= task.target_accuracy and not errors)
+
+
 class EvaluationService:
     """Reports, comparisons, and final evaluation of an ``Engine``, scoped like its experiment service."""
 
@@ -172,15 +187,7 @@ class EvaluationService:
                      checkpoint_id: str, suite: EvaluationSuite, usage: Usage, keep_scores: bool) -> EvaluationReport:
         """Bind an evaluation result to its experiment, checkpoint, task, and suite as a managed report."""
         task = self._task_definition(suite.task_id)
-        target_met = None
-        # The development target is a property of the task's own development suite only: a
-        # report of another (for example smaller) suite cannot meet it, and final reports carry
-        # no development-target verdict at all.
-        if suite.split == "development" and task is not None and task.target_accuracy is not None \
-                and "accuracy" in result.metrics:
-            target_met = (suite.suite_id == task.development_suite_id
-                          and result.sample_count == suite.example_count == task.development_examples
-                          and result.metrics["accuracy"] >= task.target_accuracy and not result.errors)
+        target_met = development_target_met(task, suite, result.sample_count, result.metrics, result.errors)
         return EvaluationReport(
             report_id=_new_report_id(),
             experiment_id=experiment_id,
@@ -615,4 +622,4 @@ def render_markdown(value: EvaluationReport | ComparisonReport | FinalEvaluation
 
 
 __all__ = ["EvaluationService", "FINAL_BATCH_SIZE", "REPORT_DETAIL_FIELDS", "comparison_markdown",
-           "evaluation_report_markdown", "final_report_markdown", "render_markdown"]
+           "development_target_met", "evaluation_report_markdown", "final_report_markdown", "render_markdown"]

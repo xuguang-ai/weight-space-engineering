@@ -60,6 +60,7 @@ decisions, and usage accounting.
   kept in the connection.
 """
 
+import asyncio
 import json
 import logging
 import threading
@@ -725,9 +726,7 @@ class WSEMCPServer:
             try:
                 poll_job(lambda: self._call(self.engine.get_job, eid, job_id, 0), self.evaluation_wait,
                          _request_cancelled)
-            except ToolError:
-                raise
-            except BaseException:
+            except asyncio.CancelledError:
                 logger.info("wse_evaluate: the request was cancelled while waiting for job %s; the job continues in "
                             "the worker", job_id)
                 raise
@@ -737,6 +736,10 @@ class WSEMCPServer:
 
     def _evaluation_response(self, experiment_id: str,
                              evaluation: CheckpointEvaluation) -> ToolResponse[CheckpointEvaluation]:
+        if evaluation.state == "succeeded":  # as _job_response: the agent's own code reads the new pass in inputs/
+            from wse.sandbox_runs import refresh_inputs
+
+            refresh_inputs(self.engine.experiments, experiment_id)
         config, report, comparison = evaluation.config, evaluation.report, evaluation.comparison
         summary = (f"checkpoint {evaluation.checkpoint_id} on {evaluation.suite_id} (sample_count "
                    f"{config.sample_count}, seed {config.seed}): ")

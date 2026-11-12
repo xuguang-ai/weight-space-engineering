@@ -868,18 +868,23 @@ class JobService:
                            f"text {index}: {uri} is a stored result of this run but not a generation output; give "
                            "the output_uri of a sample of a generation pass's report", details={"text": index})
         output = GenerationOutput.model_validate(document)
-        if output.experiment_id != experiment_id and not self._reused_output(experiment_id, output):
-            raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"text {index}: generation output {uri} names another "
-                           "experiment", details={"text": index})
+        if output.experiment_id != experiment_id:
+            suite_id = self._reusing_suite(experiment_id, output)
+            if suite_id is None:
+                raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"text {index}: generation output {uri} names another "
+                               "experiment", details={"text": index})
+            # The output of a reused pass is read as one of this run's suite, which holds the same problems.
+            output = output.model_copy(update={"suite_id": suite_id})
         return output
 
-    def _reused_output(self, experiment_id: str, output: GenerationOutput) -> bool:
-        """Whether ``output`` comes from the pass of a report that ``experiment_id`` reused (``ensure_baseline``)."""
-        return self.db.conn.execute(
-            "SELECT 1 FROM reports linked JOIN reports source "
+    def _reusing_suite(self, experiment_id: str, output: GenerationOutput) -> str | None:
+        """The suite of the report of ``experiment_id`` that reused ``output``'s pass (``ensure_baseline``), if any."""
+        row = self.db.conn.execute(
+            "SELECT linked.suite_id FROM reports linked JOIN reports source "
             "ON source.report_id = json_extract(linked.report_json, '$.reused_from.report_id') "
             "WHERE linked.experiment_id = ? AND source.experiment_id = ? AND source.job_id = ?",
-            (experiment_id, output.experiment_id, output.job_id)).fetchone() is not None
+            (experiment_id, output.experiment_id, output.job_id)).fetchone()
+        return None if row is None else row["suite_id"]
 
     # -- reading ----------------------------------------------------------------
 
