@@ -106,6 +106,8 @@ def test_a_run_evaluates_the_baseline_applies_the_rule_and_freezes(experiment_se
     assert "Behavior on the development set" in summary and "Candidates (1 evaluated)" in summary
     assert "Rule: WSE keeps the candidate with the lowest limit_hit_rate" in summary and "Audit:" in summary
     assert summary.index("Candidates") < summary.index("Audit:")
+    verdict = "selected" if result.selected_checkpoint_id != model.checkpoint_id else "did not qualify"
+    assert f"; {verdict}" in summary and "; kept" not in summary
 
 
 def test_test_registers_the_test_data_only_now_and_caches_the_report(experiment_setup) -> None:

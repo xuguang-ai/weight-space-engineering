@@ -484,7 +484,12 @@ class ExperimentResult:
             hypothesis = preview.hypothesis
         metrics = ", ".join(f"{name} {candidate['metrics'][name]:.4g}" for name in METRICS
                             if name in candidate["metrics"])
-        verdict = "kept" if candidate["qualifies"] else "not kept: " + "; ".join(candidate["reasons"])
+        if candidate["checkpoint_id"] == self.selected_checkpoint_id:
+            verdict = "selected"
+        elif candidate["qualifies"]:
+            verdict = "qualified; another candidate scored better"
+        else:
+            verdict = "did not qualify: " + "; ".join(candidate["reasons"])
         return (f"  - {candidate['checkpoint_id']}: {metrics}; {where}; {verdict}"
                 + (f"\n    hypothesis: {hypothesis}" if hypothesis else ""))
 
