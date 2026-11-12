@@ -22,7 +22,7 @@ from test_sandbox_policy import SANDBOX_POLICY_ID, _small_sandbox_policy
 
 from wse import sandbox
 from wse.agent_runs import run_agent_experiment
-from wse.runner import SANDBOX_CONSTRAINT_REASON, SANDBOX_TIME_LABEL, TEST_DOUBLE_PREFIX
+from wse.runner import OWN_CODE_CONSTRAINT_REASON, SANDBOX_CONSTRAINT_REASON, SANDBOX_TIME_LABEL, TEST_DOUBLE_PREFIX
 
 AVAILABLE, REASON = sandbox.available()
 pytestmark = pytest.mark.skipif(not AVAILABLE, reason=REASON)
@@ -42,7 +42,8 @@ def test_a_scripted_sandbox_strategy_repairs_signed_sum_through_mcp(engine, work
     summary = run.summary
     assert (summary["controller"], summary["model"]) == ("codex_cli@1", model)
     assert summary["constraint_status"] == "unverified"
-    assert summary["constraint_reason"] == SANDBOX_CONSTRAINT_REASON
+    # Unverified twice over: the Codex adapter gives agents a shell, and the policy grants the sandbox.
+    assert summary["constraint_reason"] == f"{OWN_CODE_CONSTRAINT_REASON}; {SANDBOX_CONSTRAINT_REASON}"
     assert summary["sandbox"]["calls"] == 1 and summary["sandbox"]["label"] == SANDBOX_TIME_LABEL
 
     # The sandbox call: its code read the sandbox's copy of the base weights and printed the pair it found.

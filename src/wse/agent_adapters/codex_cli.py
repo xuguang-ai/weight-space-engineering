@@ -163,6 +163,7 @@ SKILL_NAME = "wse"
 STOP_MARKER = "WSE-STOP"
 TEST_DOUBLE_PROVIDER = "wse-test-double"
 TEST_DOUBLE_MODULE = "wse.agent_adapters.codex_test_double"
+DECIDER_ENV = "WSE_CODEX_TEST_DOUBLE_DECIDER"  # the stand-in's pipe pair to the runner's strategy
 DEFAULT_MAX_RESUMES = 2
 DEFAULT_INTERRUPT_GRACE_SECONDS = 10.0
 DEFAULT_TERMINATE_GRACE_SECONDS = 5.0
@@ -1329,14 +1330,24 @@ class CodexCLIAdapter(AgentAdapter):
         rollout = _RolloutTail(paths.home, recorder, totals)
         started = time.monotonic()
         stderr = open(segment.stderr, "wb")  # noqa: SIM115 - closed below, after the process ends
+        env, decider = dict(session.env), None
+        strategy = getattr(self.model, "strategy", None)
+        if strategy is not None and session.binary is not None and session.binary.test_double:
+            decider = _Decider(strategy)  # the stand-in asks this process for the runner's own strategy's calls
+            env[DECIDER_ENV] = decider.child_fds
         try:
             process = await asyncio.create_subprocess_exec(
-                *self._command(session, prompt, session_id), cwd=str(paths.sandbox), env=session.env,
+                *self._command(session, prompt, session_id), cwd=str(paths.sandbox), env=env,
                 stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE, stderr=stderr,
-                start_new_session=True, limit=STREAM_LIMIT_BYTES)
+                start_new_session=True, limit=STREAM_LIMIT_BYTES,
+                pass_fds=decider.pass_fds if decider is not None else ())
         except BaseException:
             stderr.close()
+            if decider is not None:
+                decider.close()
             raise
+        if decider is not None:
+            decider.start()
         seen: dict[int, str] = {}
         limit_hit = False
         requests_before = totals.requests
@@ -1413,6 +1424,8 @@ class CodexCLIAdapter(AgentAdapter):
             if process.returncode is None:
                 await self._stop(process, segment)
             stderr.close()
+            if decider is not None:
+                await asyncio.to_thread(decider.close)
             rollout.poll(translator.session_id, index)
             segment.reaped = await asyncio.to_thread(reap_orphans, seen, self.orphan_grace_seconds)
         segment.session_id = translator.session_id
@@ -1452,6 +1465,68 @@ def _stderr_errors(path: Path, tail_bytes: int = 8192) -> list[str]:
         return []
     errors = [line.strip() for line in lines if re.search(r"\berror\b", line, re.IGNORECASE)]
     return [line[:2000] for line in errors[-3:]]
+
+
+class _Decider:
+    """Answers the stand-in's requests for the next call with the strategy object the runner made.
+
+    A strategy that exists only in the runner's process (a subclass bound
+    to parameters, or one an example script registers) cannot be resolved by
+    name in the stand-in, so the stand-in sends its observations over a pipe
+    pair and this process replies with ``next_action``'s action.
+    """
+
+    def __init__(self, strategy: Any) -> None:
+        self.strategy = strategy
+        self.request_read, self.request_write = os.pipe()
+        self.reply_read, self.reply_write = os.pipe()
+        self.thread: threading.Thread | None = None
+
+    @property
+    def pass_fds(self) -> tuple[int, int]:
+        return self.request_write, self.reply_read
+
+    @property
+    def child_fds(self) -> str:
+        return f"{self.request_write},{self.reply_read}"
+
+    def start(self) -> None:
+        for descriptor in (self.request_write, self.reply_read):  # the child's ends, now inherited
+            os.close(descriptor)
+        self.request_write = self.reply_read = -1
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self) -> None:
+        from wse.agent_adapters.codex_test_double import next_action
+
+        requests = os.fdopen(self.request_read, "r", encoding="utf-8")
+        replies = os.fdopen(self.reply_write, "w", encoding="utf-8")
+        self.request_read = self.reply_write = -1
+        with requests, replies:
+            for line in requests:
+                try:
+                    action = next_action(self.strategy, json.loads(line)["observations"])
+                    reply: dict[str, Any] = {"action": action.model_dump(mode="json")}
+                except Exception as exc:  # noqa: BLE001 - a strategy failure is reported to the stand-in
+                    reply = {"error": describe_exception(exc)}
+                try:
+                    replies.write(json.dumps(reply) + "\n")
+                    replies.flush()
+                except OSError:
+                    return
+
+    def close(self) -> None:
+        for name in ("request_read", "request_write", "reply_read", "reply_write"):
+            descriptor = getattr(self, name)
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+                setattr(self, name, -1)
+        if self.thread is not None:
+            self.thread.join(5.0)
 
 
 def worker_arguments(serve_command: Sequence[str]) -> list[str]:

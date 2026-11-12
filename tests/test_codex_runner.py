@@ -182,6 +182,42 @@ def test_the_runner_selects_the_stand_in_by_model_name(engine, workspace, prepar
     assert engine.get_experiment(eid).state == "FROZEN"
 
 
+class InProcessOnly:
+    """A strategy that exists only in the runner's process: the stand-in cannot resolve it by name."""
+
+    strategy_id, version = "in_process_only", "1"
+
+    def config(self) -> dict:
+        return {}
+
+    def next_action(self, objective, observations, remaining_budget):
+        from wse.strategies.base import Action
+
+        if not observations or observations[-1].tool != "wse_get_experiment":
+            return Action.call("wse_get_experiment", "Read the task.")
+        return Action.stop(f"read {len(observations)} observations")
+
+
+def test_the_stand_in_plays_the_runners_own_strategy_object(engine, workspace, prepared):
+    """The adapter answers the stand-in's requests with the strategy the runner made, registered nowhere else."""
+    from wse.registry import builtin_registry
+
+    import wse_test_plugins
+
+    registry = builtin_registry()
+    wse_test_plugins.setup(registry)
+    registry.register("strategy", InProcessOnly.strategy_id, InProcessOnly.version, InProcessOnly)
+    run_id = engine.grant_run(prepared["task_id"], WEIGHTS_ONLY_POLICY_ID, prepared["task_checkpoint_id"]).run_id
+    runner = ReferenceRunner(workspace, registry=registry, setup=["wse_test_plugins:setup"], worker_args=FAST_WORKER,
+                             serve_env={"PYTHONPATH": str(TESTS_DIR)}, settle_timeout_seconds=60)
+    eid = runner.run_experiment(run_id, prepared["task_id"], WEIGHTS_ONLY_POLICY_ID,
+                                {"kind": "agent", "adapter": "codex_cli@1", "model": "wse-test-double:in_process_only@1"})
+    result = runner.last_result["result"]
+    assert result["status"] == "completed" and result["reason"] == "the agent stopped: WSE-STOP: read 1 observations"
+    assert runner.last_result["config"]["test_double"]["strategy"] == "in_process_only@1"
+    assert engine.get_experiment(eid).state == "FROZEN"
+
+
 def test_a_deliberate_stop_ends_the_run_without_a_resume(engine, workspace, prepared):
     run_id = engine.grant_run(prepared["task_id"], WEIGHTS_ONLY_POLICY_ID, prepared["task_checkpoint_id"]).run_id
     runner = ReferenceRunner(workspace, setup=["codex_test_plugins:setup"], worker_args=FAST_WORKER,

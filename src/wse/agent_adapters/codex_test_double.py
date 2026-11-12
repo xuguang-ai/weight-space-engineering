@@ -11,10 +11,12 @@ adapter's whole path runs without a model or the network:
   talks to it with a small JSON-RPC client of its own (the legacy MCP
   handshake, as Codex 0.167 does; the MCP SDK stays in ``wse.mcp_server``
   only), and refuses a tool outside ``enabled_tools``;
-* the model name ``wse-test-double:<strategy>@<version>`` names a registered
-  stepwise strategy (resolved with the built-in registry and the server's
-  ``--setup`` hooks), which chooses every tool call from the tool results so
-  far: the first call reads the experiment, and
+* a stepwise strategy chooses every tool call from the tool results so far:
+  the strategy object the runner made, which the adapter consults over a
+  pipe pair (``WSE_CODEX_TEST_DOUBLE_DECIDER``), or else the registered
+  strategy that the model name ``wse-test-double:<strategy>@<version>``
+  names (resolved with the built-in registry and the server's ``--setup``
+  hooks). The first call reads the experiment, and
   a ``stop`` action becomes the final message ``WSE-STOP: <reason>``;
 * it prints Codex-shaped JSONL events (``thread.started``, ``turn.started``,
   ``item.started``/``item.completed`` of ``mcp_tool_call`` items,
@@ -60,6 +62,7 @@ from pathlib import Path
 from typing import Any
 
 PREFIX = "wse-test-double:"
+DECIDER_ENV = "WSE_CODEX_TEST_DOUBLE_DECIDER"
 STOP_MARKER = "WSE-STOP"
 
 
@@ -172,10 +175,34 @@ def observe(tool: str, arguments: dict[str, Any], text: str, is_error: bool) -> 
             "_usage": (parsed.get("usage") or {}).get("cumulative")}
 
 
+class RemoteStrategy:
+    """The runner's own strategy object, asked over the pipe pair the adapter passed (``DECIDER_ENV``)."""
+
+    def __init__(self, descriptors: str) -> None:
+        request_fd, reply_fd = (int(part) for part in descriptors.split(","))
+        self.requests = os.fdopen(request_fd, "w", encoding="utf-8")
+        self.replies = os.fdopen(reply_fd, "r", encoding="utf-8")
+
+    def decide(self, observations: list[dict[str, Any]]) -> Any:
+        from wse.strategies.base import Action
+
+        self.requests.write(json.dumps({"observations": observations}) + "\n")
+        self.requests.flush()
+        line = self.replies.readline()
+        if not line:
+            raise ConnectionError("the runner's strategy channel closed")
+        reply = json.loads(line)
+        if "error" in reply:
+            raise RuntimeError(f"the strategy failed: {reply['error']}")
+        return Action.model_validate(reply["action"])
+
+
 def next_action(strategy: Any, observations: list[dict[str, Any]]) -> Any:
     from wse.schemas import BudgetEntry, ObjectiveSpec
     from wse.strategies.base import Action, Observation
 
+    if isinstance(strategy, RemoteStrategy):
+        return strategy.decide(observations)
     if not observations:
         return Action.call("wse_get_experiment", "Read the task and budget.")
     budget: dict[str, BudgetEntry] = {}
@@ -282,7 +309,9 @@ async def drive(options: dict[str, Any], config: dict[str, Any], session: Sessio
                   file=sys.stderr)
             return 1
         strategy = None
-        if behavior.get("script") is None:  # the model, like Codex's, matters only once the session exists
+        if behavior.get("script") is None and os.environ.get(DECIDER_ENV):
+            strategy = RemoteStrategy(os.environ[DECIDER_ENV])
+        elif behavior.get("script") is None:  # the model, like Codex's, matters only once the session exists
             if not str(options["model"] or "").startswith(PREFIX):
                 print(f"Error: the Codex test double needs a model {PREFIX}<strategy>@<version> or a script, got "
                       f"{options['model']!r}", file=sys.stderr)
