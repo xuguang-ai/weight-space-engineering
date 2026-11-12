@@ -869,6 +869,64 @@ class Engine:
         return self.store.commit_checkpoint(manifest, imported.tensors, dedup_key=json_hash({"import_hf": identity}),
                                             event_type="checkpoint.imported")
 
+    def restore_checkpoint(self, manifest: ModelManifest | Mapping[str, Any], tensors: Mapping[str, Any],
+                           model_files: Mapping[str, bytes] | None = None) -> ModelManifest:
+        """Restore an exported checkpoint of an imported open-weight model (operator only; ``wse.audit``).
+
+        ``manifest`` is the checkpoint's recorded manifest, ``tensors`` its
+        tensors under their canonical names, and ``model_files`` its tokenizer,
+        chat-template, and generation-configuration files. The tensors must
+        be exactly the manifest's (names, dtypes, shapes, and blob IDs) and
+        reproduce its weights hash; every model file the manifest's source
+        lists must be given with its recorded SHA-256. The checkpoint is
+        committed under a new ID with the recorded identity, so restoring a
+        model this workspace already imported returns the existing checkpoint.
+        """
+        import hashlib
+
+        from wse.hf_snapshot import MODEL_TEXT_FILES
+        from wse.tensors import hash_weights
+
+        self._require_operator("restoring a checkpoint")
+        recorded = manifest if isinstance(manifest, ModelManifest) else ModelManifest.model_validate(manifest)
+        if recorded.source is None:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, "restore_checkpoint restores imported open-weight models; "
+                           "import other models from their bundles")
+        _, adapter = _resolve_adapter(self.registry, str(recorded.adapter))
+        expected = {info.name: info for info in recorded.tensors}
+        given = {name: tensor for name, tensor in tensors.items()}
+        if sorted(given) != sorted(expected):
+            missing, extra = sorted(set(expected) - set(given)), sorted(set(given) - set(expected))
+            raise WSEError(ErrorCode.ARTIFACT_CORRUPT, "the tensors are not the manifest's",
+                           details={"missing": missing[:20], "unexpected": extra[:20]})
+        for name, info in expected.items():
+            tensor = given[name]
+            if list(tensor.shape) != list(info.shape) or str(tensor.dtype).removeprefix("torch.") != info.dtype:
+                raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"tensor {name} has shape {list(tensor.shape)} and dtype "
+                               f"{tensor.dtype}; the manifest records {info.shape} and {info.dtype}",
+                               details={"tensor": name})
+        if hash_weights(given, weights_hash_scheme(adapter)) != recorded.weights_hash:
+            raise WSEError(ErrorCode.ARTIFACT_CORRUPT, "the tensors do not reproduce the recorded weights hash",
+                           details={"weights_hash": recorded.weights_hash})
+        files = dict(model_files or {})
+        listed = {name: digest for name, digest in recorded.source.files.items() if name in MODEL_TEXT_FILES}
+        if sorted(files) != sorted(listed):
+            raise WSEError(ErrorCode.ARTIFACT_CORRUPT, "the model files are not the manifest's",
+                           details={"missing": sorted(set(listed) - set(files)),
+                                    "unexpected": sorted(set(files) - set(listed))})
+        for name, data in files.items():
+            if "sha256:" + hashlib.sha256(data).hexdigest() != listed[name]:
+                raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"model file {name} does not match its recorded hash",
+                               details={"file": name})
+        for data in files.values():
+            self.store.publish_model_file(data)
+        identity = recorded.model_dump(mode="json")
+        del identity["checkpoint_id"]
+        restored = ModelManifest.model_validate({**recorded.model_dump(mode="json"),
+                                                 "checkpoint_id": self.store.new_checkpoint_id()})
+        return self.store.commit_checkpoint(restored, given, dedup_key=json_hash({"import_hf": identity}),
+                                            event_type="checkpoint.restored")
+
     def model_files(self, checkpoint_id: str) -> dict[str, bytes]:
         """The stored tokenizer, chat-template, and generation-configuration files of an imported model.
 

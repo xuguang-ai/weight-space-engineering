@@ -23,6 +23,15 @@ a clean workspace by applying the exact stored patches (no editing operator
 runs). Final-set inputs, labels, and generation seeds are excluded unless
 the operator explicitly asks for them.
 
+An imported open-weight model is exported as a checkpoint rather than a
+bundle (``replay.base_format``): ``base_model/model.safetensors`` holds its
+tensors under their canonical names and ``base_model/files/`` its model
+files (tokenizer, chat template, generation configuration), next to its
+manifest under ``checkpoints/``; each patch with binary blocks is also
+exported as its binary patch file (``blocks_path``). Replay restores the
+base with ``Engine.restore_checkpoint`` and replays each candidate with
+``Engine.store_patch``, which checks every step's hashes.
+
 A run whose policy grants the sandbox also exports its code execution under
 ``sandbox/``: each call's code, standard output and error as stored, result
 summary, and kept output files; the inputs manifest (what the code could
@@ -46,11 +55,13 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import Field
 
 from wse.database import Database, audit_events, insert_audit_event, utc_now
+from wse.patch_blocks import read_patch_file, write_patch_file
 from wse.policy import sandbox_available
 from wse.schemas import (
     SCHEMA_VERSION,
     ErrorCode,
     MaterializedPatch,
+    ModelManifest,
     WSEError,
     _Frozen,
     _optional,
@@ -245,6 +256,7 @@ class ExportedPatch(_Frozen):
     hypothesis: str
     changed_elements: int
     path: str
+    blocks_path: str | None = _optional()
 
 
 class ExportedReport(_Frozen):
@@ -423,17 +435,24 @@ def export_experiment(engine: Engine, experiment_id: str, output_dir: str | Path
     rows = db.conn.execute("SELECT patch_id, applied_checkpoint_id FROM patches WHERE experiment_id = ? "
                            "ORDER BY created_at, rowid", (experiment_id,)).fetchall()
     for row in rows:
-        artifact = engine.read_patch(experiment_id, row["patch_id"])
+        artifact, blocks = engine.experiments._artifact_and_blocks(
+            engine.experiments._patch_row(experiment_id, row["patch_id"]))
         preview = engine.get_patch(experiment_id, row["patch_id"])
         path = _write_json(root, f"patches/{row['patch_id']}.json",
                            {"preview": preview.model_dump(mode="json"), "artifact": artifact.model_dump(mode="json")},
                            files)
+        blocks_path = None
+        if blocks:  # an open-weight model's after-values: the binary patch file, as stored
+            blocks_path = f"patches/{row['patch_id']}.wsepatch"
+            data = write_patch_file(artifact.model_dump(mode="json"), blocks)
+            (root / blocks_path).write_bytes(data)
+            files[blocks_path] = content_hash(data)
         patches.append(ExportedPatch(
             patch_id=row["patch_id"], spec_hash=preview.spec_hash, base_checkpoint_id=preview.base_checkpoint_id,
             base_weights_hash=preview.base_weights_hash, result_weights_hash=preview.result_weights_hash,
             exact_patch_hash=json_hash(artifact.patch.model_dump(mode="json")),
             applied_checkpoint_id=row["applied_checkpoint_id"], hypothesis=preview.hypothesis,
-            changed_elements=preview.changed_elements, path=path))
+            changed_elements=preview.changed_elements, path=path, blocks_path=blocks_path))
 
     reports = []
     for report in engine.list_reports(experiment_id):
@@ -468,8 +487,14 @@ def export_experiment(engine: Engine, experiment_id: str, output_dir: str | Path
     _write_json(root, "tool_trace.json", trace, files)
 
     sandbox_record = _export_sandbox(engine, experiment, root, files) if sandbox_available(policy) else None
+    base_format = None
     if include_base_weights:
-        _export_bundle(engine, base.checkpoint_id, root / BASE_BUNDLE_DIR, files)
+        if engine.load_manifest(base.checkpoint_id).source is not None:  # an imported open-weight model
+            _export_checkpoint(engine, base.checkpoint_id, root / BASE_BUNDLE_DIR, files)
+            base_format = "checkpoint"
+        else:
+            _export_bundle(engine, base.checkpoint_id, root / BASE_BUNDLE_DIR, files)
+            base_format = "bundle"
     if include_final_data:
         final_suite = engine.evaluation.final_suite(experiment.task_id)
         data = engine.datasets.load(final_suite.dataset)
@@ -506,7 +531,7 @@ def export_experiment(engine: Engine, experiment_id: str, output_dir: str | Path
         constraint_status=(controller or {}).get("constraint_status", "unverified"),
         tracing=(controller or {}).get("tracing", {"sdk_tracing": "no controller recorded"}),
         costs=costs, environment=environment_record(),
-        replay={"base_bundle": BASE_BUNDLE_DIR if include_base_weights else None,
+        replay={"base_bundle": BASE_BUNDLE_DIR if include_base_weights else None, "base_format": base_format,
                 "method": "exact patch replay: stored after-values and hashes, no editing operator runs",
                 "recipe_reexecution": "not performed; re-running a recipe needs fresh evaluation"},
         excluded=[] if include_final_data else list(DEFAULT_EXCLUSIONS), included_final_data=include_final_data,
@@ -531,6 +556,32 @@ def _export_bundle(engine: Engine, checkpoint_id: str, directory: Path, files: d
         "output_description": manifest.output_semantics.description}, files)
 
 
+def _export_checkpoint(engine: Engine, checkpoint_id: str, directory: Path, files: dict[str, str]) -> None:
+    """An imported open-weight checkpoint: its canonical tensors and its model files (module docstring)."""
+    directory.mkdir(parents=True)
+    engine.store.export_safetensors(checkpoint_id, directory / "model.safetensors")
+    files[f"{BASE_BUNDLE_DIR}/model.safetensors"] = content_hash((directory / "model.safetensors").read_bytes())
+    for name, data in sorted(engine.model_files(checkpoint_id).items()):
+        path = directory / "files" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        files[f"{BASE_BUNDLE_DIR}/files/{name}"] = content_hash(data)
+
+
+def _restore_base(root: Path, manifest: ExportManifest, engine: Engine) -> ModelManifest:
+    """Restore an exported open-weight base checkpoint (``_export_checkpoint``) into ``engine``'s workspace."""
+    from safetensors.torch import load_file
+
+    base_id = manifest.base.checkpoint_id
+    recorded = ModelManifest.model_validate_json(
+        (root / f"checkpoints/{base_id}.manifest.json").read_text(encoding="utf-8"))
+    directory = root / BASE_BUNDLE_DIR
+    tensors = load_file(str(directory / "model.safetensors"))
+    model_files = {path.name: path.read_bytes() for path in sorted((directory / "files").iterdir())
+                   if path.is_file()} if (directory / "files").is_dir() else {}
+    return engine.restore_checkpoint(recorded, tensors, model_files)
+
+
 def replay_export(export_dir: str | Path, engine: Engine) -> ReplayResult:
     """Replay an export into ``engine``'s workspace and verify byte-identical candidate weights.
 
@@ -551,27 +602,38 @@ def replay_export(export_dir: str | Path, engine: Engine) -> ReplayResult:
             raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"exported file {relative} does not match its recorded hash")
     if manifest.replay.get("base_bundle") is None:
         raise WSEError(ErrorCode.INVALID_ARGUMENT, "this export has no base model bundle; export with base weights")
-    base = engine.import_bundle(root / BASE_BUNDLE_DIR)
+    restored = manifest.replay.get("base_format") == "checkpoint"
+    base = _restore_base(root, manifest, engine) if restored else engine.import_bundle(root / BASE_BUNDLE_DIR)
     if base.weights_hash != manifest.base.weights_hash:
         raise WSEError(ErrorCode.ARTIFACT_CORRUPT, "the exported base weights do not match the recorded hash")
-    handles = {manifest.base.checkpoint_id: engine.open_checkpoint(base.checkpoint_id)}
+    handles = {} if restored else {manifest.base.checkpoint_id: engine.open_checkpoint(base.checkpoint_id)}
+    replayed_ids = {manifest.base.checkpoint_id: base.checkpoint_id}
     patches = {patch.patch_id: patch for patch in manifest.patches}
     candidates = []
     for checkpoint in manifest.checkpoints:
         if checkpoint.role != "candidate":
             continue
-        stored = json.loads((root / patches[checkpoint.patch_id].path).read_text(encoding="utf-8"))
+        exported = patches[checkpoint.patch_id]
+        stored = json.loads((root / exported.path).read_text(encoding="utf-8"))
         exact = MaterializedPatch.model_validate(stored["artifact"]["patch"])
-        replayed = replay_patch(handles[checkpoint.parent_checkpoint_id], exact)
-        handles[checkpoint.checkpoint_id] = replayed
-        imported = engine.import_model(ImportManifest(
-            adapter=replayed.adapter_ref, config=replayed.config,
-            provenance={"kind": "import", "source": f"replay of {checkpoint.checkpoint_id}"},
-            license="replayed from an experiment export"), replayed.tensors())
+        if restored:  # an open-weight model: replayed on the restored parent, with the patch's binary blocks
+            blocks = read_patch_file((root / exported.blocks_path).read_bytes())[1] if exported.blocks_path else {}
+            record = engine.store_patch(exact, blocks, base_checkpoint_id=replayed_ids[checkpoint.parent_checkpoint_id],
+                                        label=f"replay of {checkpoint.checkpoint_id}")
+            replayed_hash, replayed_id = record.result_weights_hash, record.checkpoint_id
+        else:
+            replayed = replay_patch(handles[checkpoint.parent_checkpoint_id], exact)
+            handles[checkpoint.checkpoint_id] = replayed
+            imported = engine.import_model(ImportManifest(
+                adapter=replayed.adapter_ref, config=replayed.config,
+                provenance={"kind": "import", "source": f"replay of {checkpoint.checkpoint_id}"},
+                license="replayed from an experiment export"), replayed.tensors())
+            replayed_hash, replayed_id = imported.weights_hash, imported.checkpoint_id
+        replayed_ids[checkpoint.checkpoint_id] = replayed_id
         candidates.append({"checkpoint_id": checkpoint.checkpoint_id, "patch_id": checkpoint.patch_id,
                            "recorded_weights_hash": checkpoint.weights_hash,
-                           "replayed_weights_hash": imported.weights_hash,
-                           "replayed_checkpoint_id": imported.checkpoint_id,
-                           "identical": imported.weights_hash == checkpoint.weights_hash})
+                           "replayed_weights_hash": replayed_hash,
+                           "replayed_checkpoint_id": replayed_id,
+                           "identical": replayed_hash == checkpoint.weights_hash})
     return ReplayResult(base_checkpoint_id=base.checkpoint_id, base_weights_hash=base.weights_hash,
                         candidates=candidates, all_identical=all(c["identical"] for c in candidates))
