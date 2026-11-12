@@ -77,6 +77,7 @@ __all__ = ["Experiment", "ExperimentResult", "TestReport", "experiment_policy", 
 DEFAULT_MAX_EVALUATIONS = 10
 DEFAULT_WALL_CLOCK_HOURS = 12.0  # ten evaluations of Qwen3.5-0.8B at 8,192 tokens take about 6.5 hours
 DEFAULT_MAX_TURNS = 400
+CODEX_ADAPTER = "codex_cli@1"  # the agent runner: the Codex CLI (wse.agent_adapters.codex_cli)
 GENERATION_EVALUATOR = "generation@1"
 TEST_DOUBLE_PREFIXES = ("test-double:", "wse-test-double:")
 
@@ -158,19 +159,14 @@ def parse_agent(agent: str, *, max_turns: int | None = None, wall_clock_seconds:
         return StrategyConfig(strategy=agent.removeprefix("strategy:"), **options)
     for prefix in TEST_DOUBLE_PREFIXES:
         if agent.startswith(prefix):
-            return AgentConfig(adapter=_agent_adapter(), model="wse-test-double:" + agent.removeprefix(prefix),
+            return AgentConfig(adapter=CODEX_ADAPTER, model="wse-test-double:" + agent.removeprefix(prefix),
                                **limits)
     model = agent.removeprefix("codex:")
     if not model:
         raise _invalid("name the agent's model, for example 'codex:gpt-5.6-luna'")
-    return AgentConfig(adapter=_agent_adapter(), model=model, benchmark=False, **limits)
+    return AgentConfig(adapter=CODEX_ADAPTER, model=model, benchmark=False, **limits)
 
 
-def _agent_adapter() -> str:
-    """The agent runner: the Codex CLI adapter when this WSE has it, else the SDK adapter."""
-    from wse.runner import AGENT_ADAPTERS
-
-    return "codex_cli@1" if "codex_cli@1" in AGENT_ADAPTERS else next(iter(AGENT_ADAPTERS))
 
 
 # ---------------------------------------------------------------------------

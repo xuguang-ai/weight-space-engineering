@@ -1923,6 +1923,7 @@ name = "wse"
 version = "0.1.2"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx2" },
     { name = "mcp" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -1930,6 +1931,7 @@ dependencies = [
     { name = "safetensors" },
     { name = "torch" },
     { name = "typing-extensions" },
+    { name = "uvicorn" },
 ]
 
 [package.optional-dependencies]
@@ -1945,6 +1947,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx2", specifier = ">=2.10" },
     { name = "math-verify", marker = "extra == 'models-hf'", specifier = ">=0.9" },
     { name = "mcp", specifier = "==2.3.0" },
     { name = "numpy", specifier = ">=2.0" },
@@ -1953,6 +1956,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.9" },
     { name = "transformers", marker = "extra == 'models-hf'", specifier = ">=5.22.2" },
     { name = "typing-extensions", specifier = ">=4.6" },
+    { name = "uvicorn", specifier = ">=0.31.1" },
 ]
 provides-extras = ["models-hf"]
 
