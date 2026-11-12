@@ -77,7 +77,7 @@ OPENAI_BASE_URL=https://api.openai.com/v1
 
 For Azure OpenAI, set `OPENAI_BASE_URL` to your resource's endpoint, `https://YOUR-RESOURCE.services.ai.azure.com/openai/v1`, and put your deployment's name after `codex:`. `uv run --env-file .env` loads the file for one command only.
 
-The key stays outside the agent: Codex reaches your provider through a local proxy that WSE runs for the experiment and that adds the key to each request. Neither Codex nor the code the agent writes holds the key, and no record contains it.
+The key stays outside the agent: Codex reaches your provider through a proxy on `127.0.0.1` that WSE runs for the experiment and that adds the key to each request (`wse.model_proxy`). The agent's process holds only a random token for that proxy, valid while the run lasts; neither Codex nor the code the agent writes holds the key, and the proxy's log records no key, token, or request body.
 
 ## Data
 
