@@ -1,7 +1,6 @@
 """Qwen keeps looping in its reasoning: inspect the model, edit its weights, and measure whether it finishes more answers.
 
-The README's "Edit a language model with Python" section shows this script step by step, on Qwen3.5-0.8B and
-32 GSM8K training problems:
+Four steps on Qwen3.5-0.8B and 32 GSM8K training problems; docs/results.md, Section 3, gives the output of each:
 
 1. Diagnose: generate answers, count those cut off at the token limit, and count how many of them end in a loop
    (at least half of the lines in their last 2,000 characters repeat an earlier line there).
@@ -17,7 +16,7 @@ The layers, the columns, and each direction come from p50c, the edit published w
 Programming": a direction is the top singular vector of p50c's change to its columns, signed so that its
 largest-magnitude entry is positive, as ``svd_top_k@1`` signs its vectors. The script reconstructs p50c's edit
 from the published change; it does not discover it. GSM8K's training set serves as practice problems, so that
-MATH-500 stays unseen. The README lists the downloads into the data directory.
+MATH-500 stays unseen. docs/results.md, Section 3, lists the downloads into the data directory.
 
 Usage: ``uv run --extra models-hf python examples/p50c_four_steps.py [DATA_DIR]`` (default ``~/wse-data``).
 On an M4 Pro it takes about two hours, almost all of it in three generation passes of about 37 minutes each

@@ -1,6 +1,6 @@
 """One agent experiment on a faulty 22-parameter classifier, with all of its setup written out.
 
-The README's "Run an agent through MCP" section shows this script step by step:
+The six steps:
 
 1. Load the target model: a 2 -> 4 -> 2 classifier whose two output rows have identical weights.
 2. Define the task: the statement the agent reads and the objective that counts as success.
