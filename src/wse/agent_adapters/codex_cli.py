@@ -1195,9 +1195,9 @@ class CodexCLIAdapter(AgentAdapter):
     ``close``. ``max_resumes`` bounds the resumed segments; the grace periods
     bound the stop sequence (SIGINT, SIGTERM, SIGKILL), the wait for
     descendant processes, and (``terminate_grace_seconds``) the time a
-    leftover process gets between SIGTERM and SIGKILL. ``log_dir`` defaults to the directory of the run's
-    server log (``--log-file`` of the serve command), else
-    ``<workspace>/logs``. ``extra_env`` adds variables to Codex's own
+    leftover process gets between SIGTERM and SIGKILL. ``log_dir`` defaults
+    to the directory of the run's server log (``--log-file`` of the serve
+    command), else ``<workspace>/logs``. ``extra_env`` adds variables to Codex's own
     environment (not its commands'); names that look like credentials are
     refused. ``tool_timeout_seconds`` overrides how long one WSE tool call
     may take (default: the run's wall-clock limit, at least the runner's
