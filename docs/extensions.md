@@ -246,8 +246,8 @@ Agent SDKs are optional extras imported lazily inside the adapter module.
 
 ## Direct Python use
 
-For open-weight language models, the high-level entry point `wse.WSE`
-wraps the core and the operator `Engine` (see the README's Python example).
+For open-weight language models, the high-level entry point `wse.Model`
+wraps the core and the operator `Engine` ([models.md](models.md#the-model-api)).
 It accepts short names (`layers.15.mlp.down_proj` for
 `model.language_model.layers.15.mlp.down_proj.weight`), NumPy-style indices
 (`[:, :64]`), and roles that name tensors across families

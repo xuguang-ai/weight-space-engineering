@@ -13,8 +13,8 @@ extension contracts in [extensions.md](extensions.md).
 1. **Prepare the workspace (operator).** Import the task model and register
    the task, policy, development and final data, and suites. For the
    signed-sum task, steps 1 to 4 of
-   [examples/signed_sum/agent_api.py](../examples/signed_sum/agent_api.py),
-   which the README walks through, make these calls;
+   [examples/signed_sum/agent_api.py](../examples/signed_sum/agent_api.py)
+   make these calls, each written out;
    `examples/signed_sum/build_fixture.py OUT --workspace WORKSPACE` makes
    the same ones for the trial harness. The final set lives only in the
    workspace's evaluator storage. [Your own task](#your-own-task) describes
@@ -45,7 +45,7 @@ agent sees only the descriptions of its WSE tools and the tool results. The
 task states the behavior to reach and how it is measured, never what is
 wrong with the model, how the model was built, or how to change it.
 
-For the signed-sum task, the README's live run of 2026-11-11 received this
+For the signed-sum task, the agent example's live run of 2026-11-11 received this
 text, rendered here from its export's `task.json` and `policy.json` with the
 run's experiment ID and tools. An earlier run that day, under the built-in
 `small_model_v1` with the same values, received the same text apart from
@@ -98,7 +98,7 @@ and suites as its first observation ([Stepwise strategies](#stepwise-strategies)
 
 ### Your own task
 
-An experiment is registered in four parts. The README's agent example writes
+An experiment is registered in four parts. The signed-sum agent example writes
 each one out, in steps 1 to 4 of
 [examples/signed_sum/agent_api.py](../examples/signed_sum/agent_api.py):
 
@@ -165,7 +165,7 @@ The two policies used so far:
 (`wse.policy.qwen_loop_sandbox_policy()`) is `qwen_loop_v1` with code
 execution: 100 sandbox calls of at most 300 s of wall-clock time each and
 7,200 s in all, and job waits of up to 600 s
-([below](#code-execution-in-a-sandbox-unverified)). The README's agent
+([below](#code-execution-in-a-sandbox-unverified)). The signed-sum agent
 example registers `small_model_v1`'s values as `signed_sum_policy_v1`. The budgets in the
 article that WSE reproduces count larger passes: there, one Qwen pass could
 generate answers to up to 512 practice problems or read up to 1,024 texts
@@ -290,7 +290,7 @@ server, whose environment is an allow-list, and neither is written to the
 workspace or an export: the controller record names only the kind of
 endpoint (`openai`, `azure_openai`, or `openai_compatible`). The model
 provider receives the task instructions and the tool results, and bills the
-calls to your account. The README's signed-sum run of 2026-11-11 made 8
+calls to your account. The signed-sum agent example's run of 2026-11-11 made 8
 requests, with 68,866 input and 1,428 output tokens.
 
 ### Stop conditions
@@ -536,7 +536,7 @@ freezes the experiment. With `final_evaluation=True`, as the example below
 passes, it also runs the final evaluation, exports the closed experiment,
 and replays the export. `examples/signed_sum/agent_api.py` sets up a new
 signed-sum workspace in the directory it is given and runs one experiment
-this way; the README walks through its six steps. Offline, with a scripted
+this way, in six steps that its docstring lists. Offline, with a scripted
 controller in place of a model, it takes a few seconds. The IDs differ per
 run:
 

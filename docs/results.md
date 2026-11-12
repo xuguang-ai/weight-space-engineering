@@ -14,7 +14,7 @@ The sections:
 
 ## 1. Published edits import exactly
 
-The article's published logs hold three Qwen3.5-0.8B edits, named after Astra's budgets of 10, 25, and 50 forward passes, with SHA-256 hashes of every base and edited tensor. `WSE.apply_patch` and `wse import-patch` check every base hash before rebuilding. They rebuild each tensor as the article's `apply_edit.py` does, and require every edited hash and changed-entry count to match.
+The article's published logs hold three Qwen3.5-0.8B edits, named after Astra's budgets of 10, 25, and 50 forward passes, with SHA-256 hashes of every base and edited tensor. `Model.apply_patch` and `wse import-patch` check every base hash before rebuilding. They rebuild each tensor as the article's `apply_edit.py` does, and require every edited hash and changed-entry count to match.
 
 | Edit | Tensors | Form | Changed entries | WSE weights hash of the edited model |
 | --- | ---: | --- | ---: | --- |
@@ -34,7 +34,7 @@ Records: [M2 Q1 report](../dev/m2-q1-report.md), Section 3, and [M2 Q2 report](.
 - the profile `qwen35think@1`, the article's sampling (thinking on, a boxed-answer instruction, temperature 0.6, top-k 20, top-p 0.95, presence penalty 1.5), at its full limit of 32,768 new tokens, evaluation seed 0, and the grader `math_boxed@1`;
 - one process, 6 h 5 min in all.
 
-The recorded run used `wse compare-generation`. The README's reproduction of it, `compare` with `problems=25`, no `max_new_tokens`, and an `out_dir` (which records every problem and resumes an interrupted run), calls the same runner with the same defaults: subset seed 0, evaluation seed 0, and batch size 8.
+The recorded run used `wse compare-generation`. The [reproduction below](#reproduce-the-comparison), `compare` with `problems=25`, no `max_new_tokens`, and an `out_dir` (which records every problem and resumes an interrupted run), calls the same runner with the same defaults: subset seed 0, evaluation seed 0, and batch size 8.
 
 | Metric | Base | p50c | Paired difference, p50c − base (95% cluster bootstrap) | Exact 95% intervals (Clopper–Pearson) |
 | --- | ---: | ---: | --- | --- |
@@ -54,6 +54,53 @@ An exact two-sided sign test on the 12 problems where the two models disagree (1
 - **Against the article.** The article reports 7.9% → 48.1% accuracy and 93.0% → 33.1% of answers cut off, with 4 samples on all 500 problems. Each of the four values lies inside the matching exact interval above. Twenty-five problems confirm the direction of the change; they cannot tell whether its size matches.
 - **A cut-off answer can count as correct.** One base answer reached the limit and still counts as correct: its last `\boxed{9}` sits inside a thinking block that never closed. The article's evaluation grades cut-off answers the same way.
 
+### Reproduce the comparison
+
+It takes about six hours on an M4 Pro. With p50c's directory from [Section 3's downloads](#downloads), fetch MATH-500 at a fixed revision; the `hf` command comes with the `models-hf` extra:
+
+```bash
+uv run --extra models-hf hf download HuggingFaceH4/MATH-500 test.jsonl \
+  --repo-type dataset \
+  --revision 6e4ed1a2a79af7d8630a6b768ec859cb5af4d3be \
+  --local-dir ~/wse-data/MATH-500
+```
+
+Then save the following as `compare_p50c.py` and run it with `uv run --extra models-hf python compare_p50c.py`:
+
+```python
+from pathlib import Path
+
+from wse import Model
+
+data = Path("~/wse-data").expanduser()
+
+base = Model.from_pretrained(
+    "Qwen/Qwen3.5-0.8B",
+    revision="2fc06364715b967f1860aea9cf38778875588b17",
+    workspace=data / "workspace",
+)
+
+edited = base.apply_patch(
+    data / "lm_understand-logs/exp8_math/runs/p50c/edit",
+    repo="RikiyaT/lm_understand-logs",
+    revision="4d09ba6d6a7e891dd8063974dfe81b3d78e3494f",
+)
+
+print(edited.table())
+assert edited.verify()
+
+comparison = base.compare(
+    edited,
+    data / "MATH-500/test.jsonl",
+    problems=25,
+    profile="qwen35think@1",
+    out_dir=data / "runs/p50c",
+)
+print(comparison.table())
+```
+
+`apply_patch` refuses the edit unless every tensor matches its published SHA-256, and `verify()` replays the patch and checks every hash. For a quick check, pass `problems=2` and `max_new_tokens=1024` and leave out `out_dir`: this took about 80 seconds on an M4 Pro, but the short limit cuts off both models' answers. This script was written and run with the class's earlier name, `WSE`; `Model` is the same class, renamed.
+
 Record: [M2 Q1 report](../dev/m2-q1-report.md), Section 6.
 
 ## 3. Reconstructing p50c in four steps
@@ -69,7 +116,25 @@ An experiment follows four steps, each with its own tools:
 
 [examples/p50c_four_steps.py](../examples/p50c_four_steps.py) runs them on Qwen3.5-0.8B. It reconstructs a published intervention; it does not rediscover it. The article's agent, GPT-6 Astra, found p50c itself, by analyzing the weights in a Python kernel and running the model on practice problems. In each of layers 15 and 19, p50c subtracts six times the projection of 64 columns of `mlp.down_proj` onto one direction of that layer. Here, the direction and the columns come from p50c's published change: the columns it changes, and the top singular vector of its change to them, signed so that its largest-magnitude entry is positive. WSE's own `project_out` operator then re-executes the edit.
 
-The README's Python example walks through the script step by step, with the downloads it needs: p50c's directory and GSM8K's training set as practice problems, so that the MATH-500 problems stay unseen. The data directory defaults to `~/wse-data`:
+### Downloads
+
+The script needs two downloads besides the model, which downloads when `from_pretrained` runs: p50c's directory from the article's logs, and GSM8K's training set as practice problems, so that the MATH-500 problems stay unseen. These commands fetch both at fixed revisions into the data directory, which defaults to `~/wse-data`; run the clone step once for this directory:
+
+```bash
+M=~/wse-data
+mkdir -p "$M"
+
+git clone --filter=blob:none --no-checkout \
+  https://github.com/RikiyaT/lm_understand-logs \
+  "$M/lm_understand-logs"
+git -C "$M/lm_understand-logs" sparse-checkout set exp8_math/runs/p50c/edit
+git -C "$M/lm_understand-logs" checkout 4d09ba6d6a7e891dd8063974dfe81b3d78e3494f
+
+curl -L --create-dirs -o "$M/gsm8k/train.jsonl" \
+  https://raw.githubusercontent.com/openai/grade-school-math/3101c7d5072418e28b9008a6636bde82a006892c/grade_school_math/data/train.jsonl
+```
+
+Then run the script, which needs about 3 GB of disk:
 
 ```bash
 uv run --extra models-hf python examples/p50c_four_steps.py ~/wse-data
@@ -215,7 +280,7 @@ candidate: 0 of 21 cut-off answers end in a loop
   - comments.
 - **A third process.** The rerun behind the permutation check of step 2 reproduced the 32 base answers token for token.
 - **The published script.** On 2026-11-11 it ran on a copy of the second run's data and repeated steps 1 to 3, in 42.5 minutes while other jobs shared the machine. Step 1 reproduced the 32 base answers token for token, with the same finished flags. `save()` returned the stored candidate, `ckpt_74cd8078…`, so step 4 resumed from the recorded comparison and printed the same table.
-- **An earlier operator run.** An earlier run of the same edit through `WSE.compare`, on the same 32 problems, gave the same aggregates.
+- **An earlier operator run.** An earlier run of the same edit through `WSE.compare` (the class now named `Model`), on the same 32 problems, gave the same aggregates.
 
 **Time.** The whole script took 1 h 54 min. Each generation pass took about 37 minutes: 2,224 s per model in the second run's comparison, and 2,235 s in the first. The probe and the edits took about 1.6 minutes together.
 
@@ -292,7 +357,7 @@ Record: [M2 Q2 report](../dev/m2-q2-report.md), Sections 3 and 4.
 
 **Single runs on 2026-11-11.**
 
-- **The README's agent example,** [examples/signed_sum/agent_api.py](../examples/signed_sum/agent_api.py) with `--model gpt-5.6-luna`, which writes out the model, task, data, and policy, under `signed_sum_policy_v1` (the values of `small_model_v1`). It met the target in 8 turns and 11 tool calls, with 68,866 input and 1,428 output tokens, in 20 s. The agent read the four tensors and stated that the two output rows are identical, and that setting class 1's weights to the negation of class 0's gives the logits (−s, s), where s = x0 + x1. It set class 1's row to [1, −1, 1, −1] with `set_slice`, as the acceptance trials did, changing 4 of the 22 parameters, and its first development evaluation met the target. Final accuracy was 1.0 on 512 pairs against 0.5 for the control, and the export replayed to byte-identical weights. Of its budget it used 1 of 10 development evaluation batches, 1 of 20 candidate commits, and 4 of 100 tensor reads. An earlier run of the example that day, before a change that only moved its task and policy definitions into variables, made the same edit in 8 turns and 11 tool calls, with 69,191 input and 1,425 output tokens.
+- **The agent example,** [examples/signed_sum/agent_api.py](../examples/signed_sum/agent_api.py) with `--model gpt-5.6-luna`, which writes out the model, task, data, and policy, under `signed_sum_policy_v1` (the values of `small_model_v1`). It met the target in 8 turns and 11 tool calls, with 68,866 input and 1,428 output tokens, in 20 s. The agent read the four tensors and stated that the two output rows are identical, and that setting class 1's weights to the negation of class 0's gives the logits (−s, s), where s = x0 + x1. It set class 1's row to [1, −1, 1, −1] with `set_slice`, as the acceptance trials did, changing 4 of the 22 parameters, and its first development evaluation met the target. Final accuracy was 1.0 on 512 pairs against 0.5 for the control, and the export replayed to byte-identical weights. Of its budget it used 1 of 10 development evaluation batches, 1 of 20 candidate commits, and 4 of 100 tensor reads. An earlier run of the example that day, before a change that only moved its task and policy definitions into variables, made the same edit in 8 turns and 11 tool calls, with 69,191 input and 1,425 output tokens.
 - **The example's previous version,** which prepared the same task through `build_fixture.py` under `small_model_v1` (run from a fresh clone). It met the target in 8 turns and 11 tool calls, with 68,681 input and 1,402 output tokens, in about 30 s. Its one edit, `scale_slice` by −1 on `layers.1.weight[1:2, 0:4]`, gives the same weights, with the same final result and replay.
 
 The instructions of these runs are in [experiments.md](experiments.md#what-the-agent-is-told).

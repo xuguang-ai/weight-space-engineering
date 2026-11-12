@@ -453,7 +453,8 @@ class Edit:
 
     def table(self) -> str:
         """One line per changed tensor: changed entries, relative L2 change, and the before and after hashes."""
-        lines = [f"{len(self.changed)} tensors changed, {self.changed_elements:,} entries; "
+        count = len(self.changed)
+        lines = [f"{count} tensor{'' if count == 1 else 's'} changed, {self.changed_elements:,} entries; "
                  f"weights {_short_hash(self.base.weights_hash)} -> {_short_hash(self.model.weights_hash)}"]
         for d in self.changed:
             lines.append(f"  {d.tensor}: {d.changed_elements:,} of {d.element_count:,} entries, relative L2 change "
