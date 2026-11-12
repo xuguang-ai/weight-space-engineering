@@ -109,11 +109,17 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(16)}"
 
 
-def _wait_seconds(value: Any) -> float:
+def wait_cap(policy: Any) -> float:
+    """How long one ``get_job`` call may wait under ``policy``: its ``max_job_wait_seconds``, or 10 seconds."""
+    cap = getattr(policy, "max_job_wait_seconds", None)
+    return MAX_WAIT_SECONDS if cap is None else float(cap)
+
+
+def _wait_seconds(value: Any, cap: float = MAX_WAIT_SECONDS) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
-            or not 0 <= value <= MAX_WAIT_SECONDS:
-        raise WSEError(ErrorCode.INVALID_ARGUMENT,
-                       f"wait_seconds must be a number between 0 and {MAX_WAIT_SECONDS:g}")
+            or not 0 <= value <= cap:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, f"wait_seconds must be a number between 0 and {cap:g}",
+                       details={"max_wait_seconds": cap})
     return float(value)
 
 
@@ -859,11 +865,12 @@ class JobService:
     def get_job(self, experiment_id: str, job_id: str, wait_seconds: float = 0) -> Job:
         """The job's state, progress, usage, and inline result.
 
-        ``wait_seconds`` (0-10) holds the call until the job is terminal or
-        the wait expires.
+        ``wait_seconds`` holds the call until the job is terminal or the wait
+        expires, at most the policy's ``max_job_wait_seconds`` (10 seconds
+        when unset).
         """
-        wait = _wait_seconds(wait_seconds)
         self.experiments._experiment_row(experiment_id)
+        wait = _wait_seconds(wait_seconds, wait_cap(self.experiments.experiment_policy(experiment_id)))
         deadline = time.monotonic() + wait
         while True:
             self.recover_lost_jobs()

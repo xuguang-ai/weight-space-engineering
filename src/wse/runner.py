@@ -103,6 +103,7 @@ from wse.strategies.base import STRATEGY_TOOLS, Action, Observation
 __all__ = [
     "EVALUATION_TOOLS",
     "SANDBOX_TOOLS",
+    "agent_session_timeout",
     "JOB_TOOLS",
     "OPERATOR_INTERRUPT",
     "PROBE_TOOLS",
@@ -200,6 +201,27 @@ def constraint_for(policy: ExperimentPolicy, verified: bool) -> tuple[str, str |
     return ("verified" if verified else "unverified"), None
 
 
+# The agent's MCP session must outlast the longest tool call a policy permits (M3 plan Section 2.4).
+SESSION_TIMEOUT_MARGIN_SECONDS = 20.0
+SANDBOX_CALL_MARGIN_SECONDS = 120.0  # exporting inputs before a call and storing its outputs after it
+
+
+def agent_session_timeout(policy: ExperimentPolicy, configured: float) -> float:
+    """The agent's MCP session timeout: ``configured``, raised above the longest tool call of ``policy``.
+
+    The longest calls are a ``wse_get_job`` wait (the policy's cap) and,
+    under a sandbox policy, a ``wse_run_python`` call (its wall-clock limit,
+    plus the export of inputs before it and the storing of outputs after it).
+    """
+    from wse.jobs import wait_cap
+
+    longest = wait_cap(policy) + SESSION_TIMEOUT_MARGIN_SECONDS
+    if sandbox_available(policy):
+        assert policy.sandbox is not None
+        longest = max(longest, policy.sandbox.seconds_per_call + SANDBOX_CALL_MARGIN_SECONDS)
+    return max(float(configured), longest)
+
+
 def allowed_tools(policy: ExperimentPolicy) -> list[str]:
     """The WSE tools a controller of this policy may use, in ``STRATEGY_TOOLS`` order.
 
@@ -239,10 +261,16 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
     batches = bounded and budget.evaluation_batches > 0
     passes = bounded and budget.limit("generation_passes") > 0
     probes = probes_available(policy)
+    sandbox = sandbox_available(policy)
     evaluation = batches or passes
+    from wse.jobs import wait_cap
+
+    cap = wait_cap(policy)
     lines = [
         "You control one managed weight-space engineering experiment through the WSE tools listed below. They are "
-        "your only tools: you cannot run code, read files, or use the network.",
+        + ("your only tools. wse_run_python runs your own Python in a sandbox that reads only its own inputs and has "
+           "no network; no other tool runs code, reads files, or uses the network." if sandbox else
+           "your only tools: you cannot run code, read files, or use the network."),
         "",
         f"Experiment ID: {experiment_id} (the tools use it when you omit experiment_id)",
         f"Task {task.task_id}: {task.title}",
@@ -274,6 +302,11 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
         lines += [f"- probe calls: {budget.probe_calls}, each at most {budget.texts_per_probe_call} texts of at most "
                   f"{budget.tokens_per_probe_text} tokens; {budget.teacher_forced_tokens} teacher-forced tokens in "
                   "total"]
+    if sandbox:
+        assert policy.sandbox is not None
+        lines += [f"- sandbox calls: {budget.sandbox_calls}, each at most {policy.sandbox.seconds_per_call:g} s of "
+                  f"wall-clock time; {budget.sandbox_seconds:g} s in total. WSE counts the calls and their time; "
+                  "what your code computes is not metered, so this run is unverified."]
     lines += [f"- computation time: {budget.compute_seconds:g} s in total, at most {budget.seconds_per_operation:g} s "
               "per operation",
               "Consumed allowance is never refunded; every result reports usage and the remaining budget.",
@@ -294,13 +327,22 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
                      "and optionally two groups of text indices for a contrast; wait for its job with wse_get_job. "
                      "Its vectors are references (<result_uri>#/sites/<i>/contrast/direction) that wse_analyze and "
                      "wse_preview_patch accept.")
+    if sandbox:
+        steps.append("Run your own Python with wse_run_python (NumPy, PyTorch on the CPU, safetensors; each call is a "
+                     "fresh process with a time limit). It reads inputs/weights/base.safetensors (the base "
+                     "checkpoint's permitted tensors in their stored dtype; load them with "
+                     "safetensors.torch.load_file), inputs/passes/<report_id>.jsonl (every output of your generation "
+                     "passes, with its grade and text), and inputs/probes/<job_id>.npz and .json (your probe "
+                     "vectors); it writes work/ (kept between calls) and outputs/. Each numeric vector or matrix you "
+                     "save to outputs/ with numpy.save comes back with a pointer, <result_uri>#/values (a row: "
+                     "#/values/<row>), which wse_preview_patch and wse_analyze accept as a stored vector.")
     steps.append("Propose an edit with wse_preview_patch (base_checkpoint_id, a hypothesis of one or two sentences "
                  "stating the observable evidence, and the operations), then create a candidate with wse_apply_patch "
                  "by patch_id.")
     if evaluation:
         text = ("Evaluate checkpoints with wse_submit_evaluation on a development suite with a preregistered "
-                "eval_config (sample_count, seed), wait with wse_get_job (wait_seconds up to 10), read a whole "
-                "report with wse_get_report, and compare two reports with wse_compare.")
+                f"eval_config (sample_count, seed), wait with wse_get_job (wait_seconds up to {cap:g}), read a "
+                "whole report with wse_get_report, and compare two reports with wse_compare.")
         if passes:
             text += (" A generation suite's report gives every output's grade, length, whether it reached the token "
                      "limit, the end of its text, and its output_uri; wse_compare pairs two such reports on accuracy, "
@@ -965,6 +1007,9 @@ class ReferenceRunner:
 
     def _run_agent(self, run_id: str, eid: str, task: TaskDefinition, policy: ExperimentPolicy,
                    config: AgentConfig, interrupt: _OperatorInterrupt) -> None:
+        timeout = agent_session_timeout(policy, config.client_session_timeout_seconds)
+        if timeout != config.client_session_timeout_seconds:
+            config = config.model_copy(update={"client_session_timeout_seconds": timeout})
         adapter = self._make_adapter(config, eid)
         constraint_status, constraint_reason = constraint_for(policy, config.benchmark)
         connection = self.connection(run_id, eid, task, policy, constraint_status)

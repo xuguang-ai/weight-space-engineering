@@ -71,6 +71,7 @@ from wse.api import MODEL_PAGE_SIZE, Engine, model_list_page
 from wse.api import manifest_uri as _manifest_uri
 from wse.jobs import MAX_WAIT_SECONDS
 from wse.jobs import _wait_seconds as wait_seconds_value
+from wse.jobs import wait_cap
 from wse.probes import DEFAULT_SUMMARY_TOP, MAX_PROBE_SITES, MAX_SITE_CHARACTERS, MAX_SUMMARY_TOP
 from wse.store import ANALYSIS_URI_PREFIX
 from wse.schemas import (
@@ -353,6 +354,8 @@ class WSEMCPServer:
             raise WSEError(ErrorCode.POLICY_DENIED, "the MCP server serves only an Engine bound to one run grant")
         self.engine = engine
         self.constraint_status = constraint_status
+        grant = engine.experiments.get_run_grant(engine.bound_run_id)
+        self.wait_cap = wait_cap(engine.get_policy(grant.policy_id))
         self._lock = threading.Lock()
         self.server: MCPServer = MCPServer(SERVER_NAME, instructions=server_instructions(engine),
                                            version=_package_version(), log_level="INFO")
@@ -401,7 +404,7 @@ class WSEMCPServer:
             (self.wse_preview_patch, MUTATION),
             (self.wse_apply_patch, MUTATION),
             (self.wse_submit_evaluation, MUTATION),
-            (self.wse_get_job, READ_ONLY),
+            (self._get_job_tool(), READ_ONLY),
             (self.wse_get_report, READ_ONLY),
             (self.wse_cancel_job, MUTATION),
             (self.wse_compare, READ_ONLY),
@@ -409,6 +412,22 @@ class WSEMCPServer:
         ]
         for function, annotations in tools:
             self.server.add_tool(function, name=function.__name__, annotations=annotations)
+
+    def _get_job_tool(self) -> Callable[..., Any]:
+        """``wse_get_job`` as this run publishes it: its policy's wait cap in the schema and the description."""
+        cap = self.wait_cap
+        wait_arg = Annotated[float, Field(json_schema_extra={"minimum": 0, "maximum": cap},
+                                          description=f"Seconds (0-{cap:g}) to hold the call until the job is "
+                                                      "terminal.")]
+
+        def wse_get_job(*, experiment_id: str | None = None, job_id: str, wait_seconds: float = 0) -> Any:
+            return self.wse_get_job(experiment_id=experiment_id, job_id=job_id, wait_seconds=wait_seconds)
+
+        wse_get_job.__annotations__ = {"experiment_id": ExperimentIdArg, "job_id": IdArg, "wait_seconds": wait_arg,
+                                       "return": Annotated[CallToolResult, ToolResponse[Job]]}
+        wse_get_job.__doc__ = (WSEMCPServer.wse_get_job.__doc__ or "").replace(
+            "can wait up to 10 seconds", f"can wait up to {cap:g} seconds")
+        return wse_get_job
 
     def _experiment_id(self, experiment_id: str | None) -> str:
         """The experiment a call names: ``experiment_id``, or this run's experiment when it is omitted."""
@@ -623,7 +642,7 @@ class WSEMCPServer:
         """
         # The wait happens here, polling outside the lock; the service validates every argument.
         eid = self._call(self._experiment_id, experiment_id)
-        wait = self._call(wait_seconds_value, wait_seconds)
+        wait = self._call(wait_seconds_value, wait_seconds, self.wait_cap)
         deadline = time.monotonic() + wait
         while True:
             job = self._call(self.engine.get_job, eid, job_id, 0)
