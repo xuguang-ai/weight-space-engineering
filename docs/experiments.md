@@ -3,7 +3,7 @@
 This document describes how an operator runs managed weight-space
 engineering trials with the reference runner, what each trial records and
 exports, and how to read the results. It covers tasks, agent instructions,
-and budgets, stepwise strategies, the OpenAI Agents SDK reference agent and
+and budgets, stepwise strategies, the Codex CLI agent and
 its model configuration, exports and replay, and the offline demo whose
 reports appear below. Tool contracts are in [protocol.md](protocol.md);
 extension contracts in [extensions.md](extensions.md).
@@ -193,48 +193,56 @@ candidate at a time, selecting each improvement. In `weights_only` mode it
 commits and selects its first candidate and stops. It reads neither the
 fixture builder nor any reference model or oracle.
 
-### OpenAI Agents SDK reference agent
+### The Codex CLI agent
 
-`--controller openai-agents --model MODEL` (or `{"kind": "agent", "model":
-MODEL}`) runs `OpenAIAgentsAdapter` from the optional `agents-openai` extra.
-The operator chooses the model name, which must name a model with tool calls
-at the provider; every recorded trial used `gpt-5.6-luna`. Credentials come
-from the SDK's normal environment configuration (`OPENAI_API_KEY`, and
-`OPENAI_BASE_URL` for an endpoint other than OpenAI's; see
-[Agent model configuration](#agent-model-configuration)) and are never
-read, recorded, or passed to the WSE server.
+`--controller codex --model MODEL`, `{"kind": "agent", "model": MODEL}`
+(the adapter `codex_cli@1` is the default), or `Experiment.run(agent=
+"codex:MODEL")` runs `CodexCLIAdapter`: OpenAI's Codex CLI, `codex exec
+--json`, as the agent of one run grant. The operator chooses the model
+name, which must name a model with tool calls at the provider; the recorded
+Codex run used `gpt-5.6-luna` ([results](results.md#6-a-live-llm-agent-edits-a-language-model-through-experiment)).
+WSE runs the binary that `WSE_CODEX_PATH` names, else the `codex` on `PATH`,
+else the newest one bundled with OpenAI's VS Code extension, and on macOS
+only after its code signature names OpenAI (Team ID `2DC432GLL2`); it has
+been tested with codex-cli 0.167.0-alpha.4.1.
 
 | Setting | Value |
 | --- | --- |
-| SDK loop | the SDK's own `Agent` and `Runner.run`; no second tool loop around it |
-| Tools | only the allow-listed WSE MCP tools (static tool filter); evaluation tools only when the policy permits evaluation; no hosted, shell, file, or code tools |
-| MCP connection | `MCPServerStdio` running `wse serve --run-id RUN` on the same workspace, started in the workspace directory with an allow-listed environment (`PATH`, `HOME`, locale, `TMPDIR`, `PYTHONPATH`, `VIRTUAL_ENV`; names that look like credentials are refused); `client_session_timeout_seconds` 30, raised above the longest call the policy permits (`wse.runner.agent_session_timeout`: a `wse_evaluate` wait of up to the policy's `seconds_per_operation` and 15 s, a `wse_get_job` wait, or a sandbox call) |
-| Scheduler | the `wse serve` process owns the run's job scheduler (one worker); the runner starts none |
-| Turn limit | `max_turns=100`, always passed explicitly (the SDK default is 10) |
-| Wall clock | 900 s per trial, independent of WSE's 300 s computation budget |
-| Tracing | `RunConfig(tracing_disabled=True)`, no sensitive trace data, and `OPENAI_AGENTS_DISABLE_TRACING=1` for the server; a benchmark configuration cannot enable tracing |
-| Instructions | generated from `task.json` and the policy (`wse.runner.render_instructions`), never from repository documentation |
+| Codex home | one per run, `<log_dir>/codex-<run_id>/home`: `config.toml` (checked with `--strict-config`) and the WSE skill, `skills/wse/SKILL.md`; nothing from `~/.codex`, and no `AGENTS.md`, project configuration, plugins, apps, web search, image tools, sub-agents, hooks, or memories |
+| Model access | WSE's model proxy on 127.0.0.1 ([below](#agent-model-configuration)); Codex holds only a per-run token |
+| Tools | the run's allow-listed WSE MCP tools, offered as direct function tools and approved without asking, and Codex's own shell under the permission profile `wse` ([what the agent's commands can reach](experiment-api.md#what-the-agent-can-reach)) |
+| MCP connection | Codex starts `wse serve --run-id RUN --no-worker` as its stdio MCP server `wse`, in the workspace directory with an allow-listed environment (`PATH`, `HOME`, locale, `TMPDIR`, `PYTHONPATH`, `VIRTUAL_ENV`; names that look like credentials are refused); one tool call may last as long as the policy's longest operation (`wse.runner.agent_session_timeout`: a `wse_evaluate` wait of up to the policy's `seconds_per_operation` and 15 s, a `wse_get_job` wait, or a sandbox call) |
+| Scheduler | the adapter runs the workspace's evaluation worker from start to finish, so jobs outlive a Codex segment and its server |
+| Segments | the agent stops with a final message whose first line starts with `WSE-STOP:`; a turn that ends without it while budget remains, or after an error that a new turn can fix, is continued with `codex exec resume`, at most twice |
+| Turn limit | `max_turns` (default 100; `Experiment.run`, 400) counts model requests in Codex's session record, so a fast loop can make one more |
+| Wall clock | `wall_clock_seconds` (default 900; `Experiment.run`, 12 hours) for all segments together; then WSE stops Codex with SIGINT, SIGTERM, and SIGKILL, and ends every process Codex started |
+| Constraint status | `unverified`: the agent's commands compute what WSE does not meter (`wse.runner.OWN_CODE_CONSTRAINT_REASON`) |
+| Instructions | generated from `task.json` and the policy (`wse.runner.render_instructions`, saying what the agent's commands can do), a section on how the run works in Codex, and the skill; never from repository documentation |
+| Logs | each segment's JSONL events and standard error, Codex's session record, the proxy's request log, and the first prompt, under `<log_dir>/codex-<run_id>/`; usage per model request (input, cached input, output, and reasoning tokens), never the model's private reasoning |
 
-The agent cannot reach the source code, this documentation, the plan, the
-fixture builder, or the final data: its only channel is the run-bound WSE
-tools, which see only the grant's base checkpoint and the run's own
-candidates, patches, jobs, and reports.
+The agent's commands cannot reach the source code, this documentation, the
+plan, the fixture builder, WSE's database, or the final data, and its WSE
+tools see only the grant's base checkpoint and the run's own candidates,
+patches, jobs, and reports.
 
-`--model wse-test-double:STRATEGY` replaces the language model with an SDK
-`Model` test double whose tool calls come from a registered strategy. The
-real SDK runner then drives a real `wse serve` without any network access;
-the demo below and the adapter tests use it. Its token counts are synthetic
-(about four characters per token) and its provider is reported as
+`--model wse-test-double:STRATEGY` runs an offline stand-in instead of
+Codex (`wse.agent_adapters.codex_test_double`), whose tool calls come from a
+registered strategy, through the same configuration, MCP server, event
+stream, and process handling. It is a toolchain check, not an agent; its
+token counts are synthetic and its provider is reported as
 `wse-test-double`.
 
 ### Agent model configuration
 
-The reference agent needs a model that supports tool calls, named with
-`--model` (or `model=`), and the provider's key and endpoint in the
-environment of the process that runs it. The SDK reads them from
-`OPENAI_API_KEY` and `OPENAI_BASE_URL`. Models other than `gpt-5.6-luna`
-have not been tested; the recorded trials reached it through an Azure
-OpenAI deployment.
+The agent needs a model that supports tool calls, named with `--model` (or
+`codex:MODEL`), and the provider's key and endpoint in the environment of
+the process that runs WSE, as `OPENAI_API_KEY` and `OPENAI_BASE_URL`. They
+stay in that process: for each run, WSE starts a proxy on `127.0.0.1`
+(`wse.model_proxy`) that adds the key to Codex's requests and forwards them
+to the endpoint over HTTPS, and Codex receives only a random token for that
+proxy, valid while the run lasts. Models other than `gpt-5.6-luna` have not
+been tested; the recorded runs reached it through an Azure OpenAI
+deployment.
 
 **The `.env` file.** Copy the repository's template,
 [.env.example](../.env.example), to `.env` at the repository root, which git
@@ -253,28 +261,25 @@ Then load the file for one command with uv's `--env-file` flag (uv reads no
 `.env` file without it):
 
 ```sh
-uv run --extra agents-openai --env-file .env \
+uv run --env-file .env \
   python examples/signed_sum/agent_api.py \
   demo/live \
-  --model YOUR_AGENT_MODEL
+  --agent codex:YOUR_AGENT_MODEL
 ```
 
-**OpenAI.** Keep the template's endpoint, which is OpenAI's own and the
-SDK's default, and name an OpenAI model with `--model`.
+**OpenAI.** Keep the template's endpoint, which is OpenAI's own, and name an
+OpenAI model with `--model` (or after `codex:`).
 
 **Azure OpenAI or another compatible endpoint.** Set `OPENAI_BASE_URL` to
 the endpoint. For an Azure OpenAI resource, that is the resource's endpoint,
-with the resource's name in place of `YOUR-RESOURCE`, and `--model` is the
-deployment's name. The recorded trials used this route, through the
+with the resource's name in place of `YOUR-RESOURCE`, and the model name is
+the deployment's name. The recorded runs used this route, through the
 Responses API:
 
 ```text
 OPENAI_API_KEY=your-azure-key
 OPENAI_BASE_URL=https://YOUR-RESOURCE.services.ai.azure.com/openai/v1
 ```
-
-Do not leave `OPENAI_BASE_URL` empty; to use the SDK's default, delete the
-line.
 
 **Without a file.** To keep the key out of files, enter it at a hidden
 prompt instead and leave out `--env-file .env` (for another endpoint, also
@@ -285,18 +290,21 @@ block of several lines `read` can take the next line as the key:
 printf 'OpenAI API key: '; read -rs OPENAI_API_KEY; echo; export OPENAI_API_KEY
 ```
 
-**What stays private, and what is sent.** Neither variable reaches the WSE
-server, whose environment is an allow-list, and neither is written to the
-workspace or an export: the controller record names only the kind of
-endpoint (`openai`, `azure_openai`, or `openai_compatible`). The model
-provider receives the task instructions and the tool results, and bills the
-calls to your account. The signed-sum agent example's run of 2026-11-11 made 8
-requests, with 68,866 input and 1,428 output tokens.
+**What stays private, and what is sent.** Neither variable reaches Codex,
+the agent's commands, or the WSE server, whose environment is an
+allow-list, and neither is written to the workspace or an export. The
+proxy's request log records each request's method, path, status, timing,
+request ID, and served model, never the key, the token, a header, a body,
+or the endpoint. The model provider receives the task instructions, the
+skill, Codex's own instructions, and the tool results and command outputs,
+and bills the calls to your account. The recorded Codex run made 31
+requests, with 1,577,323 input tokens (1,501,586 of them cached) and 6,155
+output tokens.
 
 ### Stop conditions
 
 After every operation the runner reads authoritative WSE state and stops the
-controller (cancelling the SDK run) when:
+controller (stopping Codex, or a stepwise strategy before its next action) when:
 
 - an operation fails with `BUDGET_EXCEEDED`, no computation time remains, or
   (`bounded_eval`) no candidate commits or evaluation batches remain; a
@@ -310,16 +318,20 @@ controller (cancelling the SDK run) when:
 - (`weights_only`) the single permitted candidate is committed and selected;
   this mode has no development-score threshold.
 
+Under a task with a selection rule (every `Experiment`), there is no stop
+after candidates without improvement: the agent decides when to stop, within
+its budget and its time and turn limits, and the rule chooses when it ends.
+
 The controller may also stop voluntarily (a final message, or a strategy's
 `stop`). After any ending, including the turn limit, the wall-clock limit,
-cancellation, an SDK error, a failed connection, or a failure inside the
+cancellation, a Codex error, a failed connection, or a failure inside the
 runner, the runner cancels every queued or running job, waits for the worker
 to settle it (recovering jobs whose worker was lost), and freezes the
 selected checkpoint, while the MCP server stays connected; only then does it
 close the connection.
 
 The operator can stop a running trial with Ctrl-C. The first SIGINT stops a
-stepwise strategy before its next action, or cancels the SDK loop; the
+stepwise strategy before its next action, or stops Codex; the
 runner then settles and freezes as above, records the trial as `cancelled`
 with the stop condition `operator_interrupt`, and only then raises
 `KeyboardInterrupt` to its caller. A second Ctrl-C aborts at once and can
@@ -408,38 +420,41 @@ files of at most 1 MiB in `calls/<n>/outputs/`. It is recorded as a
 ## Records
 
 Each experiment records its controller (`controller_runs`): kind, exact ID
-and version (`scripted_search@1`, `openai_agents@1`), configuration and its
+and version (`scripted_search@1`, `codex_cli@1`), configuration and its
 hash, `constraint_status`, the tracing setting, and the termination record:
 status (`completed`, `stopped`, `max_turns`, `timeout`, `cancelled`,
 `connection_failed`, `error`), reason, stop condition, final message, turns,
-tool calls, elapsed time, usage (for an agent: token counts, the model name,
-and the class of the endpoint the SDK called, `openai` for OpenAI's endpoint
-or when `OPENAI_BASE_URL` is unset, `azure_openai` for an Azure resource,
-otherwise `openai_compatible`; the URL itself is never recorded), provider metadata (SDK, MCP, and protocol
-versions, limits, allowed and observed tools), the settlement and freeze, the
+tool calls, elapsed time, usage (for an agent: model requests and input,
+cached input, output, reasoning, and total tokens, the model name, and the
+provider entry, `wse_proxy`; the endpoint is never recorded), provider
+metadata (for Codex: its version, path, signature's Team ID, the permission
+profile, limits, resumes and every segment with its log and session ID,
+allowed tools and calls per tool, the shell's wall-clock time, the tool
+timeout, the filesystem rules, and the hash of the first prompt), the
+settlement and freeze, the
 environment (Python, platform, CPU, package versions), and, for an agent, the
 path of the `wse serve` log (`serve_log`; the reason of a `connection_failed`
 or `error` ending names the underlying exception and points to that log).
 The normalized trace (`controller_events`) holds tool calls with their
 arguments, tool results with their error codes, sizes, hashes, and bounded
-excerpts, model responses with per-request usage, latency (the SDK's whole
-model call, the client's retries included), and the provider's response and
-request IDs, messages, and stop requests. Private
+excerpts, Codex's shell commands and file changes with their exit codes and
+bounded output, model responses with per-request usage (from Codex's session
+record), messages, and stop requests. Private
 reasoning is never requested or stored: reasoning items are counted, not
 kept, and hypotheses are one or two sentences of observable evidence.
 
 Usage fields that the host cannot report are `null` with a reason, never
-zero: OpenAI Agents SDK reports token counts but not cost or the served model
-snapshot; a stepwise strategy calls no language model, so its token fields
-are "not applicable".
+zero: Codex reports token counts but not cost or the served model snapshot
+(the proxy's request log names the served model); a stepwise strategy calls
+no language model, so its token fields are "not applicable".
 
 `constraint_status` is `verified` when the controller's only execution
 channel is the run-bound WSE interface: the scripted strategy (actions
-executed by the runner) and the reference agent in its benchmark
-configuration (no tool besides the allow-listed WSE tools). Any other client
-of `wse serve` is `unverified` unless its operator attests otherwise, and a
-run under a policy that grants the sandbox is always `unverified`, with its
-`constraint_reason` ([above](#code-execution-in-a-sandbox-unverified)).
+executed by the runner). A Codex run is always `unverified`, because the
+agent runs its own commands, and so is a run under a policy that grants the
+sandbox; `constraint_reason` says why
+([above](#code-execution-in-a-sandbox-unverified)). Any other client of
+`wse serve` is `unverified` unless its operator attests otherwise.
 
 ## Exports and replay
 
@@ -499,27 +514,27 @@ tolerances.
 
 These commands reproduce the reports below without a model or network
 (each takes a few seconds on CPU; IDs differ per run). The last two run the
-test double through the agent SDK, which the `agents-openai` extra
-installs:
+offline Codex stand-in, whose tool calls come from the scripted strategy,
+through the Codex adapter, a real `wse serve`, and its MCP connection:
 
 ```sh
 uv run python examples/signed_sum/run_trials.py DEMO --label scripted
 uv run python examples/signed_sum/run_trials.py DEMO --label control --policy small_model_weights_only_v1
-uv run --extra agents-openai python examples/signed_sum/run_trials.py DEMO --label sdk-double \
-    --controller openai-agents --model wse-test-double:scripted_search@1
-uv run --extra agents-openai python examples/signed_sum/run_trials.py DEMO --label sdk-double-control \
-    --controller openai-agents --model wse-test-double:scripted_search@1 --policy small_model_weights_only_v1
+uv run python examples/signed_sum/run_trials.py DEMO --label codex-double \
+    --controller codex --model wse-test-double:scripted_search@1
+uv run python examples/signed_sum/run_trials.py DEMO --label codex-double-control \
+    --controller codex --model wse-test-double:scripted_search@1 --policy small_model_weights_only_v1
 ```
 
-Representative output (2026-11-04, macOS 26.7.1 arm64, CPU, Python 3.14.8,
-torch 2.15.0, openai-agents 0.24.0, mcp 2.3.0):
+Representative output (2026-11-12, macOS 26.7.1 arm64, CPU, Python 3.14.8,
+torch 2.15.0, mcp 2.3.0):
 
 | Report | Controller | Policy | Status | Candidates | Evaluated examples | Tokens (in/out) | Changed fraction | Final accuracy (control) | CP 95% lower |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | scripted (success) | scripted_search@1 | small_model_v1 | stopped: target_met | 2 | 192 | n/a (no language model) | 0.1818 | 1.0000 (0.5000) | 0.9928 |
 | control (failure) | scripted_search@1 | small_model_weights_only_v1 | stopped: candidate_committed | 1 | 0 | n/a (no language model) | 0.1818 | 0.0000 (0.5000) | 0.0000 |
-| sdk-double (success) | openai_agents@1, wse-test-double:scripted_search@1 | small_model_v1 | stopped: target_met | 2 | 192 | 131042/948 (synthetic) | 0.1818 | 1.0000 (0.5000) | 0.9928 |
-| sdk-double-control (failure) | openai_agents@1, wse-test-double:scripted_search@1 | small_model_weights_only_v1 | stopped: candidate_committed | 1 | 0 | 19920/336 (synthetic) | 0.1818 | 0.0000 (0.5000) | 0.0000 |
+| codex-double (success) | codex_cli@1, wse-test-double:scripted_search@1 | small_model_v1 | stopped: target_met | 2 | 192 | 102954/954 (synthetic) | 0.1818 | 1.0000 (0.5000) | 0.9928 |
+| codex-double-control (failure) | codex_cli@1, wse-test-double:scripted_search@1 | small_model_weights_only_v1 | stopped: candidate_committed | 1 | 0 | 14131/339 (synthetic) | 0.1818 | 0.0000 (0.5000) | 0.0000 |
 
 Every export replayed to byte-identical weights. The failure reports state
 their cause, for example: "final accuracy 0 is below 0.99; the controller
@@ -589,8 +604,9 @@ uv run wse --workspace "$W" \
 
 From Python, `run_agent_experiment` does it in one call: it grants a run,
 runs the controller, and freezes the experiment when the controller stops.
-With `model=...`, the controller is the OpenAI Agents SDK agent, connected
-to the run's MCP server (run it with `uv run --extra agents-openai`):
+With `model=...`, the controller is the Codex agent, connected to the run's
+MCP server; `wse-test-double:scripted_search@1` runs the offline stand-in
+instead of Codex:
 
 ```python
 from wse.agent_runs import run_agent_experiment
@@ -612,20 +628,24 @@ print(run.state, run.summary["status"])  # FROZEN stopped: the final evaluation 
 
 ## Live agent trials
 
-The M1 agent acceptance run uses 5 trials with isolated run grants and fresh
-contexts and a fixed, operator-chosen model (`gpt-5.6-luna` in the recorded
-trials). With the key in `.env` as in
-[Agent model configuration](#agent-model-configuration):
+An acceptance run of the signed-sum task uses 5 trials with isolated run
+grants and fresh contexts and a fixed, operator-chosen model. With the key in
+`.env` as in [Agent model configuration](#agent-model-configuration):
 
 ```sh
-uv run --extra agents-openai --env-file .env \
+uv run --env-file .env \
   python examples/signed_sum/run_trials.py \
   LIVE \
   --label live \
-  --controller openai-agents \
+  --controller codex \
   --model YOUR_AGENT_MODEL \
   --trials 5
 ```
+
+The M1 acceptance trials of 2026-11 ran these steps through the OpenAI
+Agents SDK adapter that WSE used before Codex, which this version no longer
+has; their record is unchanged ([m1-agent-trials.md](../dev/m1-agent-trials.md)).
+No Codex acceptance run of this task has been made yet.
 
 Each trial runs to its freeze before the next starts; the final evaluations
 run only after all 5 have frozen; every trial is exported, replayed, and
@@ -634,7 +654,8 @@ is listed with its error and counts as unsuccessful, and the remaining
 trials still run. Ctrl-C stops the running trial (settled and frozen first),
 starts no further trial, and still final-evaluates and reports the frozen
 ones. The script exits with 0, with 1 if any trial or step failed, or with
-130 after an interrupt; each server's log is `LIVE/logs/serve-RUN_ID.log`. The exact SDK and
+130 after an interrupt; each server's log is `LIVE/logs/serve-RUN_ID.log`, and each trial's Codex
+home and logs are under `LIVE/logs/codex-RUN_ID/`. The exact Codex and
 model settings are in each export's `controller.json`. Running these trials
-sends the task instructions and tool results to the model provider. The M1
-acceptance trials and their results are in [m1-agent-trials.md](../dev/m1-agent-trials.md).
+sends the task instructions, the tool results, and the agent's command
+outputs to the model provider.

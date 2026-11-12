@@ -76,11 +76,13 @@ its legacy handshake. Observed on 2026-11-04 (macOS, Python 3.14.8):
 | `mcp.Client` 2.3.0, `mode="legacy"` | 2025-11-25 | Served by the SDK's handshake; same tools and results. |
 | OpenAI Agents SDK 0.24.0 `agents.mcp.MCPServerStdio` (with mcp 2.3.0) | 2026-07-28 | Tool names arrive verbatim; with the default `use_structured_content=False` the model sees the text content, which carries the same JSON as `structuredContent`. Tracing disabled, no model call, no API key. |
 
+On 2026-11-12, Codex CLI 0.167.0-alpha.4.1, the host of WSE's agent adapter, connected to `wse serve` as its stdio MCP server `wse` (`tests/test_mcp_e2e.py`, against a local scripted model endpoint; the negotiated version was not recorded). It offered the model every allowed tool under the namespace `mcp__wse` with its name verbatim, as a function tool with its schema (the adapter lists the namespace in `features.code_mode.direct_only_tool_namespaces`), and each result carried `structuredContent` and the same JSON as text. WSE no longer includes an OpenAI Agents SDK adapter; the row above records that client's behavior.
+
 ## Tools
 
 Tool names use only letters, digits, and `_` (at most 64 characters),
-because OpenAI Agents SDK forwards MCP tool names verbatim as model function
-names. Every tool declares an input and an output JSON Schema. Mutations take
+because MCP hosts such as Codex and OpenAI Agents SDK forward MCP tool names
+verbatim as model function names. Every tool declares an input and an output JSON Schema. Mutations take
 an `idempotency_key`: the same key and input return the original result
 without creating another version or charging the budget again; the same key
 with different input fails with `IDEMPOTENCY_CONFLICT`.
@@ -121,8 +123,8 @@ fixes the device and batch size.
 
 A successful call returns `structuredContent` that validates against the
 tool's `outputSchema`, and one text content block holding the canonical
-compact JSON of exactly the same object (OpenAI Agents SDK shows the model
-the text by default). Every result has the same envelope:
+compact JSON of exactly the same object, for hosts that show the model only
+the text (as OpenAI Agents SDK does by default). Every result has the same envelope:
 
 ```json
 {
@@ -206,9 +208,10 @@ or `running`), calling it again for the checkpoint keeps waiting.
 A wait that is interrupted leaves the job to the worker: the client's
 timeout cancels the request, which ends the wait in the server at once; a
 killed server's worker finishes the job it runs before it stops. A later
-`wse_evaluate` for the checkpoint, or `wse_get_job`, returns the result. The
-OpenAI Agents SDK abandons a call it stops without cancelling it, so the
-server's wait then ends when the runner's finalization cancels the job.
+`wse_evaluate` for the checkpoint, or `wse_get_job`, returns the result. A
+host that abandons a call without cancelling the request (OpenAI Agents SDK
+0.24 did) leaves the server's wait to end when the runner's finalization
+cancels the job.
 
 Before a controller starts, the runner can give the experiment its base
 checkpoint's whole development report (`Engine.ensure_baseline`, operator
@@ -262,8 +265,8 @@ result stays within the inline-result limit:
   the policy's `max_result_json_bytes`, and `resource_uri` the paged resource
   `wse://reports/{report_id}` that holds the whole report.
 
-A host that cannot read resources (OpenAI Agents SDK exposes them only to
-application code) sees per-output results by evaluating fewer problems, a
+A host that cannot read resources (OpenAI Agents SDK, for example, exposes
+them only to application code) sees per-output results by evaluating fewer problems, a
 smaller preregistered `sample_count`, whose report fits, and pairs reports
 with `wse_compare`. A report of another experiment fails with `NOT_FOUND`, and
 so does a final report until the experiment is closed.
@@ -504,8 +507,8 @@ Reads are bounded to 32 KiB of JSON. A document that fits is returned as
 larger document is returned in pages `{"uri", "page", "page_count",
 "next_uri", "chunk"}`: follow `next_uri` (`?page=N`) and concatenate the
 chunks to obtain the document's JSON. Tools carry inline everything a
-controller needs, because OpenAI Agents SDK exposes resources only to
-application code; resources are an optional view. The one exception is the
+controller needs, because some hosts (OpenAI Agents SDK, for example)
+expose resources only to application code; resources are an optional view. The one exception is the
 per-example part of a report too large for one result, whose tool view is a
 `ReportOverview` (see `wse_get_report`).
 

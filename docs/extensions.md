@@ -240,9 +240,10 @@ fields the host cannot report are `None` with a reason), and provider
 metadata. An adapter never selects, freezes, or closes. Events reach the
 runner as `AgentEvent` records (model responses with usage, tool calls, tool
 results with error codes and bounded excerpts, messages, cancellations).
-Agent SDKs are optional extras imported lazily inside the adapter module.
-`wse.agent_adapters.openai_agents.OpenAIAgentsAdapter` is the M1 adapter; see
-[experiments.md](experiments.md) for its configuration.
+An adapter that gives the model its own commands sets `runs_own_code = True`,
+which makes every run `unverified`. `wse.agent_adapters.codex_cli.CodexCLIAdapter`
+(`codex_cli@1`, the Codex CLI) is the one adapter WSE ships; see
+[experiments.md](experiments.md#the-codex-cli-agent) for its configuration.
 
 ## Direct Python use
 

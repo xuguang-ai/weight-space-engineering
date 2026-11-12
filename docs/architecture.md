@@ -31,7 +31,7 @@ No MCP handler contains an editing, analysis, budget, or evaluation algorithm. T
 
 ## Registry and versioned contracts
 
-Extensions are registered by kind, name, and version, with `registry.register(kind, extension_id, version, implementation)`; a duplicate registration is rejected. The kinds are model adapters, family descriptors (per-family name maps, roles, and protected tensors), edit operators, evaluators, graders, sampling profiles, and strategies. Agent adapters are named and versioned too, such as the reference agent's `openai_agents@1`.
+Extensions are registered by kind, name, and version, with `registry.register(kind, extension_id, version, implementation)`; a duplicate registration is rejected. The kinds are model adapters, family descriptors (per-family name maps, roles, and protected tensors), edit operators, evaluators, graders, sampling profiles, and strategies. Agent adapters are named and versioned too, such as the Codex agent's `codex_cli@1`.
 
 Every record names the exact version it used, such as `scale_slice@1` or `qwen35think@1`, and a recipe is re-executed only with the exact versions it names, never with the latest. Registering an extension does not permit it: a policy maps public names to exact versions, and the server refuses everything else. A setup hook (`--setup module:function` on `wse serve`, `wse worker`, and `wse run`) registers extensions in each process. [extensions.md](extensions.md) specifies each contract.
 
@@ -82,6 +82,6 @@ No developer outside the project has added a method or a task yet, so the cost o
 | `model_proxy.py` | A per-run proxy on 127.0.0.1 that adds the operator's API key to an agent's model calls, so the agent's process holds only a run token |
 | `adapters/`, `engines/` | Model adapters and family descriptors, and the PyTorch inference engine for imported causal LMs |
 | `operators/`, `evaluators/`, `strategies/` | Built-in edit operators and analyses, evaluators and graders, and stepwise controllers |
-| `agent_adapters/` | The vendor-neutral agent adapter contract and the OpenAI Agents SDK adapter |
+| `agent_adapters/` | The vendor-neutral agent adapter contract, the Codex CLI adapter, and its offline stand-in |
 
 All paths are under [src/wse/](../src/wse).
