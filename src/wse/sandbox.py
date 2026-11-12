@@ -29,9 +29,12 @@ agent's code runs, and the server enforces the wall-clock limit by killing
 the process group. Standard output and error are each returned within a
 byte limit and stored in full up to ``STORED_OUTPUT_BYTES``.
 
-Only regular files with a single link count as outputs. The server never
-follows a symbolic link or a hard link that the sandboxed code made: either
-could point at a file the sandbox itself cannot read.
+``outputs/`` is emptied before each call, so a call's outputs are the files
+it wrote there; ``work/`` keeps files between calls. Only regular files with
+a single link count as outputs. The server never follows a symbolic link or
+a hard link that the sandboxed code made: either could point at a file the
+sandbox itself cannot read. Each call keeps a copy of its output files of at
+most ``KEPT_OUTPUT_BYTES`` in ``calls/<n>/outputs/``, for the record.
 
 The isolation is offered only on macOS with ``/usr/bin/sandbox-exec``, and
 only after a self-check confirms that an allowed read works and a read
@@ -44,6 +47,7 @@ import functools
 import hashlib
 import json
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -61,6 +65,7 @@ SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
 STORED_OUTPUT_BYTES = 1 << 20
 TAIL_BYTES = 64 * 1024
 FILE_SIZE_LIMIT = 1 << 30
+KEPT_OUTPUT_BYTES = 1 << 20
 ENVIRONMENT_NAMES = ("HOME", "LANG", "MPLCONFIGDIR", "PATH", "PYTHONIOENCODING", "TMPDIR", "XDG_CACHE_HOME",
                      "__PYVENV_LAUNCHER__")
 BOOTSTRAP = """\
@@ -75,8 +80,8 @@ sys.argv = [path]
 runpy.run_path(path, run_name="__main__")
 """
 
-__all__ = ["ENVIRONMENT_NAMES", "OutputFile", "SandboxLayout", "SandboxResult", "available", "profile_text",
-           "run_python"]
+__all__ = ["ENVIRONMENT_NAMES", "KEPT_OUTPUT_BYTES", "OutputFile", "SandboxLayout", "SandboxResult", "available",
+           "profile_text", "read_output", "run_python"]
 
 
 @dataclass(frozen=True)
@@ -299,6 +304,50 @@ def list_outputs(layout: SandboxLayout) -> tuple[tuple[OutputFile, ...], tuple[s
     return tuple(sorted(files, key=lambda f: f.path)), tuple(sorted(refused))
 
 
+def read_output(layout: SandboxLayout, output: OutputFile, limit: int) -> bytes | None:
+    """The bytes of ``output`` if it is still a regular, singly linked file of at most ``limit`` bytes with its hash.
+
+    The file is opened without following a link, so a link the sandboxed
+    code made is never read through.
+    """
+    try:
+        descriptor = os.open(layout.outputs / output.path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > limit:
+            return None
+        with os.fdopen(os.dup(descriptor), "rb") as handle:
+            data = handle.read(limit + 1)
+    finally:
+        os.close(descriptor)
+    if len(data) > limit or "sha256:" + hashlib.sha256(data).hexdigest() != output.sha256:
+        return None
+    return data
+
+
+def _empty(directory: Path) -> None:
+    """Remove everything inside ``directory`` without following links."""
+    with os.scandir(directory) as entries:
+        for entry in list(entries):
+            if entry.is_dir(follow_symlinks=False):
+                shutil.rmtree(entry.path)
+            else:
+                os.unlink(entry.path)
+
+
+def _keep(layout: SandboxLayout, directory: Path, outputs: tuple[OutputFile, ...]) -> None:
+    """Copy each output file of at most ``KEPT_OUTPUT_BYTES`` into ``directory/outputs``."""
+    for output in outputs:
+        data = read_output(layout, output, KEPT_OUTPUT_BYTES)
+        if data is None:
+            continue
+        target = directory / "outputs" / output.path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+
+
 def _new_call(layout: SandboxLayout) -> tuple[int, Path]:
     numbers = [int(p.name) for p in layout.calls.iterdir() if p.is_dir() and p.name.isdigit()]
     number = max(numbers, default=0) + 1
@@ -367,6 +416,7 @@ def _run(layout: SandboxLayout, code: str, *, wall_seconds: float, cpu_seconds: 
     if wall_seconds <= 0 or cpu_seconds <= 0 or max_output_bytes <= 0:
         raise WSEError(ErrorCode.INVALID_ARGUMENT, "the sandbox limits must be positive")
     layout.create()
+    _empty(layout.outputs)
     runtime = _runtime()
     layout.profile_path.write_text(profile_text(layout), encoding="utf-8")
     bootstrap = layout.calls / "bootstrap.py"
@@ -409,6 +459,7 @@ def _run(layout: SandboxLayout, code: str, *, wall_seconds: float, cpu_seconds: 
     (directory / "stdout.txt").write_bytes(out.stored())
     (directory / "stderr.txt").write_bytes(err.stored())
     outputs, refused = list_outputs(layout)
+    _keep(layout, directory, outputs)
     result = SandboxResult(
         call=number, ending=ending, exit_code=exit_code, signal=signal_name, wall_seconds=round(wall, 3),
         cpu_seconds=round(usage.ru_utime + usage.ru_stime, 3), max_rss_bytes=int(usage.ru_maxrss),

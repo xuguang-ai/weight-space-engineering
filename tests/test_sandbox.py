@@ -168,6 +168,18 @@ def test_each_call_is_a_fresh_process_and_files_persist(layout: SandboxLayout) -
     assert first.code_sha256 == "sha256:" + hashlib.sha256((layout.calls / "1" / "code.py").read_bytes()).hexdigest()
 
 
+@needs_sandbox
+def test_outputs_start_empty_and_each_call_keeps_its_small_files(layout: SandboxLayout) -> None:
+    first = run_python(layout, "open('outputs/a.txt', 'w').write('a')\n"
+                               "open('outputs/big.bin', 'wb').write(bytes(2 << 20))\n", **LIMITS)
+    second = run_python(layout, "import os\nprint(sorted(os.listdir('outputs')))\n", **LIMITS)
+    assert [f.path for f in first.outputs] == ["a.txt", "big.bin"]
+    assert second.stdout.strip() == "[]" and second.outputs == ()
+    kept = layout.calls / "1" / "outputs"
+    assert (kept / "a.txt").read_text() == "a" and not (kept / "big.bin").exists()
+    assert not (layout.calls / "2" / "outputs").exists() or not any((layout.calls / "2" / "outputs").iterdir())
+
+
 def test_the_sandbox_fails_closed_without_sandbox_exec(layout: SandboxLayout, tmp_path: Path,
                                                        monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sandbox, "SANDBOX_EXEC", tmp_path / "missing-sandbox-exec")

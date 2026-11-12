@@ -155,7 +155,11 @@ The two policies used so far:
 
 `small_model_v1` is defined in
 [examples/signed_sum/policy.json](../examples/signed_sum/policy.json) and
-`qwen_loop_v1` by `wse.policy.qwen_loop_policy()`. The README's agent
+`qwen_loop_v1` by `wse.policy.qwen_loop_policy()`. `qwen_loop_sandbox_v1`
+(`wse.policy.qwen_loop_sandbox_policy()`) is `qwen_loop_v1` with code
+execution: 100 sandbox calls of at most 300 s of wall-clock time each and
+7,200 s in all, and job waits of up to 600 s
+([below](#code-execution-in-a-sandbox-unverified)). The README's agent
 example registers `small_model_v1`'s values as `signed_sum_policy_v1`. The budgets in the
 article that WSE reproduces count larger passes: there, one Qwen pass could
 generate answers to up to 512 practice problems or read up to 1,024 texts
@@ -318,6 +322,78 @@ group, so a terminal's Ctrl-C reaches only the runner; its evaluation worker
 stops after its current job if `wse serve` dies without cleanup (a crash or
 SIGKILL), so no orphaned worker claims a later trial's jobs.
 
+## Code execution in a sandbox (unverified)
+
+A policy with a `sandbox` section grants one more tool, `wse_run_python`,
+which runs the agent's own Python (NumPy, PyTorch on the CPU, safetensors)
+in a fresh process per call. Analysis is open; evaluation and edits are not:
+generation passes and probes stay WSE jobs, and every edit is still a
+validated exact patch of a registered operator.
+
+**What the code sees.** The process's working directory is the run's
+sandbox, `<workspace>/sandboxes/<run_id>/`:
+
+- `inputs/`, read only. `weights/base.safetensors` holds the base
+  checkpoint's tensors in their stored dtype, except tensors tied as aliases
+  and those the model family protects (for Qwen3.5-0.8B: the embeddings, the
+  output head, and the final norm); a policy's `sandbox.readable_tensors`
+  patterns narrow it further. `passes/<report_id>.jsonl` holds every output
+  of the run's development generation passes (problem, item, sample, grade,
+  answer, finished, limit hit, generated tokens, and text);
+  `probes/<job_id>.npz` and `.json` each finished probe's vectors
+  (`site<i>_mean`, `site<i>_group_mean_a` and `_b`, `site<i>_contrast`) and
+  its document; `manifest.json` every input's size, SHA-256, and source.
+  WSE brings them up to date before each call. Final suites are never
+  exported, and candidates are not: they differ from the base only by the
+  run's own patches.
+- `work/`, read and write, kept between calls; `outputs/`, read and write,
+  emptied before each call; `tmp/`, the process's `TMPDIR`.
+
+**Isolation.** On macOS the process runs under `sandbox-exec` with a
+profile that denies everything, imports Apple's `system.sb` (the system
+libraries and services every process needs), and then allows only reading
+the Python runtime and executing its interpreter, the sandbox directories
+above, and the metadata of their parent directories. The rest of the
+workspace (evaluator storage among it), the repository, the user's files,
+other executables, new processes, and the network are denied, and the
+environment is an allow-list, so no credential reaches the process. A call
+is killed at its wall-clock limit (the policy's `seconds_per_call`, or the
+time left); CPU time is limited to that many seconds per core, and files to
+1 GiB each. Peak memory is recorded but not limited: macOS enforces no
+address-space limit. Before its first use WSE checks that an allowed read
+works and a read outside the allow-list fails; elsewhere, and on other
+platforms, the tool fails closed with `UNSUPPORTED_CAPABILITY`.
+
+**From code to an edit.** Each finite numeric array of one or two
+dimensions, of at most 65,536 values, that the code saves to `outputs/` with
+`numpy.save` is stored as a run-scoped result and returned with a pointer,
+`<result_uri>#/values` (a row: `#/values/<row>`). The parameters that take
+stored vectors accept it: `project_out`'s `direction`, each column of
+`add_low_rank`'s `u` and `v`, and `direction_projection`'s `direction`.
+`set_slice` takes its values inline, from what the code printed; a row of
+any length is also one exact edit as `add_low_rank` on that row with
+`u = [[1.0]]` and `v` a pointer to the new row minus the old one. A patch
+records each pointer with the length and hash of the vector it named, and
+its exact after-values, so replay needs no sandbox file.
+
+**What is metered, and the label.** Each call is charged one
+`sandbox_calls` and its wall-clock seconds to `sandbox_seconds`; nothing is
+held while the code runs. What the code computes is not metered, and
+`compute_seconds` is not charged: WSE counts its own calls, not the work
+inside them. Every run of such a policy is therefore recorded as
+`constraint_status: unverified` with `constraint_reason: "sandbox code
+execution: WSE meters only its own calls"`, and summaries and reports list
+the WSE-metered calls apart from "sandbox wall-clock time (not metered
+computation)". The isolation of the final test is unchanged: the final
+suite is evaluated only after the freeze, by the worker, from storage the
+sandbox cannot read.
+
+**Records.** Each call stores `calls/<n>/code.py`, `stdout.txt` and
+`stderr.txt` (in full up to 1 MiB each), `result.json` (the ending, times,
+peak memory, and output files with their hashes), and copies of its output
+files of at most 1 MiB in `calls/<n>/outputs/`. It is recorded as a
+`sandbox.ran` audit event and is idempotent by its key.
+
 ## Records
 
 Each experiment records its controller (`controller_runs`): kind, exact ID
@@ -350,7 +426,9 @@ are "not applicable".
 channel is the run-bound WSE interface: the scripted strategy (actions
 executed by the runner) and the reference agent in its benchmark
 configuration (no tool besides the allow-listed WSE tools). Any other client
-of `wse serve` is `unverified` unless its operator attests otherwise.
+of `wse serve` is `unverified` unless its operator attests otherwise, and a
+run under a policy that grants the sandbox is always `unverified`, with its
+`constraint_reason` ([above](#code-execution-in-a-sandbox-unverified)).
 
 ## Exports and replay
 
@@ -372,7 +450,14 @@ nothing else). Final-set inputs, labels, and the generation seed are
 excluded; `--include-final-data` adds them for an operator who needs them.
 Costs include the budget ledger, candidate count, evaluated examples,
 controller usage and elapsed time, and the selected candidate's changed
-elements and fraction of parameters.
+elements and fraction of parameters. A run whose policy grants the sandbox
+adds `sandbox/`: each call's code, stored output, result summary, and kept
+output files (`sandbox/calls/<n>/`); `sandbox/inputs_manifest.json` (what the
+code could read, with hashes and sources, not the inputs themselves); and
+each stored sandbox array byte for byte (`sandbox/arrays/<sha256>.json`, so
+its file hashes to the digest in the URI an edit names). The manifest's
+`sandbox` field indexes them, and `costs.sandbox` gives the calls and their
+wall-clock time under the label above.
 
 `wse replay` verifies every file hash, imports the base bundle, and rebuilds
 each candidate from its parent by exact patch replay; every replayed weights

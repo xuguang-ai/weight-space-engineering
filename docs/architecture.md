@@ -9,6 +9,7 @@ How WSE's parts fit together, for readers who want to extend WSE or contribute t
 | Core | Works in memory on a model handle: loads, analyzes, probes, edits, evaluates, and replays, without a database, service, or MCP. Its results are labeled `unmanaged`. | `wse.load_model`, `wse.apply_operator`, `wse.evaluate_candidate`, `wse.replay_patch` |
 | Engine | Adds a workspace with SQLite metadata and content-addressed files: imports, stored checkpoints, and managed experiments with run grants, policies, budgets, audit records, final evaluation, export, and replay. | `wse.Engine` |
 | Worker | A separate process that claims, runs, meters, and settles jobs (evaluations, generation passes, and probes), one at a time. It runs registered evaluators over registered adapters only, never code an agent wrote. | `wse worker`, or the job scheduler that `wse serve` and the runner start |
+| Sandbox | Under a policy that grants it, a fresh, network-less process per call for agent-written Python that reads only the run's inputs; arrays it saves become stored vectors that edits may name. WSE meters its calls, not what they compute, so such runs are unverified. | `Engine.run_python`, `wse_run_python` |
 | MCP server | A thin front end to the Engine for one run grant: each tool validates its arguments against the published schema and calls one Engine operation. | `wse serve --run-id RUN` |
 | Runner | Grants a run, runs one controller (a registered strategy, or an agent connected to `wse serve`), settles every outstanding job, and freezes the selected checkpoint. | `wse run`, `wse.agent_runs.run_agent_experiment` |
 | `WSE` | The high-level Python entry point for open-weight language models, over the core and the Engine. | `wse.WSE` |
@@ -73,6 +74,7 @@ No developer outside the project has added a method or a task yet, so the cost o
 | `store.py`, `database.py`, `tensors.py` | Content-addressed storage, the SQLite schema, and tensor hashing and selections |
 | `audit.py` | Audit events, controller records, and exports |
 | `analysis.py`, `probes.py` | Bounded tensor reads and analyses, and activation probes |
+| `sandbox.py`, `sandbox_runs.py` | The sandbox process and its profile, and code execution in a run: inputs, metering, records, and stored arrays |
 | `hf_snapshot.py` | Allow-listed reading of Hugging Face snapshots |
 | `adapters/`, `engines/` | Model adapters and family descriptors, and the PyTorch inference engine for imported causal LMs |
 | `operators/`, `evaluators/`, `strategies/` | Built-in edit operators and analyses, evaluators and graders, and stepwise controllers |

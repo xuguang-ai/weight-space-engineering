@@ -22,6 +22,14 @@ bundle, so ``replay_export`` can recover byte-identical candidate weights in
 a clean workspace by applying the exact stored patches (no editing operator
 runs). Final-set inputs, labels, and generation seeds are excluded unless
 the operator explicitly asks for them.
+
+A run whose policy grants the sandbox also exports its code execution under
+``sandbox/``: each call's code, standard output and error as stored, result
+summary, and kept output files; the inputs manifest (what the code could
+read, with hashes and sources, not the inputs themselves: the base weights
+are in the base bundle); and every stored sandbox array, byte for byte, so
+each array's file hashes to the digest in the URI an edit names. Replay
+needs none of it, but checks its hashes with every other file's.
 """
 
 from __future__ import annotations
@@ -38,12 +46,14 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import Field
 
 from wse.database import Database, audit_events, insert_audit_event, utc_now
+from wse.policy import sandbox_available
 from wse.schemas import (
     SCHEMA_VERSION,
     ErrorCode,
     MaterializedPatch,
     WSEError,
     _Frozen,
+    _optional,
     canonical_json,
     content_hash,
     json_hash,
@@ -209,6 +219,8 @@ def controller_events(db: Database, experiment_id: str) -> list[dict[str, Any]]:
 
 EXPORT_MANIFEST_NAME = "export_manifest.json"
 BASE_BUNDLE_DIR = "base_model"
+SANDBOX_EXPORT_DIR = "sandbox"
+SANDBOX_CALL_FILES = ("code.py", "stdout.txt", "stderr.txt", "result.json")
 DEFAULT_EXCLUSIONS = ("final-set inputs", "final-set labels", "final-set generation seed")
 
 
@@ -251,7 +263,9 @@ class ExportManifest(_Frozen):
     """The index of an experiment export (``export_manifest.json``).
 
     ``files`` maps every other exported file to its content hash.
-    ``excluded`` lists what the export deliberately leaves out.
+    ``excluded`` lists what the export deliberately leaves out. ``sandbox``
+    indexes the run's code execution when its policy grants the sandbox
+    (module docstring); it is absent otherwise.
     """
 
     schema_version: Literal["1"] = SCHEMA_VERSION
@@ -280,6 +294,7 @@ class ExportManifest(_Frozen):
     excluded: list[str]
     included_final_data: bool = False
     files: dict[str, str] = Field(default_factory=dict)
+    sandbox: dict[str, Any] | None = _optional()
 
 
 class ReplayResult(_Frozen):
@@ -315,6 +330,59 @@ def _write_json(root: Path, relative: str, value: Any, files: dict[str, str]) ->
     path.write_text(text, encoding="utf-8")
     files[relative] = content_hash(text.encode("utf-8"))
     return relative
+
+
+def _copy_file(source: Path, root: Path, relative: str, files: dict[str, str]) -> str:
+    data = source.read_bytes()
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    files[relative] = content_hash(data)
+    return relative
+
+
+def _export_sandbox(engine: Engine, experiment: Any, root: Path, files: dict[str, str]) -> dict[str, Any]:
+    """Copy the run's sandbox record into ``root/sandbox`` (module docstring) and return its index."""
+    from wse.sandbox_runs import ARRAY_KIND, MANIFEST, layout_for
+    from wse.store import ANALYSIS_URI_PREFIX
+
+    layout = layout_for(engine.experiments, experiment.run_id)
+    calls = []
+    numbered = sorted((p for p in layout.calls.iterdir() if p.is_dir() and not p.is_symlink() and p.name.isdigit()),
+                      key=lambda p: int(p.name)) if layout.calls.is_dir() else []
+    for directory in numbered:
+        prefix = f"{SANDBOX_EXPORT_DIR}/calls/{directory.name}"
+        entry: dict[str, Any] = {"call": int(directory.name)}
+        for name in SANDBOX_CALL_FILES:
+            source = directory / name
+            if source.is_file() and not source.is_symlink():
+                entry[name] = _copy_file(source, root, f"{prefix}/{name}", files)
+        kept = directory / "outputs"
+        entry["outputs"] = {
+            path.relative_to(kept).as_posix(): _copy_file(path, root, f"{prefix}/outputs/"
+                                                          f"{path.relative_to(kept).as_posix()}", files)
+            for path in sorted(kept.rglob("*")) if path.is_file() and not path.is_symlink()
+        } if kept.is_dir() else {}
+        calls.append(entry)
+    inputs = layout.inputs / MANIFEST
+    arrays = []
+    rows = engine.store.db.conn.execute("SELECT uri FROM analysis_results WHERE experiment_id = ? "
+                                        "ORDER BY created_at, rowid", (experiment.experiment_id,)).fetchall()
+    for row in rows:
+        data = engine.store.read_analysis_result(row["uri"])
+        document = json.loads(data)
+        if not isinstance(document, dict) or document.get("kind") != ARRAY_KIND:
+            continue
+        relative = f"{SANDBOX_EXPORT_DIR}/arrays/{row['uri'].removeprefix(ANALYSIS_URI_PREFIX)}.json"
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        files[relative] = content_hash(data)
+        arrays.append({"uri": row["uri"], "call": document["call"], "path": document["path"],
+                       "shape": document["shape"], "dtype": document["dtype"], "file": relative})
+    return {"calls": calls, "arrays": arrays,
+            "inputs_manifest": _copy_file(inputs, root, f"{SANDBOX_EXPORT_DIR}/inputs_manifest.json", files)
+            if inputs.is_file() else None}
 
 
 def export_experiment(engine: Engine, experiment_id: str, output_dir: str | Path, *,
@@ -399,6 +467,7 @@ def export_experiment(engine: Engine, experiment_id: str, output_dir: str | Path
     _write_json(root, "controller.json", controller, files)
     _write_json(root, "tool_trace.json", trace, files)
 
+    sandbox_record = _export_sandbox(engine, experiment, root, files) if sandbox_available(policy) else None
     if include_base_weights:
         _export_bundle(engine, base.checkpoint_id, root / BASE_BUNDLE_DIR, files)
     if include_final_data:
@@ -422,6 +491,12 @@ def export_experiment(engine: Engine, experiment_id: str, output_dir: str | Path
         "selected_changed_fraction": (selected_patch.changed_elements / selected_manifest.parameter_count
                                       if selected_patch else 0.0),
     }
+    if sandbox_record is not None:
+        from wse.runner import SANDBOX_TIME_LABEL
+
+        costs["sandbox"] = {"calls": experiment.budget["sandbox_calls"].consumed,
+                            "wall_seconds": experiment.budget["sandbox_seconds"].consumed,
+                            "label": SANDBOX_TIME_LABEL}
     manifest = ExportManifest(
         created_at=utc_now(), experiment_id=experiment_id, run_id=experiment.run_id, task_id=experiment.task_id,
         task_hash=None if task is None else task.task_hash, policy_id=experiment.policy_id,
@@ -435,7 +510,7 @@ def export_experiment(engine: Engine, experiment_id: str, output_dir: str | Path
                 "method": "exact patch replay: stored after-values and hashes, no editing operator runs",
                 "recipe_reexecution": "not performed; re-running a recipe needs fresh evaluation"},
         excluded=[] if include_final_data else list(DEFAULT_EXCLUSIONS), included_final_data=include_final_data,
-        files=dict(sorted(files.items())))
+        files=dict(sorted(files.items())), sandbox=sandbox_record)
     (root / EXPORT_MANIFEST_NAME).write_text(
         json.dumps(manifest.model_dump(mode="json"), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return manifest

@@ -27,8 +27,8 @@ charges ``sandbox_calls`` and the measured wall-clock time to
 call leaves no reservation behind. ``compute_seconds`` is not charged: WSE
 does not meter what the code computes.
 
-Every regular file the code left in ``outputs/`` is listed with its size and
-SHA-256. A ``.npy`` file holding a finite numeric array of one or two
+Every regular file the code left in ``outputs/`` (emptied before each call)
+is listed with its size and SHA-256. A ``.npy`` file holding a finite numeric array of one or two
 dimensions, of at most ``MAX_REFERENCE_ELEMENTS`` values, is also stored as a
 run-scoped result (``kind: sandbox_array``) whose pointer ``#/values`` (or
 ``#/values/<row>`` for a row of a matrix) names a stored vector, which edits
@@ -48,7 +48,6 @@ import io
 import json
 import math
 import os
-import stat
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -215,21 +214,10 @@ def sync_inputs(service: ExperimentService, experiment: Experiment, policy: Expe
     return sorted([*files, MANIFEST])
 
 
-def _load_array(path: Path, sha256: str) -> np.ndarray | None:
-    """The array in ``path`` when it is a regular, singly linked ``.npy`` file whose bytes hash to ``sha256``."""
-    try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError:
-        return None
-    try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > MAX_ARRAY_FILE_BYTES:
-            return None
-        with os.fdopen(os.dup(descriptor), "rb") as handle:
-            data = handle.read()
-    finally:
-        os.close(descriptor)
-    if "sha256:" + hashlib.sha256(data).hexdigest() != sha256:
+def _load_array(layout: SandboxLayout, output: sandbox.OutputFile) -> np.ndarray | None:
+    """The array in ``output`` when it is a regular, singly linked ``.npy`` file that still has its listed hash."""
+    data = sandbox.read_output(layout, output, MAX_ARRAY_FILE_BYTES)
+    if data is None:
         return None
     try:
         return np.load(io.BytesIO(data), allow_pickle=False)
@@ -249,7 +237,7 @@ def _outputs(service: ExperimentService, experiment_id: str, layout: SandboxLayo
     for output in result.outputs:
         shape = dtype = pointer = None
         if output.path.endswith(".npy"):
-            array = _load_array(layout.outputs / output.path, output.sha256)
+            array = _load_array(layout, output)
             if array is not None:
                 shape, dtype = list(array.shape), str(array.dtype)
                 if _referenceable(array):

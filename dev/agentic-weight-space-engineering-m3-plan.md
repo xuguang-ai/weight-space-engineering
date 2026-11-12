@@ -38,7 +38,7 @@ The [M2 plan](./agentic-weight-space-engineering-m2-plan.md) listed "a sandboxed
 
 ### 2.1 The sandbox process
 
-- **One process per call.** `wse_run_python` writes the agent's code to `<sandbox>/calls/<n>/code.py` and starts `sandbox-exec -f <profile> <python> -I -B <code.py>` with the sandbox directory as its working directory. Files persist between calls in `work/`; the process does not.
+- **One process per call.** `wse_run_python` writes the agent's code to `<sandbox>/calls/<n>/code.py` and starts `sandbox-exec -f <profile> <python> -I -B <code.py>` with the sandbox directory as its working directory. Files persist between calls in `work/`; the process does not. WSE empties `outputs/` before each call, so a call's outputs are exactly the files it wrote there, and keeps each call's output files of at most 1 MiB in `calls/<n>/outputs/`.
 - **Profile.** `(deny default)`, then allow:
   - reading the Python runtime (`sys.base_prefix` and the environment's `sys.prefix`) and the system libraries Python, NumPy, and PyTorch load at import;
   - reading `<sandbox>/inputs/`, and reading and writing `<sandbox>/work/` and `<sandbox>/outputs/`;
@@ -54,12 +54,12 @@ The [M2 plan](./agentic-weight-space-engineering-m2-plan.md) listed "a sandboxed
 - **Weights:** `inputs/weights/base.safetensors`, the base checkpoint's tensors that the policy permits. By default these are all tensors that the family descriptor does not protect; for Qwen3.5-0.8B that leaves out the embeddings, the output head, and the final norm. Candidates are not exported in S1: they differ from the base by the agent's own patches.
 - **Activations:** `inputs/probes/<job_id>.npz`, with the vectors of each finished probe of the run (per text and site, the group means, and the contrasts), next to the probe's JSON summary.
 - **Development outputs:** `inputs/passes/<report_id>.jsonl`, with each output of the run's finished development passes: problem index, item ID, grade, finished flag, generated tokens, and text. No final-suite data is ever exported.
-- **Manifest:** `inputs/manifest.json` lists every input with its size and SHA-256. Inputs are exported when their job settles; the base weights are exported when the run starts.
+- **Manifest:** `inputs/manifest.json` lists every input with its size and SHA-256. Inputs are brought up to date before each call (`sync_inputs`): the base weights on the first call, and each finished development pass and probe once.
 
 ### 2.3 Sandbox results in edits
 
-- An array-valued operator parameter, such as `project_out`'s `direction` and `columns`, `add_low_rank`'s `u` and `v`, or `set_slice`'s `values`, may be given as `wse://sandbox/outputs/<file>.npy`.
-- WSE reads that file from the run's own sandbox directory, checks its dtype, shape, finiteness, and size against the policy, stores it as an artifact by SHA-256, and freezes the values into the patch. This extends the existing vector references (`resolve_vector_reference`, which already resolves probe results such as `wse://analyses/<sha256>#/sites/0/contrast/direction`).
+- Each finite numeric array of one or two dimensions, of at most 65,536 values, that the code saves to `outputs/` with `numpy.save` is stored as a run-scoped result `wse://analyses/<sha256>` (`kind: sandbox_array`), and the call returns its pointer `<result_uri>#/values` (`#/values/<row>` for a row of a matrix). WSE reads the file without following links and checks its hash, dtype, shape, and finiteness.
+- The parameters that already accept stored vectors accept these pointers through the existing resolution (`resolve_vector_reference`, which also resolves probe results such as `wse://analyses/<sha256>#/sites/0/contrast/direction`): `project_out`'s `direction`, each column of `add_low_rank`'s `u` and `v`, and the analysis `direction_projection`'s `direction`. `set_slice`'s `values` and `project_out`'s `columns` stay inline, so the agent passes values its code printed. A row of any length is still one exact edit: `add_low_rank` on that row with `u = [[1.0]]` and `v` a pointer to the new row minus the old one.
 - Patches therefore stay exact and self-contained: export and replay need no sandbox file, and the element limit (`max_patch_elements`, which counts inline values) applies as before.
 
 ### 2.4 Evaluation and long waits
@@ -78,7 +78,7 @@ The [M2 plan](./agentic-weight-space-engineering-m2-plan.md) listed "a sandboxed
 ### 2.6 Records and export
 
 - **Trace.** Each call adds a tool call carrying the code, and a tool result carrying the exit status, wall-clock and CPU time, peak memory, bounded output, and every output file's name, size, and SHA-256. An audit event records the same.
-- **Export.** It adds `sandbox/calls/<n>/` with the code, the full output, and output files up to a size cap, all hashed in the export manifest. Exact replay is unchanged.
+- **Export.** It adds `sandbox/calls/<n>/` with the code, the stored output, the result summary, and the call's kept output files; `sandbox/inputs_manifest.json` (what the code could read, with hashes and sources, not the inputs themselves); and `sandbox/arrays/<sha256>.json`, each stored sandbox array byte for byte, so its file hashes to the digest in the URI an edit names. All are hashed in the export manifest, and `costs.sandbox` reports the calls and their wall-clock time under its label. Exact replay is unchanged.
 
 ### 2.7 Agent instructions
 
@@ -97,7 +97,7 @@ The [M2 plan](./agentic-weight-space-engineering-m2-plan.md) listed "a sandboxed
 
 **Files:** create `src/wse/sandbox.py` and `tests/test_sandbox.py`; modify `docs/experiments.md`.
 
-- [ ] Write failing tests:
+- [x] Write failing tests:
   - `test_sandbox_runs_numpy_and_torch_on_the_cpu`;
   - `test_sandbox_reads_its_inputs_and_writes_only_its_work_and_outputs`;
   - `test_sandbox_cannot_read_the_workspace_the_repository_or_a_planted_home_file`;
@@ -106,83 +106,83 @@ The [M2 plan](./agentic-weight-space-engineering-m2-plan.md) listed "a sandboxed
   - `test_wall_clock_limit_kills_the_process_and_records_it`;
   - `test_output_is_returned_within_its_limit_and_stored_in_full`;
   - `test_tool_fails_closed_without_sandbox_exec`.
-- [ ] Run the tests; they must fail.
-- [ ] Implement the profile, the process runner, the limits, and the self-check; record every system allowance that imports need.
-- [ ] Run the new tests and the full suite. Review and commit.
+- [x] Run the tests; they must fail.
+- [x] Implement the profile, the process runner, the limits, and the self-check; record every system allowance that imports need.
+- [x] Run the new tests and the full suite. Review and commit.
 
 ### Task 2: Policy, ledger, and labels
 
 **Files:** modify `src/wse/policy.py`, `src/wse/budget.py`, `src/wse/schemas.py`, `src/wse/database.py` (a migration adding the two counters), `src/wse/experiments.py`, `src/wse/runner.py`, and `src/wse/audit.py`; create `tests/test_sandbox_policy.py`.
 
-- [ ] Write failing tests:
+- [x] Write failing tests:
   - `test_existing_policies_and_their_hashes_are_unchanged`;
   - `test_a_sandbox_policy_marks_every_run_unverified_with_its_reason`;
   - `test_sandbox_usage_is_charged_to_its_own_counters`;
   - `test_reports_separate_wse_metered_calls_from_sandbox_time`;
   - `test_qwen_loop_sandbox_v1_limits`.
-- [ ] Run the tests; they must fail. Implement; run the new tests and the full suite. Review and commit.
+- [x] Run the tests; they must fail. Implement; run the new tests and the full suite. Review and commit.
 
 ### Task 3: Sandbox inputs
 
-**Files:** create `src/wse/sandbox_inputs.py` and `tests/test_sandbox_inputs.py`; modify `src/wse/jobs.py` and `src/wse/runner.py`.
+**Files:** create `src/wse/sandbox_inputs.py` and `tests/test_sandbox_inputs.py`; modify `src/wse/jobs.py` and `src/wse/runner.py`. As built, Tasks 3 to 5 share `src/wse/sandbox_runs.py` and `tests/test_sandbox_tool.py`, and inputs are synced before each call rather than when a job settles (Section 2.2).
 
-- [ ] Write failing tests:
+- [x] Write failing tests:
   - `test_permitted_base_tensors_are_exported_and_protected_ones_are_not`;
   - `test_probe_vectors_appear_in_the_inputs_when_the_job_settles`;
   - `test_development_outputs_are_exported_and_final_data_never_is`;
   - `test_the_manifest_hashes_every_input`.
-- [ ] Run the tests; they must fail. Implement; run the new tests and the full suite. Review and commit.
+- [x] Run the tests; they must fail. Implement; run the new tests and the full suite. Review and commit.
 
 ### Task 4: The tool `wse_run_python`
 
 **Files:** modify `src/wse/mcp_server.py`, `src/wse/experiments.py`, `src/wse/runner.py`, and `docs/protocol.md`; create `tests/test_sandbox_tool.py`.
 
-- [ ] Write failing tests:
+- [x] Write failing tests:
   - `test_run_python_returns_bounded_output_and_its_output_files`;
   - `test_run_python_is_refused_without_a_sandbox_grant`;
   - `test_run_python_is_recorded_in_the_trace_and_the_audit_log`;
   - `test_mcp_and_python_agree_on_run_python`, following M1's parity test;
   - `test_exhausted_sandbox_calls_stop_the_run`.
-- [ ] Run the tests; they must fail. Implement; run the new tests and the full suite. Review and commit.
+- [x] Run the tests; they must fail. Implement; run the new tests and the full suite. Review and commit.
 
 ### Task 5: Sandbox outputs as edit parameters
 
-**Files:** modify `src/wse/analysis.py`, `src/wse/patches.py`, and `src/wse/experiments.py`; create `tests/test_sandbox_references.py`.
+**Files:** modify `src/wse/analysis.py`, `src/wse/patches.py`, and `src/wse/experiments.py`; create `tests/test_sandbox_references.py`. As built, no resolver changed: sandbox arrays are stored results whose pointers the existing vector parameters accept (Section 2.3), and `set_slice` values stay inline.
 
-- [ ] Write failing tests:
+- [x] Write failing tests:
   - `test_a_project_out_direction_from_a_sandbox_file_is_frozen_exactly`;
   - `test_set_slice_values_from_a_sandbox_file_respect_the_element_limit`;
   - `test_non_finite_mis_shaped_or_foreign_files_are_refused`;
   - `test_replaying_the_export_needs_no_sandbox_file`.
-- [ ] Run the tests; they must fail. Implement; run the new tests and the full suite. Review and commit.
+- [x] Run the tests; they must fail. Implement; run the new tests and the full suite. Review and commit.
 
 ### Task 6: Long waits for jobs
 
 **Files:** modify `src/wse/jobs.py`, `src/wse/mcp_server.py`, `src/wse/agent_adapters/openai_agents.py`, and `src/wse/runner.py`; create `tests/test_long_waits.py`.
 
-- [ ] Write failing tests:
+- [x] Write failing tests:
   - `test_get_job_waits_up_to_the_policy_cap`;
   - `test_policies_without_a_cap_keep_ten_seconds`;
   - `test_the_published_schema_states_the_policy_cap`;
   - `test_the_adapter_session_timeout_exceeds_the_cap`.
-- [ ] Run the tests; they must fail. Implement; run the new tests and the full suite. Review and commit.
+- [x] Run the tests; they must fail. Implement; run the new tests and the full suite. Review and commit.
 
 ### Task 7: Instructions, export, documentation, and leak checks
 
 **Files:** modify `src/wse/runner.py` (`render_instructions`), `src/wse/audit.py`, `docs/experiments.md`, `docs/protocol.md`, and `docs/architecture.md`; create `tests/test_sandbox_records.py`.
 
-- [ ] Write failing tests:
+- [x] Write failing tests:
   - `test_instructions_describe_the_sandbox_and_name_no_oracle`;
   - `test_the_export_holds_every_sandbox_call_and_still_replays`;
   - `test_qwen_sandbox_inputs_hold_no_published_edit_or_final_item`.
-- [ ] Run the tests; they must fail. Implement; document the mode, its labels, and its limits; run the new tests and the full suite. Review and commit.
+- [x] Run the tests; they must fail. Implement; document the mode, its labels, and its limits; run the new tests and the full suite. Review and commit.
 
 ### Task 8: Offline end-to-end check
 
 **Files:** create `src/wse/strategies/sandbox_search.py` (`sandbox_search@1`) and `tests/test_sandbox_e2e.py`; modify `src/wse/registry.py`.
 
-- [ ] Write a failing test, `test_a_scripted_sandbox_strategy_repairs_signed_sum_through_mcp`. Through a real `wse serve` and the SDK test double, the strategy reads `layers.1.weight` from the sandbox inputs, computes a corrected row with NumPy, writes it to `outputs/`, previews and applies a `set_slice` that names that file, evaluates, and selects. The final accuracy is 1.0, the run is `unverified` with its reason, and the export replays to identical weights.
-- [ ] Run it; it must fail. Implement; run it and the full suite. Review and commit. **S1 exit:** the conditions of Section 1 hold.
+- [x] Write a failing test, `test_a_scripted_sandbox_strategy_repairs_signed_sum_through_mcp`. Through a real `wse serve` and the SDK test double, the strategy's code reads `layers.1.weight` from the sandbox inputs, computes a corrected row with NumPy, prints it, and saves it to `outputs/`; the strategy previews and applies a `set_slice` with those values inline, evaluates, and selects. The final accuracy is 1.0, the run is `unverified` with its reason, and the export replays to identical weights.
+- [x] Run it; it must fail. Implement; run it and the full suite. Review and commit. **S1 exit:** the conditions of Section 1 hold.
 
 ## 4. Stage S2: Pipeline Check on Qwen
 

@@ -100,10 +100,11 @@ with `NOT_FOUND` and says to create the experiment first.
 | `wse_read_tensor` | `experiment_id` (optional), `checkpoint_id, tensor, selection` | A bounded slice (at most 2,048 elements); charges one `tensor_read_calls`. |
 | `wse_analyze` | `experiment_id` (optional), `checkpoint_id, kind, tensor, selection, k` (optional), `parameters` (optional) | A permitted analysis (`stats`, `norm`, `top_k` in M1; `tensor_norms`, `svd_top_k`, and `direction_projection` where the policy adds them), charged under its operator's usage contract. |
 | `wse_probe` | `experiment_id` (optional), `checkpoint_id, texts, sites, idempotency_key, groups` (optional), `top` (optional) | The queued probe job, returned immediately (below). |
+| `wse_run_python` | `experiment_id` (optional), `code, idempotency_key` | One run of the code in the run's sandbox, only under a policy that grants it (below): its ending, exit code, times, bounded standard output and error, its output files with their hashes, and a pointer for each stored array. Charges one `sandbox_calls` and its wall-clock seconds to `sandbox_seconds`. |
 | `wse_preview_patch` | `experiment_id` (optional), `patch_spec, idempotency_key` | An immutable preview with `patch_id`; the selected checkpoint does not change. Each new preview charges one `patch_previews`, because its deltas reveal the base values of the edited region. |
 | `wse_apply_patch` | `experiment_id` (optional), `patch_id, idempotency_key` | The candidate's manifest; charges one `candidate_commits`. |
 | `wse_submit_evaluation` | `experiment_id` (optional), `checkpoint_id, suite_id, eval_config, idempotency_key` | The queued job, returned immediately; development suites only. A generation suite's evaluation is a generation pass (below). |
-| `wse_get_job` | `experiment_id` (optional), `job_id, wait_seconds` (0-10) | The job; `wait_seconds` holds the call until the job is terminal or the wait expires. A succeeded evaluation carries its report summary (metrics, sample count, errors, `target_met`, report URI) inline and its `report_id`; a succeeded probe carries its summary and `result_uri`. |
+| `wse_get_job` | `experiment_id` (optional), `job_id, wait_seconds` (0 to the policy's `max_job_wait_seconds`, 10 when unset; the run's server publishes its cap in the schema) | The job; `wait_seconds` holds the call until the job is terminal or the wait expires. A succeeded evaluation carries its report summary (metrics, sample count, errors, `target_met`, report URI) inline and its `report_id`; a succeeded probe carries its summary and `result_uri`. |
 | `wse_get_report` | `experiment_id` (optional), `report_id` | A report of the experiment, within the inline-result limit (below); not charged. Final reports only after the experiment is closed. |
 | `wse_cancel_job` | `experiment_id` (optional), `job_id, idempotency_key` | The job; a queued job is cancelled and its reservation released, a running job stops at its next check, and work already performed stays charged. |
 | `wse_compare` | `experiment_id` (optional), `base_report_id, candidate_report_id` | Paired difference with cluster-bootstrap and exact intervals; two generation reports are paired on accuracy, limit-hit rate, and mean generated tokens. Mismatched reports fail with `INCOMPATIBLE_REPORTS`. |
@@ -372,6 +373,46 @@ On the test fixtures, a 32-problem pass whose answers reach the graders'
 its tails evenly to a 64,323-byte response. A probe summary filled to its
 allowance (64 texts at up to 128 sites) gives at most a 64,439-byte
 `wse_get_job` response.
+
+### Code execution
+
+**`wse_run_python(experiment_id, code, idempotency_key)`.** Under a policy
+with a `sandbox` section, runs `code` (Python, at most 256 KiB) once in a
+fresh process whose working directory is the run's sandbox
+([experiments.md](experiments.md#code-execution-in-a-sandbox-unverified)):
+
+- `inputs/` (read only): `weights/base.safetensors`, the base checkpoint's
+  tensors that its family descriptor does not protect and that no alias
+  ties, in their stored dtype; `passes/<report_id>.jsonl`, every output of
+  the run's development generation passes with its grade and text;
+  `probes/<job_id>.npz` and `.json`, each finished probe's vectors and
+  document; and `manifest.json`, each input's size, SHA-256, and source.
+  WSE brings them up to date before each call; final suites are never
+  exported.
+- `work/` (kept between calls) and `outputs/` (emptied before each call).
+
+The result (`SandboxRun`) gives `call`, `ending` (`exited`, `timed_out`,
+`cpu_limit`, `file_size_limit`, or `signal`), `exit_code`, `signal`,
+`wall_seconds`, `cpu_seconds`, `max_rss_bytes`, `stdout` and `stderr` within
+the policy's `max_output_bytes` each (a longer stream keeps its start and end
+around a marker; `*_bytes` counts all of it and `*_truncated` says whether it
+was cut), `outputs` (each regular file in `outputs/` with its size and
+SHA-256), `refused_outputs` (links and other entries, never followed),
+`inputs`, `code_sha256`, and `usage`. A `.npy` output also gives its `shape`
+and `dtype`, and a finite numeric array of one or two dimensions of at most
+65,536 values gives a `pointer`, `<result_uri>#/values` (`#/values/<row>` for
+a row of a matrix): a run-scoped stored vector that `project_out`'s
+`direction`, each column of `add_low_rank`'s `u` and `v`, and
+`direction_projection`'s `direction` accept. `set_slice` values stay inline.
+The response's `uris` list the pointers.
+
+A retry with the same key and code returns the first result without
+running again; other code under the same key fails with
+`IDEMPOTENCY_CONFLICT`. A policy without a sandbox fails with
+`POLICY_DENIED`, a host without the sandbox with `UNSUPPORTED_CAPABILITY`,
+and exhausted calls or time with `BUDGET_EXCEEDED`. A call that fails inside
+the process (an exception, a time limit) is a result, not an error: it is
+charged, and its `ending`, `exit_code`, and `stderr` say what happened.
 
 ### Errors
 

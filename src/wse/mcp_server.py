@@ -561,11 +561,12 @@ class WSEMCPServer:
         The working directory holds inputs/ (read only: weights/base.safetensors with the base checkpoint's
         permitted tensors in their stored dtype, which safetensors.torch.load_file reads; passes/<report_id>.jsonl
         with every output of your development generation passes; probes/<job_id>.npz and .json with your probe
-        results; manifest.json), work/ (your files, kept between calls), and outputs/. Save a numeric vector or
-        matrix there with numpy.save to use it in an edit: each such .npy output comes back with a pointer,
-        <result_uri>#/values (a row of a matrix: #/values/<row>), which project_out's direction, add_low_rank's u and
-        v, and direction_projection accept as a stored vector. Output beyond the policy's limit is cut in the middle. WSE meters only
-        the call and its wall-clock time, so every run that grants this tool is unverified.
+        results; manifest.json), work/ (your files, kept between calls), and outputs/ (emptied before each call).
+        Save a numeric vector or matrix there with numpy.save to use it in an edit: each such .npy output comes back
+        with a pointer, <result_uri>#/values (a row of a matrix: #/values/<row>), which project_out's direction,
+        add_low_rank's u and v, and direction_projection accept as a stored vector. Standard output and error beyond
+        the policy's limit are cut in the middle. WSE meters only the call and its wall-clock time, so every run
+        that grants this tool is unverified.
         """
         def run() -> ToolResponse[SandboxRun]:
             eid = self._experiment_id(experiment_id)

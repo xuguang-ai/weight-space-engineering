@@ -333,9 +333,10 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
                      "checkpoint's permitted tensors in their stored dtype; load them with "
                      "safetensors.torch.load_file), inputs/passes/<report_id>.jsonl (every output of your generation "
                      "passes, with its grade and text), and inputs/probes/<job_id>.npz and .json (your probe "
-                     "vectors); it writes work/ (kept between calls) and outputs/. Each numeric vector or matrix you "
-                     "save to outputs/ with numpy.save comes back with a pointer, <result_uri>#/values (a row: "
-                     "#/values/<row>), which wse_preview_patch and wse_analyze accept as a stored vector.")
+                     "vectors); it writes work/ (kept between calls) and outputs/ (emptied before each call). Each "
+                     "numeric vector or matrix you save to outputs/ with numpy.save comes back with a pointer, "
+                     "<result_uri>#/values (a row: #/values/<row>), which wse_preview_patch and wse_analyze accept as "
+                     "a stored vector.")
     steps.append("Propose an edit with wse_preview_patch (base_checkpoint_id, a hypothesis of one or two sentences "
                  "stating the observable evidence, and the operations), then create a candidate with wse_apply_patch "
                  "by patch_id.")
