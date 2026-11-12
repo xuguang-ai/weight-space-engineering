@@ -22,11 +22,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
+import signal
 import site
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -335,6 +338,7 @@ def test_a_real_codex_run_isolates_its_commands_and_keeps_credentials_out(engine
     python = result["provider_metadata"]["python"]
     assert environment["PATH"] == f"{python['bin_dir']}:/usr/bin:/bin:/usr/sbin:/sbin"
     assert environment["HOME"].endswith(f"sandboxes/{run_id}/work") and environment["PYTHONPATH"] == python["pythonpath"]
+    assert len(environment["WSE_CODEX_RUN"]) == 32  # the run's random marker, by which leftovers are found
     # The WSE server's environment: what the runner allow-lists, plus Codex's defaults; never the token.
     server = json.loads(record.read_text())
     assert server["token_values"] == [] and server["token_substrings"] == []
@@ -492,6 +496,76 @@ def test_codex_offers_no_sub_agents(engine, workspace, prepared):
     (output,) = tool_outputs(fake.requests[1]["body"])
     assert "NO-SPAWN" in output and "SPAWNED" not in output
     assert len(fake.requests) == 2  # no sub-agent made a model request of its own
+
+
+# -- processes that a command detaches ---------------------------------------------------------------------------
+
+DAEMON_TAG = "wse-codex-detached-daemon"
+# Writes its process ID, then a heartbeat into work/ every second for two minutes, by absolute path.
+DAEMON = ("import os, sys, time\n"
+          "root, mode = sys.argv[1], sys.argv[2]\n"
+          "open(os.path.join(root, 'work', 'daemon.pid'), 'w').write(str(os.getpid()))\n"
+          "if mode == 'changed_dir':\n"
+          "    os.chdir('/')\n"
+          "for i in range(120):\n"
+          "    with open(os.path.join(root, 'work', 'heartbeat.txt'), 'w') as handle:\n"
+          "        handle.write(str(i))\n"
+          "    time.sleep(1)\n")
+
+
+def _tagged_processes() -> list[int]:
+    """The daemons, whose last argument is the tag (not a shell or ``grep`` whose command line merely names it)."""
+    table = subprocess.run(["/bin/ps", "-A", "-o", "pid=,command="], capture_output=True, text=True).stdout
+    return [int(line.split()[0]) for line in table.splitlines() if line.rstrip().endswith(f" {DAEMON_TAG}")]
+
+
+@pytest.mark.parametrize(("mode", "found_by"), [("inherited", ["marker", "cwd"]), ("cleared_env", ["cwd"]),
+                                                 ("changed_dir", ["marker"])])
+def test_a_process_that_a_command_detaches_does_not_outlive_the_run(engine, workspace, prepared, mode, found_by):
+    """A command starts a process in a session of its own and exits at once, between two of Codex's process snapshots.
+
+    ``inherited`` keeps the command's environment (the run's marker) and its
+    working directory, the sandbox; ``cleared_env`` starts it through
+    ``env -i`` in the sandbox; ``changed_dir`` keeps the marker and moves to
+    ``/``. Each is found, ended, and recorded with how it was found.
+    """
+    start = "['/usr/bin/env', '-i', sys.executable]" if mode == "cleared_env" else "[sys.executable]"
+    launcher = ("import os, subprocess, sys\n"
+                f"subprocess.Popen({start} + ['-c', {DAEMON!r}, os.getcwd(), {mode!r}, {DAEMON_TAG!r}], "
+                "start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+                "stderr=subprocess.DEVNULL)\n"
+                "print('LAUNCHED')\n")
+    command = f"cat > work/launch.py <<'EOF'\n{launcher}EOF\npython work/launch.py"
+    run_id = engine.grant_run(prepared["task_id"], SMALL_MODEL_POLICY_ID, prepared["task_checkpoint_id"]).run_id
+    work = workspace / "sandboxes" / run_id / "work"
+    fake = FakeResponses([[shell(command, 1)], [message("WSE-STOP: launched.", 2)]], token=TOKEN).start()
+    try:
+        runner = ReferenceRunner(workspace, setup=["wse_test_plugins:setup"], worker_args=FAST_WORKER,
+                                 serve_env={"PYTHONPATH": str(TESTS_DIR)}, settle_timeout_seconds=60,
+                                 adapter_factory=lambda config, eid: CodexCLIAdapter(
+                                     codex_path=BINARY.path, provider_config=fake.provider_config(PROXY_TOKEN_ENV),
+                                     proxy_token=TOKEN, interrupt_grace_seconds=5.0, terminate_grace_seconds=2.0))
+        runner.run_experiment(run_id, prepared["task_id"], SMALL_MODEL_POLICY_ID,
+                              {"kind": "agent", "adapter": "codex_cli@1", "model": MODEL, "wall_clock_seconds": 300})
+        result = runner.last_result["result"]
+        assert result["status"] == "completed", result
+        (item,) = _segment_items(result, "command_execution")
+        assert "LAUNCHED" in item["aggregated_output"], item
+        daemon = int((work / "daemon.pid").read_text())  # the process ran under Codex's sandbox
+        first = (work / "heartbeat.txt").read_text()
+        time.sleep(2.5)
+        survivors = _tagged_processes()
+        assert survivors == [] and (work / "heartbeat.txt").read_text() == first, (survivors, first)
+        reaped = [entry for segment in result["provider_metadata"]["segments"]
+                  for entry in segment["reaped_processes"] if entry["pid"] == daemon]
+        assert reaped and reaped[0]["signal"] == "SIGTERM" and reaped[0]["found_by"] == found_by, reaped
+    finally:
+        fake.stop()
+        for pid in _tagged_processes():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_the_native_profile_denies_other_runs_temporary_directories_and_ssh_keys(configured):

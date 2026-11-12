@@ -911,10 +911,17 @@ class ReferenceRunner:
         return eid
 
     def _freeze_if_open(self, eid: str) -> None:
-        """Settle and freeze an experiment that is still open after a failure; never mask the failure."""
+        """Settle and freeze an experiment left open by a failure before its controller's own finalization.
+
+        When the controller's finalization already ran (its termination record
+        exists) and could not freeze, for example because jobs did not settle,
+        the experiment stays open as that record says; it is not retried here.
+        Never masks the failure.
+        """
         try:
             with Engine(self.workspace, registry=self.registry) as operator:
-                if operator.get_experiment(eid).state == "OPEN":
+                record = controller_record(operator.store.db, eid) or {}
+                if operator.get_experiment(eid).state == "OPEN" and record.get("result") is None:
                     self._finalize(operator, eid)
         except Exception:  # noqa: BLE001 - the original failure is re-raised by the caller
             logger.exception("freezing experiment %s after a failure failed", eid)

@@ -524,6 +524,82 @@ def test_a_process_that_left_codex_s_process_group_is_reaped(engine, workspace, 
     assert str(reaped[0]["pid"]) not in [line.split()[0] for line in table.splitlines() if "time.sleep(3600)" in line]
 
 
+LEFTOVER = ("import os, sys, time\n"
+            "cwd, held = sys.argv[1], sys.argv[2]\n"
+            "handle = open(held[2:], held[0]) if held else None\n"
+            "os.chdir(cwd)\n"
+            "time.sleep(60)\n")
+LAUNCHER = ("import json, subprocess, sys\n"
+            "pids = {}\n"
+            "for name, (env, cwd, held) in json.loads(sys.argv[1]).items():\n"
+            "    pids[name] = subprocess.Popen([sys.executable, '-c', sys.argv[2], cwd, held, sys.argv[3]], env=env,\n"
+            "                                  start_new_session=True, stdin=subprocess.DEVNULL,\n"
+            "                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid\n"
+            "print(json.dumps(pids))\n")
+
+
+def _detach(specs: dict[str, tuple[dict[str, str], Path, str]], tag: str) -> dict[str, int]:
+    """Start each process from a launcher that exits at once, as a command would: launchd becomes the parent.
+
+    A spec is ``(environment, working directory, held)``; ``held`` is
+    ``"a:<path>"`` or ``"r:<path>"`` for a file the process keeps open, or empty.
+    """
+    encoded = json.dumps({name: [env, str(cwd), held] for name, (env, cwd, held) in specs.items()})
+    output = subprocess.run([sys.executable, "-c", LAUNCHER, encoded, LEFTOVER, tag], capture_output=True, text=True,
+                            check=True, timeout=60).stdout
+    pids = json.loads(output)
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline and any(codex_cli._process_cwd(pids[name]) not in codex_cli.path_forms(cwd)
+                                              for name, (_, cwd, _) in specs.items()):
+        time.sleep(0.05)  # each process has opened its file and changed directory
+    return pids
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="the scan for leftover processes reads macOS process information")
+def test_leftover_processes_are_found_by_their_traces_and_nothing_else_is_ended(tmp_path):
+    """Processes no snapshot saw: found by the run's marker, their working directory, or a file open for writing.
+
+    Left alone: a process older than the run, a child of this process (as
+    the adapter's evaluation worker is), one that only reads a file in the
+    sandbox (as Spotlight's workers do), and one with no trace at all, the
+    evasion that remains.
+    """
+    sandbox, outside = tmp_path / "workspace" / "sandboxes" / "run_x", tmp_path / "outside"
+    for directory in (sandbox / "work", sandbox / "inputs", outside):
+        directory.mkdir(parents=True)
+    (sandbox / "inputs" / "data.bin").write_bytes(b"\0" * 64)
+    marker, tag = "5f0c3a9e" * 4, f"wse-leftover-test-{os.getpid()}"
+    marked = {codex_cli.RUN_MARKER_ENV: marker}
+    pids = _detach({"older": (marked, sandbox, "")}, tag)
+    since = time.time()
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", tag], cwd=sandbox, env=marked)
+    pids.update(_detach({"marked": (marked, outside, ""), "in_sandbox": ({}, sandbox, ""),
+                         "writing": ({}, outside, f"a:{sandbox / 'work' / 'log.txt'}"),
+                         "reading": ({}, outside, f"r:{sandbox / 'inputs' / 'data.bin'}"),
+                         "no_trace": ({}, outside, ""),
+                         "other_marker": ({codex_cli.RUN_MARKER_ENV: "0" * 32}, outside, "")}, tag))
+    try:
+        stopped = codex_cli.reap_run_processes(codex_cli.path_forms(sandbox), marker, since, grace_seconds=2.0)
+        terminated = {entry["pid"]: entry["found_by"] for entry in stopped if entry["signal"] == "SIGTERM"}
+        assert terminated == {pids["marked"]: ["marker"], pids["in_sandbox"]: ["cwd"],
+                              pids["writing"]: ["open_file"]}, stopped
+        assert all(" -c import os, sys, time" in entry["command"] for entry in stopped)  # the argv it was started with
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and any(codex_cli._process_facts(pid) for pid in terminated):
+            time.sleep(0.05)
+        assert [pid for pid in terminated if codex_cli._process_facts(pid)] == []
+        for name in ("older", "reading", "no_trace", "other_marker"):
+            os.kill(pids[name], 0)  # still running
+        assert child.poll() is None
+    finally:
+        for pid in [*pids.values(), child.pid]:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        child.wait()
+
+
 def test_cancel_from_another_thread_stops_the_run(engine, workspace, prepared):
     import threading
 

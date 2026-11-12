@@ -34,7 +34,7 @@ def _reports(out: Path, label: str) -> tuple[list[dict], str]:
 
 
 def test_failing_trials_are_reported_and_later_trials_still_run(tmp_path, monkeypatch, run_trials):
-    original_run, original_strategy = ReferenceRunner.run_experiment, ReferenceRunner._run_strategy
+    original_run, original_finalize = ReferenceRunner.run_experiment, ReferenceRunner._finalize
     started: list[str] = []
 
     def run_experiment(self, run_id, *args, **kwargs):
@@ -43,13 +43,13 @@ def test_failing_trials_are_reported_and_later_trials_still_run(tmp_path, monkey
             raise RuntimeError("the runner could not start")  # before the trial's experiment exists
         return original_run(self, run_id, *args, **kwargs)
 
-    def run_strategy(self, *args, **kwargs):
-        if len(started) == 2:  # after the trial's experiment exists, which stays open
+    def finalize(self, engine, eid):
+        if len(started) == 2:  # the controller's finalization cannot freeze, so the experiment stays open
             raise WSEError(ErrorCode.WORKER_FAILED, "1 jobs did not settle within 120 s; the experiment stays open")
-        return original_strategy(self, *args, **kwargs)
+        return original_finalize(self, engine, eid)
 
     monkeypatch.setattr(ReferenceRunner, "run_experiment", run_experiment)
-    monkeypatch.setattr(ReferenceRunner, "_run_strategy", run_strategy)
+    monkeypatch.setattr(ReferenceRunner, "_finalize", finalize)
     code = run_trials([str(tmp_path), "--label", "batch", "--policy", WEIGHTS_ONLY_POLICY_ID, "--trials", "4"])
     assert code == 1 and len(started) == 4
     rows, markdown = _reports(tmp_path, "batch")
