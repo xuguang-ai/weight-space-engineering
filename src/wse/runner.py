@@ -148,7 +148,8 @@ SANDBOX_TIME_LABEL = "sandbox wall-clock time (not metered computation)"
 SERVE_ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "PYTHONPATH", "VIRTUAL_ENV",
                        "SYSTEMROOT")
 SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE)
-AGENT_ADAPTERS = {"openai_agents@1": ("wse.agent_adapters.openai_agents", "OpenAIAgentsAdapter")}
+AGENT_ADAPTERS = {"openai_agents@1": ("wse.agent_adapters.openai_agents", "OpenAIAgentsAdapter"),
+                  "codex_cli@1": ("wse.agent_adapters.codex_cli", "CodexCLIAdapter")}
 
 
 class StrategyConfig(_Frozen):
@@ -1053,10 +1054,12 @@ class ReferenceRunner:
         module_name, class_name = AGENT_ADAPTERS[ref]
         adapter_class = getattr(importlib.import_module(module_name), class_name)
         if config.model.startswith(TEST_DOUBLE_PREFIX):
-            from wse.agent_adapters.openai_agents import strategy_model
-
             strategy_ref = self.registry.resolve_reference("strategy", config.model[len(TEST_DOUBLE_PREFIX):])
             strategy = self.registry.resolve("strategy", strategy_ref.extension_id, strategy_ref.version)()
+            if hasattr(adapter_class, "test_double"):  # an adapter with its own offline stand-in (codex_cli@1)
+                return adapter_class.test_double(strategy)
+            from wse.agent_adapters.openai_agents import strategy_model
+
             return adapter_class(model=strategy_model(strategy, experiment_id=eid))
         return adapter_class()
 

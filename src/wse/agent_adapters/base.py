@@ -132,6 +132,8 @@ class AgentUsage(_Frozen):
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+    cached_input_tokens: int | None = None  # part of input_tokens, when the host reports it
+    reasoning_output_tokens: int | None = None  # part of output_tokens, when the host reports it
     cost_usd: float | None = None
     provider: str | None = None
     model: str | None = None
