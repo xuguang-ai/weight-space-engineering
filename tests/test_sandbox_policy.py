@@ -149,3 +149,34 @@ def test_only_a_sandbox_policy_grants_wse_run_python() -> None:
     for policy_id in ("qwen_loop_v1", SMALL_MODEL_POLICY_ID, "small_model_weights_only_v1"):
         assert not set(sandbox_tools) & set(allowed_tools(policies[policy_id]))
     assert len(allowed_tools(policies[SMALL_MODEL_POLICY_ID])) == 14  # the 13 earlier tools and wse_evaluate
+
+
+def test_an_agent_that_runs_its_own_commands_makes_every_run_unverified_and_is_told_so() -> None:
+    from wse.policy import builtin_experiment_policies
+    from wse.runner import (
+        OWN_CODE_CONSTRAINT_REASON,
+        SANDBOX_CONSTRAINT_REASON,
+        allowed_tools,
+        constraint_for,
+        render_instructions,
+    )
+    from wse.schemas import TaskDefinition
+
+    policies = builtin_experiment_policies()
+    plain, sandboxed = policies["qwen_loop_v1"], policies["qwen_loop_sandbox_v1"]
+    assert constraint_for(plain, True) == ("verified", None)
+    assert constraint_for(plain, True, runs_own_code=True) == ("unverified", OWN_CODE_CONSTRAINT_REASON)
+    assert constraint_for(sandboxed, True, runs_own_code=True) == (
+        "unverified", f"{OWN_CODE_CONSTRAINT_REASON}; {SANDBOX_CONSTRAINT_REASON}")
+    task = TaskDefinition.model_validate({
+        "task_id": "loops", "title": "Finish answers", "description": "Make the model finish its answers.",
+        "objective": {"task_id": "loops", "description": "Fewer outputs at the token limit.",
+                      "gates": [{"metric": "accuracy", "min_delta": 0.0}]},
+        "development_suite_id": "practice", "development_examples": 4})
+    for policy, phrase in ((sandboxed, "they read inputs/"), (plain, "holds no model data")):
+        text = render_instructions(task, policy, experiment_id="exp_0123", tools=allowed_tools(policy),
+                                   own_commands=True)
+        assert "You can also run your own commands" in text and phrase in text, policy.policy_id
+        assert "you cannot run code" not in text and "this run is unverified" in text
+    assert "you cannot run code" in render_instructions(task, plain, experiment_id="exp_0123",
+                                                        tools=allowed_tools(plain))

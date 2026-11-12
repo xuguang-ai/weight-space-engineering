@@ -125,6 +125,7 @@ __all__ = [
     "serve_environment",
     "summarize_trial",
     "constraint_for",
+    "OWN_CODE_CONSTRAINT_REASON",
     "SANDBOX_CONSTRAINT_REASON",
     "SANDBOX_TIME_LABEL",
 ]
@@ -144,6 +145,9 @@ TEST_DOUBLE_PREFIX = "wse-test-double:"
 OPERATOR_INTERRUPT = "operator_interrupt: the operator interrupted the run (SIGINT)"
 # Why a run whose policy grants the sandbox is unverified, whatever its controller (M3 plan Section 2.5).
 SANDBOX_CONSTRAINT_REASON = "sandbox code execution: WSE meters only its own calls"
+# Why a run of an agent that runs its own commands (an adapter with ``runs_own_code``, such as Codex) is unverified.
+OWN_CODE_CONSTRAINT_REASON = ("the agent runs its own commands (Codex's shell), whose computation WSE does not "
+                              "meter: WSE meters only its own calls")
 # How reports name the sandbox's usage, apart from the calls WSE meters.
 SANDBOX_TIME_LABEL = "sandbox wall-clock time (not metered computation)"
 SERVE_ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "PYTHONPATH", "VIRTUAL_ENV",
@@ -193,16 +197,21 @@ def jobs_available(policy: ExperimentPolicy) -> bool:
     return policy.evaluation_available or probes_available(policy)
 
 
-def constraint_for(policy: ExperimentPolicy, verified: bool) -> tuple[str, str | None]:
-    """A run's ``constraint_status`` and, when its policy decides it, the reason.
+def constraint_for(policy: ExperimentPolicy, verified: bool, *,
+                   runs_own_code: bool = False) -> tuple[str, str | None]:
+    """A run's ``constraint_status`` and, when the agent or the policy decides it, the reason.
 
-    A policy that grants the sandbox makes every run unverified, because the
-    agent's own code runs computation that WSE does not meter. Otherwise the
-    controller decides: ``verified`` when its only channel is the run-bound
-    interface (``verified``).
+    An agent that runs its own commands (``runs_own_code``, an adapter such
+    as ``codex_cli@1`` that gives the model a shell) and a policy that grants
+    the sandbox each make every run unverified, because the agent's own code
+    runs computation that WSE does not meter. Otherwise the controller
+    decides: ``verified`` when its only channel is the run-bound interface
+    (``verified``).
     """
-    if sandbox_available(policy):
-        return "unverified", SANDBOX_CONSTRAINT_REASON
+    reasons = [reason for applies, reason in ((runs_own_code, OWN_CODE_CONSTRAINT_REASON),
+                                              (sandbox_available(policy), SANDBOX_CONSTRAINT_REASON)) if applies]
+    if reasons:
+        return "unverified", "; ".join(reasons)
     return ("verified" if verified else "unverified"), None
 
 
@@ -282,7 +291,8 @@ def _gate_text(gate: Any) -> str:
 
 
 def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, experiment_id: str,
-                        tools: Sequence[str], baseline: Mapping[str, Any] | None = None) -> str:
+                        tools: Sequence[str], baseline: Mapping[str, Any] | None = None,
+                        own_commands: bool = False) -> str:
     """Agent instructions built only from the task definition, the policy, and the run's IDs and tools.
 
     ``baseline`` (report ID and metrics), when given, is the base checkpoint's
@@ -298,11 +308,25 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
     from wse.jobs import wait_cap
 
     cap = wait_cap(policy)
+    if own_commands:
+        opening = ("You control one managed weight-space engineering experiment. The WSE tools listed below are the "
+                   "only way to change, evaluate, or select the model's weights. You can also run your own commands "
+                   "in this run's working directory, under a sandbox without network: "
+                   + ("they read inputs/ (the base checkpoint's weights, and the reports and generated outputs of "
+                      "finished development evaluations, refreshed as evaluations finish) and write work/, outputs/, "
+                      "and tmp/; wse_run_python runs Python on the same inputs in WSE's own sandbox. "
+                      if sandbox else
+                      "the working directory holds no model data, so read and analyze the weights with the WSE "
+                      "tools. ")
+                   + "WSE does not meter what your commands compute, so this run is unverified.")
+    else:
+        opening = ("You control one managed weight-space engineering experiment through the WSE tools listed below. "
+                   "They are "
+                   + ("your only tools. wse_run_python runs your own Python in a sandbox that reads only its own "
+                      "inputs and has no network; no other tool runs code, reads files, or uses the network."
+                      if sandbox else "your only tools: you cannot run code, read files, or use the network."))
     lines = [
-        "You control one managed weight-space engineering experiment through the WSE tools listed below. They are "
-        + ("your only tools. wse_run_python runs your own Python in a sandbox that reads only its own inputs and has "
-           "no network; no other tool runs code, reads files, or uses the network." if sandbox else
-           "your only tools: you cannot run code, read files, or use the network."),
+        opening,
         "",
         f"Experiment ID: {experiment_id} (the tools use it when you omit experiment_id)",
         f"Task {task.task_id}: {task.title}",
@@ -1093,11 +1117,13 @@ class ReferenceRunner:
         return str(self.log_dir / f"serve-{run_id}.log")
 
     def connection(self, run_id: str, eid: str, task: TaskDefinition, policy: ExperimentPolicy,
-                   constraint_status: str) -> RunConnection:
+                   constraint_status: str, *, own_commands: bool = False) -> RunConnection:
         """The MCP connection for a run: ``wse serve`` bound to the grant, allow-listed tools and environment.
 
         Under a task with a selection rule the runner chooses the checkpoint
         to freeze, so ``wse_select_checkpoint`` is not offered.
+        ``own_commands`` says that the agent also runs its own commands (an
+        adapter with ``runs_own_code``); the instructions then say so.
         """
         tools = allowed_tools(policy)
         if task.objective.selection is not None:
@@ -1114,7 +1140,7 @@ class ReferenceRunner:
             policy_id=policy.policy_id, serve_command=command, serve_env=serve_environment(self.serve_env),
             cwd=str(self.workspace), allowed_tools=tools,
             instructions=render_instructions(task, policy, experiment_id=eid, tools=tools,
-                                             baseline=self._baseline_summary(eid, task)),
+                                             baseline=self._baseline_summary(eid, task), own_commands=own_commands),
             initial_message=initial_message(eid), constraint_status=constraint_status)
 
     def _evaluate_baseline(self, eid: str, task: TaskDefinition) -> None:
@@ -1165,8 +1191,9 @@ class ReferenceRunner:
         if timeout != config.client_session_timeout_seconds:
             config = config.model_copy(update={"client_session_timeout_seconds": timeout})
         adapter = self._make_adapter(config, eid)
-        constraint_status, constraint_reason = constraint_for(policy, config.benchmark)
-        connection = self.connection(run_id, eid, task, policy, constraint_status)
+        runs_own_code = bool(getattr(adapter, "runs_own_code", False))
+        constraint_status, constraint_reason = constraint_for(policy, config.benchmark, runs_own_code=runs_own_code)
+        connection = self.connection(run_id, eid, task, policy, constraint_status, own_commands=runs_own_code)
         serve_log = self.serve_log(run_id)
         recorded = {**config.model_dump(mode="json"), "allowed_tools": connection.allowed_tools,
                     "serve_env_names": sorted(connection.serve_env), "cwd": connection.cwd}

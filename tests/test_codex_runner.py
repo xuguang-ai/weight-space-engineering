@@ -42,7 +42,7 @@ from wse.agent_adapters.codex_cli import (
 )
 from wse.api import Engine
 from wse.policy import SMALL_MODEL_POLICY_ID, WEIGHTS_ONLY_POLICY_ID
-from wse.runner import AGENT_ADAPTERS, ReferenceRunner, agent_session_timeout, allowed_tools
+from wse.runner import AGENT_ADAPTERS, OWN_CODE_CONSTRAINT_REASON, ReferenceRunner, agent_session_timeout, allowed_tools
 from wse.strategies.scripted import ScriptedSearchStrategy
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -173,6 +173,11 @@ def test_the_runner_selects_the_stand_in_by_model_name(engine, workspace, prepar
     record = runner.last_result
     assert record["controller"] == {"extension_id": "codex_cli", "version": "1"}
     assert record["config"]["test_double"]["strategy"] == "scripted_search@1"
+    # Codex gives the model a shell, so the run is unverified whatever the policy, and the record says why.
+    assert (record["constraint_status"], record["constraint_reason"]) == ("unverified", OWN_CODE_CONSTRAINT_REASON)
+    prompt = (_codex_dir(workspace, run_id) / "prompt.txt").read_text(encoding="utf-8")
+    assert "You can also run your own commands" in prompt and "holds no model data" in prompt
+    assert "you cannot run code" not in prompt
     assert record["result"]["status"] in ("stopped", "completed")
     assert engine.get_experiment(eid).state == "FROZEN"
 

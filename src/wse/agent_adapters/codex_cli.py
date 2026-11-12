@@ -914,6 +914,8 @@ class CodexCLIAdapter(AgentAdapter):
     session timeout).
     """
 
+    runs_own_code = True  # the model runs its own commands in Codex's shell: every run is unverified
+
     adapter_id = ADAPTER_ID
     version = ADAPTER_VERSION
 
