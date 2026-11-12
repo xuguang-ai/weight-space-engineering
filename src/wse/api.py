@@ -30,6 +30,7 @@ from wse.adapters.base import Architecture, ModelAdapter
 from wse.registry import Registry, builtin_registry
 from wse.schemas import (
     BundleManifest,
+    SandboxRun,
     ClusterSummary,
     ErrorCode,
     EvalConfig,
@@ -1358,6 +1359,16 @@ class Engine:
 
     def audit_log(self, experiment_id: str) -> list[dict[str, Any]]:
         return self.experiments.audit_log(experiment_id)
+
+    def run_python(self, experiment_id: str, code: str, key: str) -> SandboxRun:
+        """Run agent-written Python in the run's sandbox when the policy grants it (``wse.sandbox_runs``).
+
+        The code reads the run's inputs (permitted base weights, development
+        outputs, probe vectors) and writes ``outputs/``; arrays it saves there
+        come back with vector references for edits. Every run of a policy
+        that grants this is unverified: WSE meters only its own calls.
+        """
+        return self.experiments.run_python(experiment_id, code, key)
 
     def experiment_policy(self, experiment_id: str) -> ExperimentPolicy:
         """The immutable policy of an experiment this engine may see."""

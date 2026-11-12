@@ -38,8 +38,9 @@ __all__ = ["STRATEGY_TOOLS", "Action", "Observation", "Strategy", "validate_stra
 # starts). The runner rejects any other name, and exposes only those that the
 # experiment's policy permits (``wse.runner.allowed_tools``): ``wse_probe``
 # (activation probes of language models, M2) only under a policy that grants
-# probes, and ``wse_get_report`` (a whole report) with the other evaluation
-# tools, whenever development evaluations are permitted.
+# probes, ``wse_run_python`` (code in the sandbox, M3) only under a policy that
+# grants the sandbox, and ``wse_get_report`` (a whole report) with the other
+# evaluation tools, whenever development evaluations are permitted.
 STRATEGY_TOOLS: tuple[str, ...] = (
     "wse_list_models",
     "wse_get_experiment",
@@ -47,6 +48,7 @@ STRATEGY_TOOLS: tuple[str, ...] = (
     "wse_read_tensor",
     "wse_analyze",
     "wse_probe",
+    "wse_run_python",
     "wse_preview_patch",
     "wse_apply_patch",
     "wse_submit_evaluation",

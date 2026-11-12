@@ -102,6 +102,7 @@ from wse.strategies.base import STRATEGY_TOOLS, Action, Observation
 
 __all__ = [
     "EVALUATION_TOOLS",
+    "SANDBOX_TOOLS",
     "JOB_TOOLS",
     "OPERATOR_INTERRUPT",
     "PROBE_TOOLS",
@@ -129,6 +130,7 @@ logger = logging.getLogger("wse.runner")
 
 EVALUATION_TOOLS = ("wse_submit_evaluation", "wse_get_job", "wse_get_report", "wse_cancel_job", "wse_compare")
 PROBE_TOOLS = ("wse_probe",)
+SANDBOX_TOOLS = ("wse_run_python",)  # code execution: only under a policy that grants the sandbox
 JOB_TOOLS = ("wse_get_job", "wse_cancel_job")  # evaluations and probes are both jobs
 NO_IMPROVEMENT_PATIENCE = 3
 IMPROVEMENT_TOLERANCE = 1e-9
@@ -204,11 +206,14 @@ def allowed_tools(policy: ExperimentPolicy) -> list[str]:
     Evaluation tools (``EVALUATION_TOOLS``: submission, reports, and
     comparisons) when the policy permits development evaluations (evaluation
     batches or generation passes, ``evaluation_available``), ``wse_probe``
-    when it grants probes, and the job tools for either.
+    when it grants probes, ``wse_run_python`` when it grants the sandbox, and
+    the job tools for either.
     """
     evaluation, probes = policy.evaluation_available, probes_available(policy)
 
     def permitted(tool: str) -> bool:
+        if tool in SANDBOX_TOOLS:
+            return sandbox_available(policy)
         if tool in PROBE_TOOLS:
             return probes
         if tool in JOB_TOOLS:
@@ -387,6 +392,8 @@ class ExperimentExecutor:
             "wse_probe": lambda *, checkpoint_id, texts, sites, idempotency_key, groups=None, top=None,
                 experiment_id=None: e.submit_probe(eid(experiment_id), checkpoint_id, texts, sites, idempotency_key,
                                                    groups=groups, top=top),
+            "wse_run_python": lambda *, code, idempotency_key, experiment_id=None: e.run_python(
+                eid(experiment_id), code, idempotency_key),
             "wse_preview_patch": lambda *, patch_spec, idempotency_key, experiment_id=None: e.preview_patch(
                 eid(experiment_id), patch_spec, idempotency_key),
             "wse_apply_patch": lambda *, patch_id, idempotency_key, experiment_id=None: e.apply_patch(

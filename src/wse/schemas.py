@@ -628,6 +628,58 @@ class Usage(_Frozen):
     unavailable: dict[str, str] = Field(default_factory=dict)
 
 
+class SandboxOutput(_Frozen):
+    """A file that code in the sandbox left in ``outputs/``, with its size and SHA-256.
+
+    A ``.npy`` file also gives its ``shape`` and ``dtype``; a finite numeric
+    array of one or two dimensions gives a ``pointer``,
+    ``wse://analyses/<sha256>#/values`` (a row of a matrix is
+    ``#/values/<row>``), which edits and analyses accept wherever they take a
+    stored vector.
+    """
+
+    path: str
+    size: int = Field(ge=0)
+    sha256: str
+    shape: list[int] | None = None
+    dtype: str | None = None
+    pointer: str | None = None
+
+
+class SandboxRun(_Frozen):
+    """One run of agent-written code in the sandbox (``Engine.run_python``, ``wse_run_python``; M3 plan Section 2).
+
+    ``ending`` is ``exited`` (see ``exit_code``), ``timed_out``,
+    ``cpu_limit``, ``file_size_limit``, or ``signal``. ``stdout`` and
+    ``stderr`` are bounded by the policy (``*_truncated`` says whether they
+    were cut; ``*_bytes`` counts all of it). ``inputs`` lists what the code
+    could read under ``inputs/``; ``outputs`` what it left in ``outputs/``;
+    ``refused_outputs`` the links and other non-regular files there, which
+    WSE never follows. ``usage`` is what the call charged: one sandbox call
+    and its wall-clock seconds, not metered computation.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    call: int = Field(ge=1)
+    ending: Literal["exited", "timed_out", "cpu_limit", "file_size_limit", "signal"]
+    exit_code: int | None
+    signal: str | None
+    wall_seconds: float
+    cpu_seconds: float
+    max_rss_bytes: int
+    stdout: str
+    stderr: str
+    stdout_bytes: int
+    stderr_bytes: int
+    stdout_truncated: bool
+    stderr_truncated: bool
+    outputs: list[SandboxOutput]
+    refused_outputs: list[str]
+    inputs: list[str]
+    code_sha256: str
+    usage: Usage
+
+
 class TensorDiff(_Frozen):
     """Per-tensor difference between a base and a candidate model.
 

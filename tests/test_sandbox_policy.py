@@ -134,3 +134,15 @@ def test_migration_12_backfills_sandbox_counters_and_the_reason_table(workspace,
         assert (budget["sandbox_calls"].limit, budget["sandbox_seconds"].limit) == (0, 0)
         tables = {row[0] for row in engine.store.db.conn.execute("SELECT name FROM sqlite_master")}
         assert "run_constraints" in tables
+
+
+def test_only_a_sandbox_policy_grants_wse_run_python() -> None:
+    from wse.runner import allowed_tools
+
+    policies = builtin_experiment_policies()
+    assert "wse_run_python" in allowed_tools(policies[QWEN_LOOP_SANDBOX_POLICY_ID])
+    assert [tool for tool in allowed_tools(policies[QWEN_LOOP_SANDBOX_POLICY_ID]) if tool != "wse_run_python"] == \
+        allowed_tools(policies["qwen_loop_v1"])
+    for policy_id in ("qwen_loop_v1", SMALL_MODEL_POLICY_ID, "small_model_weights_only_v1"):
+        assert "wse_run_python" not in allowed_tools(policies[policy_id])
+    assert len(allowed_tools(policies[SMALL_MODEL_POLICY_ID])) == 13

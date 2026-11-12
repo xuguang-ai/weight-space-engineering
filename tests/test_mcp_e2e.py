@@ -41,9 +41,10 @@ TOOL_NAMES = {
     "wse_analyze", "wse_preview_patch", "wse_apply_patch", "wse_submit_evaluation", "wse_get_job",
     "wse_cancel_job", "wse_compare", "wse_select_checkpoint",
     "wse_probe", "wse_get_report",  # M2: language-model probes and whole reports (M2 plan Section 5.6)
+    "wse_run_python",  # M3: code in the sandbox, offered under a policy that grants it (M3 plan Section 2)
 }
 MUTATIONS = {"wse_create_experiment", "wse_preview_patch", "wse_apply_patch", "wse_submit_evaluation",
-             "wse_cancel_job", "wse_select_checkpoint", "wse_probe"}
+             "wse_cancel_job", "wse_select_checkpoint", "wse_probe", "wse_run_python"}
 RESOURCE_TEMPLATES = {"wse://models/{checkpoint_id}/manifest{?page}", "wse://experiments/{experiment_id}/policy{?page}",
                       "wse://reports/{report_id}{?page}", "wse://patches/{patch_id}{?page}",
                       "wse://analyses/{digest}{?page}"}

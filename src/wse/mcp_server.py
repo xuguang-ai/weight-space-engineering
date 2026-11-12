@@ -75,6 +75,7 @@ from wse.probes import DEFAULT_SUMMARY_TOP, MAX_PROBE_SITES, MAX_SITE_CHARACTERS
 from wse.store import ANALYSIS_URI_PREFIX
 from wse.schemas import (
     MAX_ECHO_CHARACTERS,
+    SandboxRun,
     MAX_PROBE_STRING_CHARACTERS,
     AnalysisResult,
     AxisSlice,
@@ -115,6 +116,7 @@ WAIT_POLL_SECONDS = 0.05
 READ_COUNTERS = ("tensor_read_calls", "compute_seconds")
 PROBE_COUNTERS = ("probe_calls", "teacher_forced_tokens", "compute_seconds")
 PREVIEW_COUNTERS = ("patch_previews", "compute_seconds")
+SANDBOX_COUNTERS = ("sandbox_calls", "sandbox_seconds")
 APPLY_COUNTERS = ("candidate_commits", "compute_seconds")
 INSPECTION_COUNTERS = ("compute_seconds",)
 
@@ -199,6 +201,9 @@ SelectionArg = Annotated[Any, WithJsonSchema(SELECTION_SCHEMA)]
 PatchSpecArg = Annotated[Any, WithJsonSchema(PATCH_SPEC_SCHEMA)]
 EvalConfigArg = Annotated[Any, WithJsonSchema({**EVAL_CONFIG_SCHEMA, "description": "A preregistered sample_count "
                                                "and seed of the suite; the server fixes the device and batch size."})]
+CodeArg = Annotated[str, Field(description="Python to run in this run's sandbox (NumPy, PyTorch on the CPU, "
+                                           "safetensors): it reads inputs/ and writes work/ and outputs/; no network, "
+                                           "no other files, no new processes.")]
 WaitArg = Annotated[float, Field(json_schema_extra={"minimum": 0, "maximum": MAX_WAIT_SECONDS},
                                  description="Seconds (0-10) to hold the call until the job is terminal.")]
 CursorArg = Annotated[str | None, Field(json_schema_extra={"maxLength": MAX_ECHO_CHARACTERS},
@@ -392,6 +397,7 @@ class WSEMCPServer:
             (self.wse_read_tensor, METERED),
             (self.wse_analyze, METERED),
             (self.wse_probe, MUTATION),
+            (self.wse_run_python, MUTATION),
             (self.wse_preview_patch, MUTATION),
             (self.wse_apply_patch, MUTATION),
             (self.wse_submit_evaluation, MUTATION),
@@ -527,6 +533,30 @@ class WSEMCPServer:
             eid = self._experiment_id(experiment_id)
             job = self.engine.submit_probe(eid, checkpoint_id, texts, sites, idempotency_key, groups=groups, top=top)
             return self._job_response(eid, job)
+        return _respond(self._call(run))
+
+    def wse_run_python(self, *, experiment_id: ExperimentIdArg = None, code: CodeArg, idempotency_key: KeyArg,
+                       ) -> Annotated[CallToolResult, ToolResponse[SandboxRun]]:
+        """Run your own Python in this run's sandbox when the policy grants it; each call is a fresh process.
+
+        The working directory holds inputs/ (read only: weights/base.safetensors with the base checkpoint's
+        permitted tensors in their stored dtype, which safetensors.torch.load_file reads; passes/<report_id>.jsonl
+        with every output of your development generation passes; probes/<job_id>.npz and .json with your probe
+        results; manifest.json), work/ (your files, kept between calls), and outputs/. Save a numeric vector or
+        matrix there with numpy.save to use it in an edit: each such .npy output comes back with a pointer,
+        <result_uri>#/values (a row of a matrix: #/values/<row>), which project_out's direction, add_low_rank's u and
+        v, and direction_projection accept as a stored vector. Output beyond the policy's limit is cut in the middle. WSE meters only
+        the call and its wall-clock time, so every run that grants this tool is unverified.
+        """
+        def run() -> ToolResponse[SandboxRun]:
+            eid = self._experiment_id(experiment_id)
+            result = self.engine.run_python(eid, code, idempotency_key)
+            pointers = [o.pointer for o in result.outputs if o.pointer]
+            return ToolResponse[SandboxRun](
+                summary=f"call {result.call} {result.ending}" + ("" if result.exit_code is None else
+                                                                 f" with exit code {result.exit_code}")
+                        + f" in {result.wall_seconds:.1f} s; {len(result.outputs)} output files",
+                uris=pointers, usage=self._usage(eid, result.usage, SANDBOX_COUNTERS), result=result)
         return _respond(self._call(run))
 
     def wse_preview_patch(self, *, experiment_id: ExperimentIdArg = None, patch_spec: PatchSpecArg,

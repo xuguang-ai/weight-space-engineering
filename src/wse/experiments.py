@@ -115,6 +115,7 @@ from wse.policy import (
     response_size,
 )
 from wse.schemas import (
+    SandboxRun,
     CHECKPOINT_ID_PATTERN,
     IDEMPOTENCY_KEY_PATTERN,
     OBJECT_ID_PATTERNS,
@@ -923,6 +924,12 @@ class ExperimentService:
                                                 read_result=self.experiment_results(experiment_id)),
             record,
         )
+
+    def run_python(self, experiment_id: str, code: Any, key: Any) -> SandboxRun:
+        """Run agent-written code in the run's sandbox, charged to the sandbox counters (``wse.sandbox_runs``)."""
+        from wse.sandbox_runs import run_python
+
+        return run_python(self, experiment_id, code, key)
 
     def experiment_results(self, experiment_id: str) -> Callable[[Any], dict[str, Any]]:
         """A reader of the stored results that ``experiment_id`` produced: its analyses and generation outputs.
