@@ -18,7 +18,7 @@ Each row's `problem` is GSM8K's `question`, and its `answer` is the number after
 - The test file shares no problem with either development file, and the two development files share none, compared as WSE compares problems (Unicode NFKC, lowercase, whitespace collapsed).
 - Graded by the `math` evaluator's grader (`math_boxed@1`) against these answers, the 64 recorded outputs of that diagnosis's comparison keep the grades that GSM8K's numeric grader gave them: 2 of 32 correct for the base model and 10 of 32 for the edited model.
 
-**License.** GSM8K is released under the [MIT License](https://github.com/openai/grade-school-math/blob/master/LICENSE). These rows keep its problems unchanged and shorten its answers to the final number.
+**License.** GSM8K is released under the MIT License, Copyright (c) 2021 OpenAI; [LICENSE-GSM8K](LICENSE-GSM8K) is a copy of its [license file](https://github.com/openai/grade-school-math/blob/3101c7d5072418e28b9008a6636bde82a006892c/LICENSE) at the commit below. These rows keep its problems unchanged and shorten its answers to the final number.
 
 ## Rebuilding the files
 

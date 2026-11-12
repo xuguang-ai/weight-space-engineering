@@ -44,7 +44,7 @@ result.export("artifacts/fix-loops")
 | `sandbox` | `"python"`: the agent may write and run Python in its working directory ([What the agent can reach](#what-the-agent-can-reach)). |
 | `max_evaluations` | How many development evaluations the run may make, the original's included. |
 
-`Experiment` also takes `profile` (the sampling profile; by default the model's own, frozen from its `generation_config.json`), `problems` and `subset_seed` (a subset of the development file), `samples` (answers per problem, default 1), and `seed` (the evaluation seed, default 0). `run` also takes `max_turns` and `wall_clock_hours`, which bound the agent (defaults 400 turns and 6 hours), `device`, the device of WSE's evaluation worker (MPS when available), and `out_dir`, the directory of the run's logs.
+`Experiment` also takes `profile` (the sampling profile; by default the model's own, frozen from its `generation_config.json`), `problems` and `subset_seed` (a subset of the development file), `samples` (answers per problem, default 1), and `seed` (the evaluation seed, default 0). `run` also takes `max_turns` and `wall_clock_hours`, which bound the agent (defaults 400 turns and 12 hours, its waits for evaluations included), `device`, the device of WSE's evaluation worker (MPS when available), and `out_dir`, the directory of the run's logs.
 
 `result.summary()` reports the change in behavior, the candidates, where each changed the weights, and why the choice was made, followed by the audit details. `result.model` is the frozen choice, a `Model`; it is the original when no candidate qualified. `result.test(path)` evaluates only the frozen choice and the original, and `report.compare()` prints each metric for both models with their difference: for accuracy, the paired 95% interval of the difference; for the other metrics, each model's own 95% interval.
 
@@ -120,7 +120,7 @@ caffeinate -is uv run --extra models-hf --env-file .env \
   --agent codex:YOUR_AGENT_MODEL
 ```
 
-One evaluation of the 32 problems took 37 to 40 minutes on an M4 Pro in the recorded runs, so 10 evaluations take 6.2 to 6.6 hours. The agent's time limit includes its waits for evaluations, so the script raises it from `run`'s default of 6 hours to 10 (`--wall-clock-hours`). `caffeinate -is` keeps the Mac awake.
+One evaluation of the 32 problems took 37 to 40 minutes on an M4 Pro in the recorded runs, so 10 evaluations take 6.2 to 6.6 hours. The agent's time limit includes its waits for evaluations; `run`'s default, 12 hours, leaves room for ten. `caffeinate -is` keeps the Mac awake.
 
 Both scripts take `--model`, `--repo`, and `--revision` for another model or a local snapshot, `--dev` and `--test` for other problems, and `--workspace` and `--export` for where results go.
 

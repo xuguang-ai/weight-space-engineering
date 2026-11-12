@@ -75,7 +75,7 @@ from wse.schemas import METRIC_DIRECTIONS, ErrorCode, WSEError, json_hash
 __all__ = ["Experiment", "ExperimentResult", "TestReport", "experiment_policy", "parse_agent"]
 
 DEFAULT_MAX_EVALUATIONS = 10
-DEFAULT_WALL_CLOCK_HOURS = 6.0
+DEFAULT_WALL_CLOCK_HOURS = 12.0  # ten evaluations of Qwen3.5-0.8B at 8,192 tokens take about 6.5 hours
 DEFAULT_MAX_TURNS = 400
 GENERATION_EVALUATOR = "generation@1"
 TEST_DOUBLE_PREFIXES = ("test-double:", "wse-test-double:")
@@ -253,8 +253,8 @@ class Experiment:
         ``agent`` is ``"codex:MODEL"`` (see ``parse_agent``); ``sandbox="python"``
         lets the agent run its own Python on the run's inputs (the run is then
         unverified); ``max_evaluations`` counts the baseline; ``max_turns``
-        and ``wall_clock_hours`` bound the agent (defaults 400 turns and 6
-        hours); ``device`` is the worker's engine device (default: MPS when
+        and ``wall_clock_hours`` bound the agent (defaults 400 turns and 12
+        hours, its waits for evaluations included); ``device`` is the worker's engine device (default: MPS when
         available); ``out_dir`` receives the runner's logs (default
         ``<workspace>/experiments/<run_id>``).
         """

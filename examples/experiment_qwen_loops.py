@@ -22,8 +22,8 @@ Status: written against the Experiment API before its first live run with an age
 
 Time: on an M4 Pro (MPS), one evaluation of the 32 problems took 37 to 40 minutes in the recorded runs, so ten
 evaluations take 6.2 to 6.6 hours, and the test (two models on 16 problems, as many answers as one evaluation)
-about as long as one more. The agent waits for its evaluations, so its time limit (``--wall-clock-hours``) is
-raised from ``run``'s default of 6 hours to 10. Keep the Mac awake (``caffeinate -is``). Disk: the download is 1.7 GB and the
+about as long as one more. The agent's time limit includes its waits for evaluations; ``run``'s default, 12 hours,
+leaves room for ten. Keep the Mac awake (``caffeinate -is``). Disk: the download is 1.7 GB and the
 workspace's copy of the model 1.5 GB; the export adds the selected model and the experiment's record, which holds
 the original model again.
 
@@ -52,7 +52,7 @@ parser.add_argument("--revision", default="2fc06364715b967f1860aea9cf38778875588
 parser.add_argument("--dev", type=Path, default=Path("examples/data/qwen_loops_dev.jsonl"), help="development problems")
 parser.add_argument("--test", type=Path, default=Path("examples/data/math_test.jsonl"), help="test problems")
 parser.add_argument("--max-evaluations", type=int, default=10, help="development evaluations, the original's included")
-parser.add_argument("--wall-clock-hours", type=float, default=10.0, help="the agent's time limit, its waits included")
+parser.add_argument("--wall-clock-hours", type=float, help="the agent's time limit, its waits included (default 12)")
 parser.add_argument("--workspace", type=Path, default=Path("runs/qwen-loops"), help="the workspace")
 parser.add_argument("--export", type=Path, default=Path("artifacts/qwen-loops"), help="a new directory")
 args = parser.parse_args()
