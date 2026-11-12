@@ -15,8 +15,9 @@
   would exceed the inline-result limit; a report's tails are shortened when
   its escaped text mirror would not fit; M1 responses are unchanged.
 * **Parity.** MCP (a real stdio session with ``wse serve``) and the Python
-  and strategy paths agree on results, errors, and usage. An OpenAI Agents
-  SDK agent under ``qwen_loop_v1`` sees every tool the policy permits.
+  and strategy paths agree on results, errors, and usage. An agent under
+  ``qwen_loop_v1`` (through the Codex adapter) sees every tool the policy
+  permits.
 * **Carried over from M1.** A flat list is accepted for a selection whose
   other axes have length 1, and a run-bound server defaults the experiment
   ID.

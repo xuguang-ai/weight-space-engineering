@@ -22,11 +22,12 @@ Each invocation:
    reference runner, which starts one worker on ``--device`` and settles and
    freezes the experiment however the run ends (the first Ctrl-C stops the
    strategy at its next step; a second aborts at once). With ``--via-mcp``,
-   which the M2 plan's Q2 exit asks for, the OpenAI Agents SDK drives the
-   managed tools through a real ``wse serve`` MCP session and the strategy
-   chooses every call in place of a model (the runner's test double: no
-   network, no credentials); without it the runner dispatches the
-   strategy's actions to the run-bound engine. The operations are the same;
+   which the M2 plan's Q2 exit asks for, Codex's offline stand-in drives
+   the managed tools through a real ``wse serve`` MCP session and the
+   strategy chooses every call in place of a model (the test double of
+   ``codex_cli@1``: no model, no network, no credentials); without it the
+   runner dispatches the strategy's actions to the run-bound engine. The
+   operations are the same;
 3. writes ``OUT/runs/<run_id>.json`` (and a copy as ``OUT/summary.json``):
    the setup, the strategy (its path, ``dispatch`` or ``mcp``, its
    parameters, and its resolved configuration), the strategy's final
@@ -45,7 +46,7 @@ the record's other keys stay.
 Default: 32 problems at 8,192 tokens, three passes, about 2 hours on the
 operator's MPS. Keep the Mac awake (``caffeinate -is``)::
 
-    caffeinate -is uv run --extra models-hf --extra agents-openai python examples/qwen_loops/run_discovery.py OUT \\
+    caffeinate -is uv run --extra models-hf python examples/qwen_loops/run_discovery.py OUT \\
         --workspace ~/Desktop/wse-models/workspaces/q2 \\
         --snapshot ~/Desktop/wse-models/Qwen3.5-0.8B --repo Qwen/Qwen3.5-0.8B \\
         --revision 2fc06364715b967f1860aea9cf38778875588b17 --via-mcp
@@ -59,7 +60,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from pathlib import Path
@@ -116,7 +116,6 @@ def main(argv: list[str] | None = None) -> int:
                         help="only update the summary of this experiment in its run's record; run nothing")
     args = parser.parse_args(argv)
     loop_setup.check_setup_arguments(parser, args)
-    os.environ.setdefault("OPENAI_AGENTS_DISABLE_TRACING", "1")
 
     from wse.api import Engine
     from wse.registry import builtin_registry
@@ -169,7 +168,8 @@ def main(argv: list[str] | None = None) -> int:
         return status or 1
     summary = _summarize(out, workspace, runner.last_experiment_id, record)
     result = (summary["experiment"]["controller"] or {}).get("result") or {}
-    # Through MCP the strategy's own reason is its final message; the SDK reports that the agent stopped.
+    # Through MCP the strategy's own reason is its final message (WSE-STOP: <reason>), which the result's
+    # reason quotes after "the agent stopped".
     print(json.dumps({"experiment_id": runner.last_experiment_id, "state": summary["experiment"]["state"],
                       "status": result.get("status"), "reason": result.get("reason"),
                       "final_message": summary["final_message"],

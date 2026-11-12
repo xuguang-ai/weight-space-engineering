@@ -4,7 +4,7 @@
 on a prepared workspace: it issues a run grant (``Engine.grant_run``), runs
 one controller on the grant's experiment through ``ReferenceRunner`` (an LLM
 agent through the ``codex_cli@1`` adapter and the MCP server, a registered
-stepwise strategy, or any controller mapping the runner accepts), and, when
+stepwise strategy, or any controller configuration the runner accepts), and, when
 asked, runs the hidden final evaluation of the frozen experiment. It then
 summarizes the experiment (``wse.runner.summarize_trial``), exports a closed
 experiment, and replays the export in a fresh workspace to check
@@ -39,12 +39,15 @@ from pathlib import Path
 from typing import Any
 
 from wse.api import Engine
-from wse.runner import ReferenceRunner, parse_controller_config, summarize_trial
+from wse.agent_adapters.base import AgentConfig
+from wse.runner import ReferenceRunner, StrategyConfig, parse_controller_config, summarize_trial
 from wse.schemas import ErrorCode, WSEError
 
 __all__ = ["AgentRun", "run_agent_experiment"]
 
 OUT_DIR_NAME = "agent_runs"
+# A complete controller configuration: a mapping, or the object ``wse.experiment.parse_agent`` returns.
+ControllerConfig = StrategyConfig | AgentConfig | Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -77,20 +80,20 @@ class AgentRun:
         return self.summary["final"]
 
 
-def _controller_config(model: str | None, strategy: str | None, controller: Mapping[str, Any] | None,
-                       max_turns: int | None, wall_clock_seconds: float | None) -> tuple[Mapping[str, Any], str]:
-    """The controller mapping for the runner, validated by ``parse_controller_config``, and its kind."""
+def _controller_config(model: str | None, strategy: str | None, controller: ControllerConfig | None,
+                       max_turns: int | None, wall_clock_seconds: float | None) -> tuple[ControllerConfig, str]:
+    """The controller configuration for the runner, validated by ``parse_controller_config``, and its kind."""
     if sum(option is not None for option in (model, strategy, controller)) != 1:
         raise WSEError(ErrorCode.INVALID_ARGUMENT, "give exactly one of model (an LLM agent through "
                        "codex_cli@1), strategy (a registered stepwise strategy), or controller (a complete "
-                       "controller mapping)")
+                       "controller configuration)")
     limits = {name: value for name, value in (("max_turns", max_turns), ("wall_clock_seconds", wall_clock_seconds))
               if value is not None}
     if controller is not None:
         if limits:
             raise WSEError(ErrorCode.INVALID_ARGUMENT, "with controller, give max_turns and wall_clock_seconds "
-                           "inside the controller mapping")
-        config: Mapping[str, Any] = controller
+                           "inside the controller configuration")
+        config: ControllerConfig = controller
     elif model is not None:
         config = {"kind": "agent", "model": model, **limits}
     else:
@@ -104,7 +107,7 @@ def _require_empty(path: Path, what: str) -> None:
 
 
 def run_agent_experiment(workspace: str | Path, *, task: str, base: str, policy: str, model: str | None = None,
-                         strategy: str | None = None, controller: Mapping[str, Any] | None = None,
+                         strategy: str | None = None, controller: ControllerConfig | None = None,
                          max_turns: int | None = None, wall_clock_seconds: float | None = None,
                          out_dir: str | Path | None = None, final_evaluation: bool = False,
                          verify_replay: bool = True) -> AgentRun:

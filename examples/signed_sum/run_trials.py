@@ -2,8 +2,8 @@
 
 Each invocation prepares the workspace under ``OUT/workspace`` on first use
 (``build_fixture.setup_workspace``), issues one run grant per trial, and runs
-each trial through the reference runner with a fresh controller (a new MCP
-server and SDK conversation for an agent). Only after every trial of the
+each trial through the reference runner with a fresh controller (a new Codex
+session and MCP server for an agent). Only after every trial of the
 invocation has frozen does it run the final evaluations, so no trial can
 adapt to final feedback. It then exports every experiment (final-set data
 excluded), replays each export in a clean workspace to confirm
@@ -22,15 +22,22 @@ Offline (no model, no network):
     uv run python examples/signed_sum/run_trials.py OUT --label scripted
     uv run python examples/signed_sum/run_trials.py OUT --label control \\
         --policy small_model_weights_only_v1
-    uv run --extra agents-openai python examples/signed_sum/run_trials.py OUT --label sdk-double \\
-        --controller openai-agents --model wse-test-double:scripted_search@1
+    uv run python examples/signed_sum/run_trials.py OUT --label codex-double \\
+        --controller codex --model wse-test-double:scripted_search@1
 
-Live agent trials (the operator chooses the model; uv loads the key and
-endpoint from ``.env``, a copy of ``.env.example``, and nothing here reads,
-prints, or stores them):
+The last runs the scripted search through the agent's path: Codex's offline
+stand-in connects to each run's MCP server, and the strategy chooses every
+tool call (a toolchain check, not an agent).
 
-    uv run --extra agents-openai --env-file .env python examples/signed_sum/run_trials.py OUT --label live \\
-        --controller openai-agents --model MODEL_NAME --trials 5
+Live agent trials run in the Codex CLI (its path in ``WSE_CODEX_PATH``,
+else ``codex`` on PATH, else OpenAI's VS Code extension's). The operator
+chooses the model; uv loads the key and endpoint from ``.env``, a copy of
+``.env.example``. Only the per-run local model proxy (``wse.model_proxy``)
+takes them from this process's environment; nothing prints or stores them,
+and neither Codex nor the agent's commands receive them:
+
+    uv run --env-file .env python examples/signed_sum/run_trials.py OUT --label live \\
+        --controller codex --model YOUR_AGENT_MODEL --trials 5
 """
 
 from __future__ import annotations
@@ -38,7 +45,6 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -80,16 +86,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("out", type=Path)
     parser.add_argument("--label", required=True, help="report name for this invocation's trials")
-    parser.add_argument("--controller", choices=("scripted", "openai-agents"), default="scripted")
-    parser.add_argument("--model", default=None, help="openai-agents: the model name (or wse-test-double:STRATEGY)")
+    parser.add_argument("--controller", choices=("scripted", "codex"), default="scripted",
+                        help="scripted: scripted_search@1; codex: an agent in the Codex CLI")
+    parser.add_argument("--model", default=None,
+                        help="codex: the model name (or wse-test-double:STRATEGY@VERSION, Codex's offline stand-in)")
     parser.add_argument("--policy", default="small_model_v1")
     parser.add_argument("--trials", type=int, default=1)
-    parser.add_argument("--max-turns", type=int, default=100)
+    parser.add_argument("--max-turns", type=int, default=100, help="codex: the limit on the agent's model requests")
     parser.add_argument("--wall-clock-seconds", type=float, default=900.0)
     args = parser.parse_args(argv)
-    if args.controller == "openai-agents" and not args.model:
-        parser.error("--model is required for --controller openai-agents")
-    os.environ.setdefault("OPENAI_AGENTS_DISABLE_TRACING", "1")
+    if args.controller == "codex" and not args.model:
+        parser.error("--model is required for --controller codex")
 
     from wse.api import Engine
     from wse.runner import ReferenceRunner, render_trials_markdown, summarize_trial
@@ -109,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.controller == "scripted":
         config = {"kind": "strategy", "wall_clock_seconds": args.wall_clock_seconds}
     else:
-        config = {"kind": "agent", "model": args.model, "max_turns": args.max_turns,
+        config = {"kind": "agent", "adapter": "codex_cli@1", "model": args.model, "max_turns": args.max_turns,
                   "wall_clock_seconds": args.wall_clock_seconds}
     trials: list[dict] = []
     interrupted = False

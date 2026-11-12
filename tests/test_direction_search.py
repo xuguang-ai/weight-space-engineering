@@ -878,6 +878,45 @@ def test_direction_search_runs_end_to_end_through_the_reference_runner(lm, monke
     assert all(call.get("details", {}).get("rationale") for call in calls)
 
 
+def test_direction_search_runs_through_mcp_with_the_scripts_bound_strategy(lm, monkeypatch):  # noqa: F811
+    """``--via-mcp``: Codex's stand-in plays the bound subclass the script registered in the runner's process only."""
+    from wse.policy import QWEN_LOOP_POLICY_ID
+    from wse.registry import builtin_registry
+    from wse.runner import ReferenceRunner
+    from wse.schemas import TaskDefinition
+
+    loop_setup = _script("loop_setup")
+    monkeypatch.setenv("PYTHONPATH", str(TESTS_DIR))
+    with Engine(lm.workspace) as engine:
+        engine.register_task(TaskDefinition.model_validate({
+            "task_id": TASK, "title": "Finish answers", "description": "Make the model finish its answers.",
+            "objective": {"task_id": TASK, "description": "Fewer outputs at the token limit, no lower accuracy.",
+                          "gates": [{"metric": "accuracy", "max_drop": 0.0}, {"metric": "accuracy", "min_value": 0.0}]},
+            "development_suite_id": "practice", "development_examples": 4}))
+        grant = engine.grant_run(TASK, QWEN_LOOP_POLICY_ID, lm.base)
+    registry = builtin_registry()
+    config = loop_setup.controller(registry, DirectionSearchStrategy, {"columns": 4}, via_mcp=True, max_steps=400,
+                                   wall_clock_seconds=600)
+    runner = ReferenceRunner(lm.workspace, registry=registry, setup=["test_direction_search:scripted_generation"],
+                             worker_args=["--poll-seconds", "0.02", "--device", "cpu"],
+                             serve_env={"PYTHONPATH": str(TESTS_DIR)}, settle_timeout_seconds=60)
+    eid = runner.run_experiment(grant.run_id, TASK, QWEN_LOOP_POLICY_ID, config)
+    record = runner.last_result
+    result = record["result"]
+    assert result["status"] == "completed", result
+    assert record["config"]["test_double"]["strategy"] == "direction_search_mcp@1"
+    assert record["config"]["test_double"]["resolved_config"]["columns"] == 4  # the script's parameters applied
+    assert re.fullmatch(r"WSE-STOP: selected alpha 6 at layer [01] \(limit-hit/accuracy: base 0\.5/0\.5, "
+                        r"a1 0\.75/0\.25, a6 0/1\)", result["final_message"]), result["final_message"]
+    with Engine(lm.workspace) as engine:
+        experiment = engine.get_experiment(eid)
+        assert experiment.state == "FROZEN"
+        selected = next(c for c in engine.list_experiment_checkpoints(eid)
+                        if c.checkpoint_id == experiment.selected_checkpoint_id)
+        operation = engine.find_patch(selected.patch_id).spec.operations[0]
+        assert operation.parameters["alpha"] == 6.0 and len(operation.parameters["columns"]) == 4
+
+
 # ---------------------------------------------------------------------------
 # The Q2 scripts' helpers (examples/qwen_loops)
 # ---------------------------------------------------------------------------

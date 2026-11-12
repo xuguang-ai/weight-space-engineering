@@ -9,16 +9,22 @@ The six steps:
 5. Start the agent: the runner grants a run on the registered IDs and connects the agent through MCP.
 6. Read the result: how the run ended, the edit, the final test, and the patch.
 
-With a live agent, the key and endpoint in ``.env`` (copied from ``.env.example``)::
+A live agent runs in the Codex CLI (its path in ``WSE_CODEX_PATH``, else ``codex`` on PATH, else OpenAI's VS Code
+extension's) with your model provider's key and endpoint in ``.env``, copied from ``.env.example``. With your
+model's name, or your Azure deployment's name, in place of ``YOUR_AGENT_MODEL``::
 
-    uv run --extra agents-openai --env-file .env \\
+    uv run --env-file .env \\
       python examples/signed_sum/agent_api.py \\
       demo/live \\
-      --model YOUR_AGENT_MODEL
+      --agent codex:YOUR_AGENT_MODEL
 
-Offline, with the scripted controller ``scripted_search@1`` in place of a model::
+Offline, with the scripted controller ``scripted_search@1`` in place of an agent::
 
     uv run python examples/signed_sum/agent_api.py demo/offline
+
+``--agent test-double:scripted_search@1`` runs the same search offline through the agent's path instead: Codex's
+stand-in connects to the run's MCP server, and the strategy chooses every tool call. It checks the toolchain; it is
+not an agent.
 
 Each run needs a new directory, because the final test is drawn at random when the workspace is set up.
 ``build_fixture.py`` prepares the same model, task, and data, with the same policy under its built-in ID
@@ -35,10 +41,13 @@ import torch
 
 from wse.agent_runs import run_agent_experiment
 from wse.api import Engine
+from wse.experiment import parse_agent
 
 parser = argparse.ArgumentParser(description="One agent experiment on a faulty 22-parameter classifier.")
 parser.add_argument("out", type=Path, help="a new directory for the workspace and the run's records")
-parser.add_argument("--model", help="the agent's model; without it, the scripted controller scripted_search@1")
+parser.add_argument("--agent", default="strategy:scripted_search@1",
+                    help="codex:YOUR_AGENT_MODEL, your model or deployment name after codex:; "
+                         "default strategy:scripted_search@1, the scripted controller")
 args = parser.parse_args()
 if args.out.exists():
     parser.error(f"{args.out} exists; each run needs a new directory")
@@ -150,15 +159,13 @@ engine.close()  # the setup is registered; the runner opens the workspace itself
 
 # 5. Start the agent: the runner grants a run on these IDs, connects the agent to WSE through MCP,
 #    and freezes the checkpoint it selects; then come the final test, an export, and its replay.
-print(f"{args.model or 'scripted_search@1'} on model {base.checkpoint_id}, task {task.task_id}, "
-      f"policy {policy.policy_id}")
+print(f"{args.agent} on model {base.checkpoint_id}, task {task.task_id}, policy {policy.policy_id}")
 run = run_agent_experiment(
     workspace,
     task=task.task_id,
     base=base.checkpoint_id,
     policy=policy.policy_id,
-    model=args.model,
-    strategy=None if args.model else "scripted_search@1",
+    controller=parse_agent(args.agent),
     final_evaluation=True,
 )
 

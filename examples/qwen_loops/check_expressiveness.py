@@ -14,10 +14,10 @@ A scripted client (the registered strategy ``expressiveness_check@1``
 defined here) drives the managed tools through the reference runner, which
 starts one worker on ``--device`` and settles and freezes the experiment
 however the run ends. With ``--via-mcp``, which the M2 plan's Q2 exit asks
-for, the OpenAI Agents SDK drives them through a real ``wse serve`` MCP
-session and the client chooses every call in place of a model (the
-runner's test double: no network, no credentials); without it the runner
-dispatches the client's actions to the run-bound engine:
+for, Codex's offline stand-in drives them through a real ``wse serve`` MCP
+session and the client chooses every call in place of a model (the test
+double of ``codex_cli@1``: no model, no network, no credentials); without
+it the runner dispatches the client's actions to the run-bound engine:
 
 1. a generation pass of the base on the practice suite (``wse_submit_evaluation``
    and ``wse_get_job``);
@@ -46,7 +46,7 @@ the script can be restarted; each invocation grants a new run.
 existing experiment in its run's record without running anything (for
 example after the process was killed); the record's other keys stay.
 
-    uv run --extra models-hf --extra agents-openai python examples/qwen_loops/check_expressiveness.py OUT \\
+    uv run --extra models-hf python examples/qwen_loops/check_expressiveness.py OUT \\
         --workspace ~/Desktop/wse-models/workspaces/q2 --recompute --via-mcp
 
 A short smoke run: ``--problems 4 --max-new-tokens 256``.
@@ -58,7 +58,6 @@ import argparse
 import hashlib
 import json
 import math
-import os
 import sys
 import time
 from collections.abc import Generator, Mapping, Sequence
@@ -295,7 +294,6 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("give --directions NPZ, --recompute, or both")
     if not math.isfinite(args.alpha):
         parser.error("--alpha must be finite")
-    os.environ.setdefault("OPENAI_AGENTS_DISABLE_TRACING", "1")
 
     from wse.api import Engine
     from wse.operators.tensor import shortest_floats
@@ -377,7 +375,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         loop_setup.write_json(out / f"expressiveness-{grant.run_id}.json", record)
         loop_setup.write_json(out / "expressiveness.json", record)
-    # Through MCP the client's own reason is its final message; the SDK reports that the agent stopped.
+    # Through MCP the client's own reason is its final message (WSE-STOP: <reason>), which the result's
+    # reason quotes after "the agent stopped".
     print(json.dumps({"run_id": grant.run_id, "experiment_id": runner.last_experiment_id,
                       "final_message": record.get("final_message"),
                       "verdict": {key: value for key, value in (record.get("verdict") or {}).items()

@@ -2,8 +2,9 @@
 
 This is an API design sketch, not executable software. Every import from `wse`
 and every WSE method below is proposed. No WSE package is implemented here.
-OpenAIAgentsAdapter is our planned wrapper around the real OpenAI Agents SDK
-for Python; it would connect to the managed WSE runtime through local MCP.
+The agent is named as WSE's Experiment API names one, ``codex:MODEL``: the
+Codex CLI runs the model and connects to the managed WSE runtime through
+local MCP.
 
 This illustrates a later pretrained-model workflow, beyond the small-MLP MVP.
 It requires the following operator-prepared components, none provided here:
@@ -28,15 +29,15 @@ under the same protocol. A failed final result does not reopen the experiment.
 Thresholds and budgets below are illustrative choices, not measured results.
 Rates are fractions: 0.20 is 20 percentage points, and 0.01 is 1 percentage point.
 WSE_AGENT_MODEL selects the editing agent; it is separate from the code model
-whose weights are edited. Credentials are supplied through the adapter's normal
-environment configuration and are never written into an experiment bundle.
+whose weights are edited. Credentials stay in the operator's environment, reach
+the model provider only through WSE's local model proxy, and are never written
+into an experiment bundle.
 """
 
 import asyncio
 import os
 
 from wse import Budget, Experiment, MetricGate, ObjectiveSpec, load_model
-from wse.agent_adapters.openai_agents import OpenAIAgentsAdapter
 
 
 async def main():
@@ -60,8 +61,8 @@ async def main():
         ],
     )
 
-    # 3. Select the editing agent, not the target model.
-    agent = OpenAIAgentsAdapter(model=os.environ["WSE_AGENT_MODEL"])
+    # 3. Select the editing agent, not the target model: a model in the Codex CLI.
+    agent = "codex:" + os.environ["WSE_AGENT_MODEL"]
 
     # 4. Give it only registered capabilities and a fixed development budget.
     async with Experiment(
@@ -82,7 +83,7 @@ async def main():
         )
         print("Development baseline:", baseline.metrics)
 
-        # 5. The SDK runs the tool loop; WSE executes and records the operations.
+        # 5. Codex runs the tool loop; WSE executes and records the operations.
         # A valid outcome is that no useful edit is discovered.
         await experiment.run(agent=agent)
 

@@ -73,8 +73,8 @@ def add_setup_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--profile", default=PROFILE, help=f"the generation profile (default {PROFILE})")
     parser.add_argument("--device", choices=("mps", "cpu"), default="mps", help="the worker's engine device")
     parser.add_argument("--via-mcp", action="store_true",
-                        help="drive the tools through a real wse serve MCP session (the SDK test double), not the "
-                             "runner's dispatch")
+                        help="drive the tools through a real wse serve MCP session (Codex's offline stand-in), "
+                             "not the runner's dispatch")
 
 
 def check_setup_arguments(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
@@ -301,12 +301,14 @@ def controller(registry: Any, strategy_class: type, parameters: dict[str, Any], 
                wall_clock_seconds: float) -> Any:
     """The controller configuration: the strategy through the runner's dispatch, or through MCP.
 
-    With ``via_mcp``, the OpenAI Agents SDK runs its tool loop against a
-    real ``wse serve`` process (stdio MCP), and the strategy chooses every
-    tool call in place of a model (the runner's test double: no network and
-    no credentials). The test double creates its strategy without
-    arguments, so a subclass bound to ``parameters`` is registered under
-    ``<strategy_id>_mcp``. Either way the managed operations, budgets, and
+    With ``via_mcp``, Codex's offline stand-in (the test double of
+    ``codex_cli@1``: no model, no network, and no credentials) runs the
+    tool loop against a real ``wse serve`` process (stdio MCP), and the
+    strategy chooses every tool call in place of a model. The runner
+    creates the strategy without arguments, from ``registry``, and the
+    stand-in asks that object for every call, so a subclass bound to
+    ``parameters`` is registered under ``<strategy_id>_mcp``; pass the same
+    registry to the runner. Either way the managed operations, budgets, and
     audit records are the same.
     """
     from wse.agent_adapters.base import AgentConfig
