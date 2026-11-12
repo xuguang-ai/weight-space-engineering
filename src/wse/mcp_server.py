@@ -22,14 +22,16 @@ decisions, and usage accounting.
   evaluation instead of polling; a wait whose request is cancelled (the
   client's timeout) or whose server stops ends at once and leaves the job to
   the worker. Names use only letters, digits, and ``_`` (at most 64
-  characters), because OpenAI Agents SDK forwards MCP tool names verbatim as
-  model function names. Every mutation takes an ``idempotency_key``. Every
+  characters), because agent hosts forward MCP tool names verbatim as model
+  function names (Codex as functions of the namespace ``mcp__wse``). Every
+  mutation takes an ``idempotency_key``. Every
   tool that names the experiment lets the agent omit ``experiment_id``: a
   run-bound server has one experiment (``Engine.resolve_experiment_id``).
 * **Results.** A successful call returns ``structuredContent`` validated
   against the tool's ``outputSchema`` and a text content block that is the
-  canonical compact JSON of exactly the same object, because OpenAI Agents
-  SDK shows the model the text, not ``structuredContent``. Every result has
+  canonical compact JSON of exactly the same object, because hosts differ in
+  which of the two they show the model (Codex 0.167 shows
+  ``structuredContent`` when it is present). Every result has
   a one-line ``summary``, the artifact ``uris`` it refers to, the per-call
   usage where the domain object records one, and the experiment's
   cumulative budget (``ToolUsage``: only the counters the call charges, for

@@ -1,1 +1,1 @@
-"""Vendor-neutral agent adapters. SDK imports live only inside the adapter modules, lazily."""
+"""Agent adapters: the vendor-neutral contract (``base``) and the Codex CLI adapter (``codex_cli``)."""

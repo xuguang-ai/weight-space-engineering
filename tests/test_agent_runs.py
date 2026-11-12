@@ -1,14 +1,13 @@
 """One agent experiment in one call: ``wse.agent_runs.run_agent_experiment`` on the signed-sum fixture.
 
-Every run is offline: the scripted strategy, or the ``openai_agents@1``
-adapter driven by the SDK test double (``wse-test-double:STRATEGY``) through
-a real ``wse serve`` process. No live model is started.
+Every run is offline: the scripted strategy, or the ``codex_cli@1`` adapter
+running its offline Codex stand-in (``wse-test-double:STRATEGY``) through a
+real ``wse serve`` process. No live model is started.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import os
 
 import pytest
 from test_mcp_e2e import FINAL_SEED
@@ -132,13 +131,11 @@ def test_a_runner_error_propagates_unchanged(workspace, prepared, monkeypatch):
     assert caught.value.code == ErrorCode.WORKER_FAILED
 
 
-def test_an_agent_run_through_the_sdk_test_double_closes_and_replays(workspace, prepared, tmp_path, monkeypatch):
-    pytest.importorskip("agents", reason="the optional agents-openai extra is not installed")
-    monkeypatch.delenv("OPENAI_AGENTS_DISABLE_TRACING", raising=False)
+def test_an_agent_run_through_the_codex_stand_in_closes_and_replays(workspace, prepared, tmp_path, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     model = f"{TEST_DOUBLE_PREFIX}{SCRIPTED}"
     run = _run(workspace, prepared, model=model, max_turns=60, out_dir=tmp_path / "out", final_evaluation=True)
-    assert os.environ["OPENAI_AGENTS_DISABLE_TRACING"] == "1"
-    assert run.summary["controller"] == "openai_agents@1" and run.summary["model"] == model
+    assert run.summary["controller"] == "codex_cli@1" and run.summary["model"] == model
     assert run.state == "CLOSED" and run.success is True and run.replay_identical is True
     assert (tmp_path / "out" / "logs" / f"serve-{run.run_id}.log").is_file()
+    assert (tmp_path / "out" / "logs" / f"codex-{run.run_id}" / "segment-1.jsonl").is_file()

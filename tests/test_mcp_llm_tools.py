@@ -1065,17 +1065,14 @@ def test_agent_visible_examples_single_out_no_site_of_a_known_method(lm):
         assert "mlp.down" not in text and "down_proj" not in text, text[:200]
 
 
-def test_an_sdk_agent_under_qwen_loop_v1_sees_every_permitted_tool_and_may_omit_the_experiment_id(lm, monkeypatch):
-    """Through the OpenAI Agents SDK's real Runner and wse serve; only the model is a test double."""
-    pytest.importorskip("agents", reason="the optional agents-openai extra is not installed")
-    from test_agent_adapter import TESTS_DIR, ToolModel
-    from wse.agent_adapters.openai_agents import OpenAIAgentsAdapter
-    from wse.runner import ReferenceRunner, allowed_tools
+def test_an_agent_under_qwen_loop_v1_sees_every_permitted_tool_and_may_omit_the_experiment_id(lm, monkeypatch):
+    """Through the Codex adapter and wse serve; Codex is the offline stand-in playing a script."""
+    from test_agent_adapter import TESTS_DIR, scripted, segment_items, shown_to_model
 
-    monkeypatch.setenv("OPENAI_AGENTS_DISABLE_TRACING", "1")
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    from wse.runner import ReferenceRunner, allowed_tools
     from wse.schemas import TaskDefinition
 
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     with Engine(lm.workspace) as engine:
         engine.register_task(TaskDefinition.model_validate({
             "task_id": "loops_v1", "title": "Finish answers", "description": "Make the model finish its answers.",
@@ -1084,11 +1081,9 @@ def test_an_sdk_agent_under_qwen_loop_v1_sees_every_permitted_tool_and_may_omit_
             "development_suite_id": "practice", "development_examples": 4}))
         grant = engine.grant_run("loops_v1", QWEN_LOOP_POLICY_ID, lm.base)
         policy = engine.get_policy(QWEN_LOOP_POLICY_ID)
-    made: dict[str, Any] = {}
 
     def factory(config, eid):
-        made["model"] = ToolModel([("call", "wse_get_experiment", {}), ("say", "done")])
-        return OpenAIAgentsAdapter(model=made["model"])
+        return scripted([("call", "wse_get_experiment", {}), ("say", "done")])
 
     runner = ReferenceRunner(lm.workspace, worker_args=["--poll-seconds", "0.02", "--device", "cpu"],
                              serve_env={"PYTHONPATH": str(TESTS_DIR)}, adapter_factory=factory,
@@ -1096,7 +1091,10 @@ def test_an_sdk_agent_under_qwen_loop_v1_sees_every_permitted_tool_and_may_omit_
     eid = runner.run_experiment(grant.run_id, "loops_v1", QWEN_LOOP_POLICY_ID, {"kind": "agent", "model": "test-double"})
     result = runner.last_result["result"]
     assert result["status"] == "completed", result
-    seen = result["provider_metadata"]["tools_seen"]
+    seen = sorted(result["provider_metadata"]["allowed_tools"])
     assert seen == sorted(allowed_tools(policy)) and {"wse_probe", "wse_get_report"} <= set(seen)
-    assert sorted(tool["name"] for tool in made["model"].requests[0]["tools"]) == seen
-    assert made["model"].outputs[1]["result"]["experiment"]["experiment_id"] == eid  # the ID was omitted
+    (shown,) = shown_to_model(lm.workspace, grant.run_id)
+    assert sorted(tool["name"] for tool in shown["tools"]) == seen
+    (call,) = segment_items(result, "mcp_tool_call")
+    output = json.loads(call["result"]["content"][0]["text"])
+    assert call["arguments"] == {} and output["result"]["experiment"]["experiment_id"] == eid  # the ID was omitted

@@ -1,7 +1,7 @@
 """Offline end-to-end check of code execution through MCP (M3 Task 8, the exit of stage S1).
 
-``sandbox_search@1`` drives the ``openai_agents@1`` adapter through the SDK
-test double and a real ``wse serve`` process, under a policy that grants the
+``sandbox_search@1`` drives the ``codex_cli@1`` adapter through its offline
+Codex stand-in and a real ``wse serve`` process, under a policy that grants the
 sandbox. Its code runs in the sandbox and reads the base weights from the
 sandbox's inputs; it finds the pair of identical rows of ``layers.1.weight``
 and computes the values for the second row; the strategy previews,
@@ -30,7 +30,6 @@ pytestmark = pytest.mark.skipif(not AVAILABLE, reason=REASON)
 
 def test_a_scripted_sandbox_strategy_repairs_signed_sum_through_mcp(engine, workspace, signed_sum, tmp_path,
                                                                     monkeypatch) -> None:
-    pytest.importorskip("agents", reason="the optional agents-openai extra is not installed")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     ids = signed_sum.setup_workspace(engine, tmp_path / "bundles", final_seed=FINAL_SEED)
     engine.register_policy(_small_sandbox_policy())
@@ -41,7 +40,7 @@ def test_a_scripted_sandbox_strategy_repairs_signed_sum_through_mcp(engine, work
     assert run.state == "CLOSED" and run.success is True and run.replay_identical is True
     assert run.final["candidate_accuracy"] == 1.0
     summary = run.summary
-    assert (summary["controller"], summary["model"]) == ("openai_agents@1", model)
+    assert (summary["controller"], summary["model"]) == ("codex_cli@1", model)
     assert summary["constraint_status"] == "unverified"
     assert summary["constraint_reason"] == SANDBOX_CONSTRAINT_REASON
     assert summary["sandbox"]["calls"] == 1 and summary["sandbox"]["label"] == SANDBOX_TIME_LABEL

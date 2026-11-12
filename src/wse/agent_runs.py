@@ -3,7 +3,7 @@
 ``run_agent_experiment`` performs the operator sequence of a single trial
 on a prepared workspace: it issues a run grant (``Engine.grant_run``), runs
 one controller on the grant's experiment through ``ReferenceRunner`` (an LLM
-through the ``openai_agents@1`` adapter and the MCP server, a registered
+agent through the ``codex_cli@1`` adapter and the MCP server, a registered
 stepwise strategy, or any controller mapping the runner accepts), and, when
 asked, runs the hidden final evaluation of the frozen experiment. It then
 summarizes the experiment (``wse.runner.summarize_trial``), exports a closed
@@ -18,11 +18,11 @@ Everything else stays with the lower-level API (``wse.api.Engine``): task,
 dataset, and suite registration, base-checkpoint import, policy
 registration, the audit log, patches, and exports of other experiments.
 
-A live ``model`` uses the SDK's credentials from the process environment;
-this module takes no key and reads no ``.env``. As with
-``examples/signed_sum/run_trials.py``, an agent run sets
-``OPENAI_AGENTS_DISABLE_TRACING=1`` in the process environment unless the
-variable is already set, so the SDK exports no traces of the run.
+A live ``model`` runs in the Codex CLI with model access through a
+per-run local proxy (``wse.model_proxy``) that holds the operator's
+``OPENAI_BASE_URL`` and ``OPENAI_API_KEY`` from this process's environment;
+this module takes no key and reads no ``.env``, and neither Codex nor the
+agent's commands ever receive the key.
 
 The wrapper has been used on M1's small-model tasks only. Managed
 experiments on open-weight language models run through the same runner and
@@ -33,7 +33,6 @@ of open-weight models replay exactly.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,8 +81,8 @@ def _controller_config(model: str | None, strategy: str | None, controller: Mapp
                        max_turns: int | None, wall_clock_seconds: float | None) -> tuple[Mapping[str, Any], str]:
     """The controller mapping for the runner, validated by ``parse_controller_config``, and its kind."""
     if sum(option is not None for option in (model, strategy, controller)) != 1:
-        raise WSEError(ErrorCode.INVALID_ARGUMENT, "give exactly one of model (an LLM controller through "
-                       "openai_agents@1), strategy (a registered stepwise strategy), or controller (a complete "
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, "give exactly one of model (an LLM agent through "
+                       "codex_cli@1), strategy (a registered stepwise strategy), or controller (a complete "
                        "controller mapping)")
     limits = {name: value for name, value in (("max_turns", max_turns), ("wall_clock_seconds", wall_clock_seconds))
               if value is not None}
@@ -126,14 +125,12 @@ def run_agent_experiment(workspace: str | Path, *, task: str, base: str, policy:
     that no trial can adapt to an earlier trial's final result (M1 plan
     Section 7.3): run the trials, then ``Engine.final_evaluate`` each one.
     """
-    config, kind = _controller_config(model, strategy, controller, max_turns, wall_clock_seconds)
+    config, _ = _controller_config(model, strategy, controller, max_turns, wall_clock_seconds)
     workspace = Path(workspace).resolve()
     out = None if out_dir is None else Path(out_dir).resolve()
     if out is not None and verify_replay:
         _require_empty(out / "export", "export")
         _require_empty(out / "replay", "replay")
-    if kind == "agent":
-        os.environ.setdefault("OPENAI_AGENTS_DISABLE_TRACING", "1")
     with Engine(workspace) as engine:
         run_id = engine.grant_run(task, policy, base).run_id
     if out is None:

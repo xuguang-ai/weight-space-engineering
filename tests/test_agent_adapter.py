@@ -1,54 +1,41 @@
-"""The OpenAI Agents SDK adapter, driven by SDK test doubles (Task 7).
+"""The agent-adapter contract through the reference runner, with the Codex adapter and its offline stand-in.
 
-Every test runs the SDK's real ``Runner`` and ``Agent`` with a real
-``MCPServerStdio`` connection to a real ``wse serve`` subprocess bound to a
-run grant; only the model is replaced, by an implementation of
-``agents.models.interface.Model`` that returns scripted tool calls. Nothing
-reaches the network: outbound IP connections are blocked in this process,
-no API key is set, and SDK tracing is disabled (stdio MCP uses pipes).
+Every test runs a real ``wse serve`` subprocess bound to a run grant, as
+Codex's MCP server, through ``CodexCLIAdapter`` and its process handling;
+only Codex itself is replaced by ``wse.agent_adapters.codex_test_double``,
+which plays a registered strategy or a fixed script of tool calls,
+messages, and sleeps (``scripted``). Nothing reaches a model or the network:
+outbound IP connections are blocked in this process and no API key is set.
 Each test stops its server and worker processes when the run ends,
 including on failure.
 """
 
 from __future__ import annotations
 
-import _socket
 import asyncio
 import json
-import os
 import signal
 import socket
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 import pytest
+from test_mcp_e2e import FAULT_DESCRIPTIONS, FINAL_SEED, _final_secrets, _is_oracle, _walk
 
-agents = pytest.importorskip("agents", reason="the optional agents-openai extra is not installed")
-
-from agents.items import ModelResponse  # noqa: E402
-from agents.models.interface import Model  # noqa: E402
-from agents.usage import Usage  # noqa: E402
-from openai.types.responses import (  # noqa: E402
-    ResponseFunctionToolCall,
-    ResponseOutputMessage,
-    ResponseOutputText,
-)
-from test_mcp_e2e import FAULT_DESCRIPTIONS, FINAL_SEED, _final_secrets, _is_oracle, _walk  # noqa: E402
-
-from wse.agent_adapters.base import AgentConfig  # noqa: E402
-from wse.agent_adapters.openai_agents import OpenAIAgentsAdapter, parse_tool_output, strategy_model  # noqa: E402
-from wse.api import Engine  # noqa: E402
-from wse.policy import SMALL_MODEL_POLICY_ID, WEIGHTS_ONLY_POLICY_ID, ExperimentPolicy  # noqa: E402
-from wse.runner import ReferenceRunner, allowed_tools, render_instructions  # noqa: E402
-from wse.strategies.scripted import ScriptedSearchStrategy  # noqa: E402
+from wse.agent_adapters.base import AgentConfig
+from wse.agent_adapters.codex_cli import TEST_DOUBLE_MODULE, CodexCLIAdapter
+from wse.api import Engine
+from wse.policy import SMALL_MODEL_POLICY_ID, WEIGHTS_ONLY_POLICY_ID, ExperimentPolicy
+from wse.runner import ReferenceRunner, allowed_tools
+from wse.strategies.scripted import ScriptedSearchStrategy
 
 TESTS_DIR = Path(__file__).resolve().parent
 FAST_WORKER = ["--poll-seconds", "0.02"]
 W1_ROW = [{"start": 0, "stop": 1, "step": 1}, {"start": 0, "stop": 2, "step": 1}]
+DOUBLE = "wse-test-double:scripted_search@1"
 
 
 @pytest.fixture(autouse=True)
@@ -69,61 +56,41 @@ def offline(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", guard(original_connect))
     monkeypatch.setattr(socket.socket, "connect_ex", guard(original_connect_ex))
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setenv("OPENAI_AGENTS_DISABLE_TRACING", "1")
     yield attempts
     assert attempts == [], f"network access was attempted: {attempts}"
 
 
-class ToolModel(Model):
-    """A fake SDK model that plays a script of tool calls, messages, and sleeps.
+def scripted(script: list[tuple], *, latency: float = 0.0, **options: Any) -> CodexCLIAdapter:
+    """The Codex adapter with its stand-in playing ``script`` (steps as in ``CodexCLIAdapter.scripted``).
 
-    Each step is ``("call", tool, arguments)`` (``arguments`` may be a
-    function of the previous tool output), ``("say", text)``,
-    ``("sleep", seconds)``, or ``("interrupt", seconds)`` (SIGINT to this
-    process, as from the operator's Ctrl-C, then a sleep). After the script,
-    it keeps repeating its last step. It records the instructions and tools
-    of every request.
+    ``latency`` delays each model request, so a stop that the runner requests
+    after a tool result lands before the next request.
     """
+    behavior = {"request_seconds": latency} if latency else {}
+    return CodexCLIAdapter.scripted(script, extra_env={"WSE_CODEX_TEST_DOUBLE": json.dumps(behavior)},
+                                    interrupt_grace_seconds=5.0, terminate_grace_seconds=2.0,
+                                    orphan_grace_seconds=3.0, **options)
 
-    provider_name = "test-double"
 
-    def __init__(self, script: list[tuple]) -> None:
-        self.script = script
-        self.calls = 0
-        self.requests: list[dict[str, Any]] = []
-        self.outputs: list[Any] = []
+def codex_dir(workspace: Path, run_id: str) -> Path:
+    return workspace / "logs" / f"codex-{run_id}"
 
-    async def get_response(self, system_instructions, input, model_settings, tools, output_schema,  # noqa: A002
-                           handoffs, tracing, *, previous_response_id=None, conversation_id=None, prompt=None):
-        self.requests.append({"system_instructions": system_instructions,
-                              "tools": [{"name": t.name, "description": t.description,
-                                         "parameters": t.params_json_schema} for t in tools]})
-        outputs = [item for item in (input if isinstance(input, list) else [])
-                   if isinstance(item, dict) and item.get("type") == "function_call_output"]
-        last = parse_tool_output(outputs[-1]["output"])[3] if outputs else None
-        self.outputs.append(last)
-        step = self.script[min(self.calls, len(self.script) - 1)]
-        self.calls += 1
-        if step[0] in ("sleep", "interrupt"):
-            if step[0] == "interrupt":  # stands in for the operator's Ctrl-C while the model is working
-                os.kill(os.getpid(), signal.SIGINT)
-            await asyncio.sleep(step[1])
-            step = ("say", "done")
-        if step[0] == "say":
-            output = [ResponseOutputMessage(id=f"m{self.calls}", type="message", role="assistant", status="completed",
-                                            content=[ResponseOutputText(type="output_text", text=step[1],
-                                                                        annotations=[])])]
-        else:
-            arguments = step[2](last) if callable(step[2]) else step[2]
-            output = [ResponseFunctionToolCall(id=f"fc{self.calls}", call_id=f"c{self.calls}", name=step[1],
-                                               arguments=json.dumps(arguments), type="function_call",
-                                               status="completed")]
-        return ModelResponse(output=output, usage=Usage(requests=1, input_tokens=100 + self.calls, output_tokens=7,
-                                                        total_tokens=107 + self.calls), response_id=None)
 
-    async def stream_response(self, *args, **kwargs):  # noqa: ANN002, ANN003
-        raise NotImplementedError
-        yield  # pragma: no cover
+def shown_to_model(workspace: Path, run_id: str) -> list[dict[str, Any]]:
+    """What the stand-in recorded as shown to the model, one entry per segment: the prompt and the offered tools."""
+    records = sorted((codex_dir(workspace, run_id) / "home" / "test-double").glob("*.requests.jsonl"))
+    return [json.loads(line) for path in records for line in path.read_text().splitlines()]
+
+
+def segment_items(result: dict[str, Any], item_type: str) -> list[dict[str, Any]]:
+    """The completed items of one type in the raw Codex event streams of a run, in order."""
+    items = []
+    for segment in result["provider_metadata"]["segments"]:
+        for line in Path(segment["log"]).read_text().splitlines():
+            event = json.loads(line)
+            if event.get("type") == "item.completed" and event["item"].get("type") == item_type:
+                items.append(event["item"])
+    return items
 
 
 @pytest.fixture
@@ -145,20 +112,19 @@ def _runner(workspace: Path, factory) -> ReferenceRunner:
                            settle_timeout_seconds=60)
 
 
-def _agent_run(engine, workspace, prepared, model_for, policy_id=SMALL_MODEL_POLICY_ID, **config):
-    """Run one SDK-backed trial; ``model_for(experiment_id)`` builds the fake model."""
+def _agent_run(engine, workspace, prepared, adapter_for, policy_id=SMALL_MODEL_POLICY_ID, model="test-double",
+               **config):
+    """Run one agent trial; ``adapter_for(experiment_id)`` builds the adapter."""
     run_id = engine.grant_run(prepared["task_id"], policy_id, prepared["task_checkpoint_id"]).run_id
     made: dict[str, Any] = {}
 
-    def factory(agent_config: AgentConfig, eid: str) -> OpenAIAgentsAdapter:
-        made["model"] = model_for(eid)
-        made["adapter"] = OpenAIAgentsAdapter(model=made["model"])
+    def factory(agent_config: AgentConfig, eid: str) -> CodexCLIAdapter:
+        made["adapter"] = adapter_for(eid)
         return made["adapter"]
 
     runner = _runner(workspace, factory)
-    eid = runner.run_experiment(run_id, prepared["task_id"], policy_id, {"kind": "agent", "model": "test-double",
-                                                                         **config})
-    return eid, runner.last_result, made
+    eid = runner.run_experiment(run_id, prepared["task_id"], policy_id, {"kind": "agent", "model": model, **config})
+    return eid, runner.last_result, run_id
 
 
 def _events(engine, eid) -> list[dict[str, Any]]:
@@ -167,123 +133,95 @@ def _events(engine, eid) -> list[dict[str, Any]]:
     return [{"kind": row["kind"], **json.loads(row["payload"])} for row in rows]
 
 
-# -- the reference loop through the real SDK runner ------------------------------------------------------------
+# -- the reference loop -------------------------------------------------------------------------------------------
 
 
-def test_the_sdk_loop_repairs_through_wse_serve_and_the_runner_settles_and_freezes(engine, workspace, prepared,
-                                                                                   monkeypatch):
-    from agents import Runner
-
-    run_calls: list[dict[str, Any]] = []
-    original = Runner.run
-
-    async def spy(*args, **kwargs):
-        run_calls.append(kwargs)
-        return await original(*args, **kwargs)
-
-    monkeypatch.setattr(Runner, "run", spy)
-    eid, record, made = _agent_run(engine, workspace, prepared,
-                                   lambda eid: strategy_model(ScriptedSearchStrategy(), experiment_id=eid))
-    model = made["model"]
-    # max_turns is passed explicitly (the SDK default is 10) and tracing is disabled for the benchmark run.
-    assert len(run_calls) == 1 and run_calls[0]["max_turns"] == 100
-    assert run_calls[0]["run_config"].tracing_disabled is True
-    assert run_calls[0]["run_config"].trace_include_sensitive_data is False
+def test_the_agent_loop_repairs_through_wse_serve_and_the_runner_settles_and_freezes(engine, workspace, prepared):
+    eid, record, run_id = _agent_run(engine, workspace, prepared,
+                                     lambda eid: CodexCLIAdapter.test_double(ScriptedSearchStrategy()), model=DOUBLE)
     result = record["result"]
     assert result["status"] == "stopped" and result["stop_condition"].startswith("target_met")
-    # SDK completion alone closes nothing: the runner settled and froze; final evaluation is separate.
+    # Completion of the agent's loop closes nothing: the runner settled and froze; final evaluation is separate.
     experiment = engine.get_experiment(eid)
     assert experiment.state == "FROZEN" and result["finalization"]["state"] == "FROZEN"
     assert not [job for job in engine.list_jobs(eid) if not job.terminal]
-    # Normalized usage: token fields come from the fake responses; unreportable fields are null with a reason.
+    # Normalized usage: tokens per model request; what Codex cannot report is null with a reason.
     usage = result["usage"]
-    assert usage["requests"] == model.calls == result["turns"]
+    responses = [event for event in _events(engine, eid) if event["kind"] == "model_response"]
+    assert usage["requests"] == len(responses) == result["turns"] > 0
     assert usage["input_tokens"] > 0 and usage["total_tokens"] == usage["input_tokens"] + usage["output_tokens"]
-    assert usage["provider"] == "wse-test-double" and usage["model"] == "test-double"
+    assert usage["input_tokens"] == sum(event["usage"]["input_tokens"] for event in responses)
+    assert usage["provider"] == "wse-test-double" and usage["model"] == DOUBLE
     assert usage["cost_usd"] is None and usage["unavailable"]["cost_usd"]
     assert usage["model_version"] is None and usage["unavailable"]["model_version"]
     metadata = result["provider_metadata"]
-    assert metadata["tracing_disabled"] is True and metadata["max_turns"] == 100
-    assert metadata["wall_clock_seconds"] == 900 and metadata["mcp_protocol_version"] == "2026-07-28"
-    assert metadata["tools_seen"] == sorted(allowed_tools(engine.get_policy(SMALL_MODEL_POLICY_ID)))
-    assert record["tracing"]["sdk_tracing_disabled"] is True and record["constraint_status"] == "verified"
-    assert record["kind"] == "agent" and record["controller"] == {"extension_id": "openai_agents", "version": "1"}
-    # Normalized events: model responses with usage, tool calls and results, the stop, and the end.
+    assert metadata["max_turns"] == 100 and metadata["wall_clock_seconds"] == 900
+    assert metadata["allowed_tools"] == allowed_tools(engine.get_policy(SMALL_MODEL_POLICY_ID))
+    assert record["kind"] == "agent" and record["controller"] == {"extension_id": "codex_cli", "version": "1"}
+    assert record["config"]["test_double"] == {"strategy": "scripted_search@1",
+                                               "resolved_config": ScriptedSearchStrategy().config()}
+    # Normalized events: the run's start, tool calls paired with results, the stop, and the end.
     events = _events(engine, eid)
     kinds = [event["kind"] for event in events]
     assert kinds[0] == "run_started" and kinds[-1] == "run_finished" and "cancel_requested" in kinds
-    responses = [event for event in events if event["kind"] == "model_response"]
-    assert sum(event["usage"]["input_tokens"] for event in responses) == usage["input_tokens"]
-    # A test double reports no provider IDs; the latency of each model call is still measured.
-    assert all(e["details"]["request_id"] is None and e["details"]["latency_seconds"] >= 0 for e in responses)
+    calls = [event for event in events if event["kind"] == "tool_call"]
     results = [event for event in events if event["kind"] == "tool_result"]
     assert results and all(event["ok"] and event["output_hash"].startswith("sha256:") for event in results)
-    assert [e["tool"] for e in events if e["kind"] == "tool_call"] == [e["tool"] for e in results]
-    # Each call the strategy explained carries its rationale, as through the runner's dispatch, and the record
-    # names the strategy that chose the calls, with its resolved configuration.
-    calls = [event for event in events if event["kind"] == "tool_call"]
-    assert [event["details"].get("rationale") for event in calls] == [model.rationales.get(event["call_id"])
-                                                                       for event in calls]
-    assert calls[0]["details"]["rationale"] == "Read the task and budget."
-    assert all(event["details"]["rationale"].startswith("Scaling output unit") for event in calls
-               if event["tool"] == "wse_preview_patch")
-    assert record["config"]["test_double"] == {"strategy": "scripted_search@1",
-                                               "resolved_config": ScriptedSearchStrategy().config()}
-    # The model saw exactly the allow-listed WSE tools and instructions generated from task.json and the policy.
+    assert [(e["tool"], e["call_id"]) for e in calls] == [(e["tool"], e["call_id"]) for e in results]
+    assert calls[0]["tool"] == "wse_get_experiment"
+    # The model was shown exactly the allow-listed WSE tools and instructions generated from task.json and the
+    # policy, with the run's and the experiment's IDs.
     policy = engine.get_policy(SMALL_MODEL_POLICY_ID)
     task = engine.get_task(prepared["task_id"])
-    for request in model.requests:
-        assert sorted(tool["name"] for tool in request["tools"]) == sorted(allowed_tools(policy))
-        assert request["system_instructions"] == render_instructions(task, policy, experiment_id=eid,
-                                                                     tools=allowed_tools(policy))
-    # The section 7.1 leak test over everything the model was shown before the answer was found.
+    shown = shown_to_model(workspace, run_id)
+    assert shown and all(sorted(tool["name"] for tool in entry["tools"]) == sorted(allowed_tools(policy))
+                         for entry in shown)
+    prompt = shown[0]["prompt"]
+    assert f"Experiment ID: {eid}" in prompt and task.description in prompt and run_id in prompt
+    assert "Available tools: " + ", ".join(allowed_tools(policy)) + "." in prompt
+    # The leak test of M1 Section 7.1 over everything the model was shown before the answer was found.
     reference = engine.load_manifest(prepared["reference_checkpoint_id"])
-    surfaces = [model.requests[0]["system_instructions"], json.dumps(model.requests[0]["tools"])]
-    text = "\n".join(surfaces)
+    text = "\n".join([prompt, json.dumps(shown[0]["tools"])])
     for secret in [reference.checkpoint_id, reference.weights_hash, *_final_secrets(engine, prepared)]:
         assert secret not in text
     assert sorted({m.group(0) for m in FAULT_DESCRIPTIONS.finditer(text)}) == []
-    assert not any(_is_oracle(node) for node in _walk(model.requests[0]["tools"]))
+    assert not any(_is_oracle(node) for node in _walk(shown[0]["tools"]))
     assert engine.final_evaluate(eid).comparison.candidate_value == 1.0
 
 
 # -- limits and cancellation ----------------------------------------------------------------------------------
 
 
-def test_the_turn_limit_ends_the_sdk_loop(engine, workspace, prepared):
-    looping = lambda eid: ToolModel([("call", "wse_get_experiment", {"experiment_id": eid})])  # noqa: E731
-    eid, record, made = _agent_run(engine, workspace, prepared, looping, WEIGHTS_ONLY_POLICY_ID, max_turns=3)
-    assert record["result"]["status"] == "max_turns" and made["model"].calls == 3
+def test_the_turn_limit_ends_the_agent_loop(engine, workspace, prepared):
+    looping = lambda eid: scripted([("call", "wse_get_experiment", {"experiment_id": eid})],  # noqa: E731
+                                   latency=1.0)
+    eid, record, _ = _agent_run(engine, workspace, prepared, looping, WEIGHTS_ONLY_POLICY_ID, max_turns=3)
+    assert record["result"]["status"] == "max_turns" and record["result"]["turns"] == 3
     assert record["result"]["provider_metadata"]["max_turns"] == 3
     assert engine.get_experiment(eid).state == "FROZEN"
 
 
-def test_the_wall_clock_limit_and_external_cancellation_stop_the_sdk_loop(engine, workspace, prepared):
-    sleeper = lambda eid: ToolModel([("call", "wse_get_experiment", {"experiment_id": eid}),  # noqa: E731
-                                     ("sleep", 60)])
+def test_the_wall_clock_limit_and_external_cancellation_stop_the_agent_loop(engine, workspace, prepared):
+    sleeper = lambda eid: scripted([("call", "wse_get_experiment", {"experiment_id": eid}),  # noqa: E731
+                                    ("sleep", 60)])
+    started = time.monotonic()
     eid, record, _ = _agent_run(engine, workspace, prepared, sleeper, WEIGHTS_ONLY_POLICY_ID, wall_clock_seconds=1.5)
     assert record["result"]["status"] == "timeout" and "wall-clock limit of 1.5 s" in record["result"]["reason"]
-    assert record["result"]["elapsed_seconds"] < 30 and engine.get_experiment(eid).state == "FROZEN"
+    assert time.monotonic() - started < 30 and engine.get_experiment(eid).state == "FROZEN"
 
     # cancel() from another thread stops a running loop with the given reason.
-    adapter_box: dict[str, Any] = {}
-
-    def model_for(eid):
-        model = ToolModel([("call", "wse_get_experiment", {"experiment_id": eid}), ("sleep", 60)])
-        timer = threading.Timer(1.0, lambda: adapter_box["adapter"].cancel(eid, "operator request"))
-        adapter_box["timer"] = timer
-        timer.start()
-        return model
-
+    box: dict[str, Any] = {}
     run_id = engine.grant_run(prepared["task_id"], WEIGHTS_ONLY_POLICY_ID, prepared["task_checkpoint_id"]).run_id
 
     def factory(config, eid):
-        adapter_box["adapter"] = OpenAIAgentsAdapter(model=model_for(eid))
-        return adapter_box["adapter"]
+        box["adapter"] = scripted([("call", "wse_get_experiment", {"experiment_id": eid}), ("sleep", 60)])
+        box["timer"] = threading.Timer(3.0, lambda: box["adapter"].cancel(eid, "operator request"))
+        box["timer"].start()
+        return box["adapter"]
 
     runner = _runner(workspace, factory)
     eid = runner.run_experiment(run_id, prepared["task_id"], WEIGHTS_ONLY_POLICY_ID, {"model": "test-double"})
-    adapter_box["timer"].join()
+    box["timer"].join()
     result = runner.last_result["result"]
     assert result["status"] == "stopped" and result["reason"] == "operator request"
     assert engine.get_experiment(eid).state == "FROZEN"
@@ -297,19 +235,20 @@ def test_a_budget_error_terminates_the_controller(engine, workspace, prepared):
     def reader(eid):
         read = {"experiment_id": eid, "checkpoint_id": prepared["task_checkpoint_id"], "tensor": "layers.0.weight",
                 "selection": W1_ROW}
-        return ToolModel([("call", "wse_get_experiment", {"experiment_id": eid}), ("call", "wse_read_tensor", read)])
+        return scripted([("call", "wse_get_experiment", {"experiment_id": eid}), ("call", "wse_read_tensor", read)],
+                        latency=0.5)
 
-    eid, record, made = _agent_run(engine, workspace, prepared, reader, tight.policy_id)
+    eid, record, _ = _agent_run(engine, workspace, prepared, reader, tight.policy_id)
     result = record["result"]
     assert result["status"] == "stopped" and result["stop_condition"].startswith("insufficient_budget")
     # The controller did not keep requesting denied work: one successful read, one denied, then the stop.
-    assert result["tool_calls"] == 3 and made["model"].calls == 3
+    assert result["tool_calls"] == 3 and result["turns"] == 3
     errors = [e["error_code"] for e in _events(engine, eid) if e["kind"] == "tool_result" and not e["ok"]]
     assert errors == ["BUDGET_EXCEEDED"]
     assert engine.get_experiment(eid).budget["tensor_read_calls"].consumed == 1
 
 
-def test_jobs_unfinished_at_sdk_exit_are_settled_before_freezing(engine, workspace, prepared, signed_sum, tmp_path):
+def test_jobs_unfinished_when_the_agent_stops_are_settled_before_freezing(engine, workspace, prepared, signed_sum):
     engine.register_suite({"suite_id": "signed_sum_dev_slow", "task_id": prepared["task_id"], "split": "development",
                            "evaluator": "slow_batches@1", "sample_counts": [64], "seeds": [0],
                            "parameters": {"sleep_seconds": 30, "cooperative": True},
@@ -318,7 +257,7 @@ def test_jobs_unfinished_at_sdk_exit_are_settled_before_freezing(engine, workspa
     def submit_and_leave(eid):
         job = {"experiment_id": eid, "checkpoint_id": prepared["task_checkpoint_id"], "suite_id": "signed_sum_dev_slow",
                "eval_config": {"sample_count": 64, "seed": 0}, "idempotency_key": "slow"}
-        return ToolModel([("call", "wse_submit_evaluation", job), ("say", "Leaving the evaluation running.")])
+        return scripted([("call", "wse_submit_evaluation", job), ("say", "Leaving the evaluation running.")])
 
     eid, record, _ = _agent_run(engine, workspace, prepared, submit_and_leave)
     result = record["result"]
@@ -339,10 +278,10 @@ def test_a_connection_failure_is_reported_and_the_experiment_is_still_finalized(
         return connection.model_copy(update={"serve_command": [sys.executable, "-c", "import sys; sys.exit(3)"]})
 
     monkeypatch.setattr(ReferenceRunner, "connection", broken)
-    never = lambda eid: ToolModel([("say", "unreachable")])  # noqa: E731
-    eid, record, made = _agent_run(engine, workspace, prepared, never, connect_timeout_seconds=20)
+    never = lambda eid: scripted([("say", "unreachable")])  # noqa: E731
+    eid, record, _ = _agent_run(engine, workspace, prepared, never, connect_timeout_seconds=20)
     result = record["result"]
-    assert result["status"] == "connection_failed" and made["model"].calls == 0
+    assert result["status"] == "connection_failed" and result["turns"] == 0
     assert result["usage"]["input_tokens"] is None and "no model request" in result["usage"]["unavailable"][
         "input_tokens"]
     experiment = engine.get_experiment(eid)
@@ -358,142 +297,45 @@ def test_a_connection_failure_names_its_cause_and_points_to_the_server_log(engin
                                                                "wse_no_such_module:setup"]})
 
     monkeypatch.setattr(ReferenceRunner, "connection", unloadable)
-    never = lambda eid: ToolModel([("say", "unreachable")])  # noqa: E731
-    eid, record, made = _agent_run(engine, workspace, prepared, never, connect_timeout_seconds=20)
+    never = lambda eid: scripted([("say", "unreachable")])  # noqa: E731
+    eid, record, _ = _agent_run(engine, workspace, prepared, never, connect_timeout_seconds=20)
     result = record["result"]
-    assert result["status"] == "connection_failed" and made["model"].calls == 0
+    assert result["status"] == "connection_failed" and result["turns"] == 0
     log = Path(result["serve_log"])
     assert log.name == f"serve-{engine.get_experiment(eid).run_id}.log"
     assert "ModuleNotFoundError: No module named 'wse_no_such_module'" in log.read_text()
-    # The reason names the underlying failure, not only an exception group, and where the server's log is.
+    # The reason names the underlying failure (the server did not start in Codex) and where the server's log is.
+    assert "MCP servers failed to initialize" in result["reason"]
     assert f"see the server log {log}" in result["reason"]
-    assert "unhandled errors in a TaskGroup" not in result["reason"].split(";")[0]
     assert engine.get_experiment(eid).state == "FROZEN"
 
 
-def test_the_provider_is_the_class_of_the_endpoint_the_sdk_calls():
-    from wse.agent_adapters.openai_agents import provider_for_base_url
-
-    # Unset (None) is the SDK client's default, https://api.openai.com/v1; an empty value is used as given.
-    for url in (None, "https://api.openai.com/v1", "https://eu.api.openai.com/v1/"):
-        assert provider_for_base_url(url) == "openai", url
-    for url in ("https://r.openai.azure.com/openai/v1", "https://r.services.ai.azure.com/openai/v1/",
-                "https://r.cognitiveservices.azure.com/openai/v1", "HTTPS://R.Services.AI.Azure.com/openai/v1"):
-        assert provider_for_base_url(url) == "azure_openai", url
-    for url in ("http://127.0.0.1:8000/v1", "https://openrouter.ai/api/v1", "https://r.openai.azure.com.example.org/v1",
-                "https://openai.azure.com/openai/v1", "https://api.openai.com.example.org/v1", "not a url", ""):
-        assert provider_for_base_url(url) == "openai_compatible", url
-
-
-def test_a_model_name_run_records_its_endpoint_class_but_not_the_endpoint(engine, workspace, prepared, monkeypatch):
+def test_a_model_name_run_records_its_provider_but_not_the_endpoint(engine, workspace, prepared, monkeypatch):
     original = ReferenceRunner.connection
 
-    def broken(self, *args, **kwargs):  # no SDK request is ever made
+    def broken(self, *args, **kwargs):  # no model request is ever made
         connection = original(self, *args, **kwargs)
         return connection.model_copy(update={"serve_command": [sys.executable, "-c", "import sys; sys.exit(3)"]})
 
     monkeypatch.setattr(ReferenceRunner, "connection", broken)
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://example-resource.services.ai.azure.com/openai/v1")
-    # model=None: the adapter passes the configured model name to the SDK, as in a live trial
-    eid, record, _ = _agent_run(engine, workspace, prepared, lambda eid: None, connect_timeout_seconds=20)
+    endpoint = "https://example-resource.services.ai.azure.com/openai/v1"
+    provider = {"model_provider": "wse_proxy", "model_providers": {"wse_proxy": {
+        "name": "WSE model proxy", "base_url": endpoint, "env_key": "WSE_MODEL_PROXY_TOKEN", "wire_api": "responses"}}}
+    adapter_for = lambda eid: CodexCLIAdapter(  # noqa: E731 - the model name goes to Codex as in a live trial
+        codex_command=(sys.executable, "-m", TEST_DOUBLE_MODULE), provider_config=provider, proxy_token="t" * 32)
+    eid, record, _ = _agent_run(engine, workspace, prepared, adapter_for, model="gpt-5.6-luna",
+                                connect_timeout_seconds=20)
     usage = record["result"]["usage"]
     assert record["result"]["status"] == "connection_failed"
-    assert usage["provider"] == "azure_openai" and usage["model"] == "test-double"
+    assert usage["provider"] == "wse_proxy" and usage["model"] == "gpt-5.6-luna"
     assert "example-resource" not in json.dumps(record) + json.dumps(_events(engine, eid))
 
 
-class _ResponsesStub(BaseHTTPRequestHandler):
-    """A loopback stand-in for the Responses API: every request gets a final assistant message.
-
-    HTTP/1.1 keeps each connection open after its response, as real endpoints
-    do, so the client's connection pool can reuse it. Each answer comes after
-    ``server.delay_seconds`` and carries an ``x-request-id`` header, as OpenAI
-    and Azure OpenAI responses do.
-    """
-
-    protocol_version = "HTTP/1.1"
-
-    def do_POST(self) -> None:  # noqa: N802 - the http.server hook name
-        request = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
-        self.server.requests.append((self.path, request.get("model"), self.headers.get("Authorization")))
-        number = len(self.server.requests)
-        body = json.dumps({
-            "id": f"resp_{number}", "object": "response", "created_at": 0, "status": "completed",
-            "model": "stub", "error": None, "incomplete_details": None, "parallel_tool_calls": True,
-            "tool_choice": "auto", "tools": [],
-            "output": [{"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
-                        "content": [{"type": "output_text", "text": "Finished.", "annotations": []}]}],
-            "usage": {"input_tokens": 10, "output_tokens": 2, "total_tokens": 12,
-                      "input_tokens_details": {"cached_tokens": 0}, "output_tokens_details": {"reasoning_tokens": 0}},
-        }).encode()
-        time.sleep(self.server.delay_seconds)
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("x-request-id", f"req_{number}")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format, *args) -> None:  # noqa: A002 - keep the test output quiet
-        pass
-
-
-@pytest.fixture
-def responses_endpoint(offline, monkeypatch):
-    """Serve ``_ResponsesStub`` on loopback, the one address the offline guard lets the test reach."""
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _ResponsesStub)
-    server.block_on_close = False  # a connection the client keeps open must not hold up shutdown
-    server.requests = []
-    server.delay_seconds = 0.0
-    address = server.server_address[:2]
-    guarded = socket.socket.connect
-
-    def connect(self, target, *args, **kwargs):
-        if self.family == socket.AF_INET and tuple(target[:2]) == address:
-            return _socket.socket.connect(self, target, *args, **kwargs)
-        return guarded(self, target, *args, **kwargs)
-
-    monkeypatch.setattr(socket.socket, "connect", connect)
-    monkeypatch.setenv("OPENAI_BASE_URL", f"http://{address[0]}:{address[1]}/v1")
-    monkeypatch.setenv("OPENAI_API_KEY", "test-only-key")
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    yield server
-    server.shutdown()
-    server.server_close()
-
-
-def test_consecutive_model_name_trials_in_one_process_each_reach_the_endpoint(engine, workspace, prepared,
-                                                                               responses_endpoint):
-    # run_trials.py runs every trial in its own event loop, all in one process. A model client shared between
-    # trials would reuse a pooled connection of an earlier, closed loop ("RuntimeError: Event loop is closed").
-    results = [_agent_run(engine, workspace, prepared, lambda eid: None)[1]["result"] for _ in range(3)]
-    assert [result["status"] for result in results] == ["completed"] * 3, [result["reason"] for result in results]
-    assert [result["usage"]["input_tokens"] for result in results] == [10, 10, 10]
-    # Each trial's own client calls the endpoint as the SDK's default client does: OPENAI_BASE_URL, the
-    # configured model name, and OPENAI_API_KEY as a bearer token.
-    assert responses_endpoint.requests == [("/v1/responses", "test-double", "Bearer test-only-key")] * 3
-
-
-def test_each_model_response_records_its_latency_and_the_provider_ids(engine, workspace, prepared,
-                                                                      responses_endpoint):
-    # A request's latency and the provider's response and request IDs locate a slow or failed request in the
-    # provider's own logs; the latency spans the SDK's whole model call, including the client's retries.
-    responses_endpoint.delay_seconds = 0.2
-    eid, last, _ = _agent_run(engine, workspace, prepared, lambda eid: None)
-    assert last["result"]["status"] == "completed", last["result"]["reason"]
-    responses = [event for event in _events(engine, eid) if event["kind"] == "model_response"]
-    assert [(e["details"]["response_id"], e["details"]["request_id"]) for e in responses] == [("resp_1", "req_1")]
-    assert all(0.2 <= e["details"]["latency_seconds"] < 30 for e in responses)
-
-
-def test_an_operator_interrupt_cancels_the_sdk_loop_and_the_trial_is_still_frozen(engine, workspace, prepared):
+def test_an_operator_interrupt_cancels_the_agent_loop_and_the_trial_is_still_frozen(engine, workspace, prepared):
     run_id = engine.grant_run(prepared["task_id"], SMALL_MODEL_POLICY_ID, prepared["task_checkpoint_id"]).run_id
-    made: dict[str, Any] = {}
 
-    def factory(config, eid):
-        made["model"] = ToolModel([("call", "wse_get_experiment", {"experiment_id": eid}), ("interrupt", 60)])
-        made["adapter"] = OpenAIAgentsAdapter(model=made["model"])
-        return made["adapter"]
+    def factory(config, eid):  # the stand-in sends SIGINT to this process, as the operator's Ctrl-C would
+        return scripted([("call", "wse_get_experiment", {"experiment_id": eid}), ("interrupt", 60)])
 
     runner = _runner(workspace, factory)
     handler = signal.getsignal(signal.SIGINT)
@@ -508,18 +350,17 @@ def test_an_operator_interrupt_cancels_the_sdk_loop_and_the_trial_is_still_froze
                                                  if not job.terminal]
     result = runner.last_result["result"]
     assert result["status"] == "cancelled" and result["stop_condition"].startswith("operator_interrupt")
-    assert result["finalization"]["state"] == "FROZEN" and made["model"].calls == 2
+    assert result["finalization"]["state"] == "FROZEN" and result["turns"] == 2
 
 
-def test_sdk_completion_alone_does_not_freeze_or_close_an_experiment(engine, workspace, prepared):
+def test_completion_of_the_agent_loop_alone_does_not_freeze_or_close_an_experiment(engine, workspace, prepared):
     run_id = engine.grant_run(prepared["task_id"], WEIGHTS_ONLY_POLICY_ID, prepared["task_checkpoint_id"]).run_id
     with Engine(workspace, run_id=run_id) as bound:
         eid = bound.create_experiment(run_id, prepared["task_id"], WEIGHTS_ONLY_POLICY_ID, "c").experiment_id
     runner = _runner(workspace, None)
     connection = runner.connection(run_id, eid, engine.get_task(prepared["task_id"]),
                                    engine.get_policy(WEIGHTS_ONLY_POLICY_ID), "verified")
-    model = ToolModel([("call", "wse_get_experiment", {"experiment_id": eid}), ("say", "Finished.")])
-    adapter = OpenAIAgentsAdapter(model=model)
+    adapter = scripted([("call", "wse_get_experiment", {"experiment_id": eid}), ("say", "Finished.")])
     config = AgentConfig(model="test-double")
     events = []
 
@@ -532,8 +373,10 @@ def test_sdk_completion_alone_does_not_freeze_or_close_an_experiment(engine, wor
 
     result = asyncio.run(body())
     assert result.status == "completed" and result.final_message == "Finished." and result.tool_calls == 1
-    assert [event.kind for event in events] == ["run_started", "model_response", "tool_call", "tool_result",
-                                                "model_response", "message", "run_finished"]
+    kinds = [event.kind for event in events]
+    assert [kind for kind in kinds if kind != "model_response"] == ["run_started", "tool_call", "tool_result",
+                                                                    "message", "run_finished"]
+    assert kinds.count("model_response") == 2 == result.turns
     assert engine.get_experiment(eid).state == "OPEN"  # only the runner freezes, and only the operator closes
 
 
@@ -542,3 +385,4 @@ def test_the_network_guard_blocks_outbound_connections(offline):
         socket.create_connection(("127.0.0.1", 9), timeout=1)
     assert offline == [("127.0.0.1", 9)]
     offline.clear()
+

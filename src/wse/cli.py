@@ -82,14 +82,18 @@ def _parser() -> argparse.ArgumentParser:
                        help="append the server's and its worker's stderr (logs) to this file instead of stderr")
     runner = commands.add_parser("run", help="run one controller on a run grant's experiment, then settle and freeze")
     runner.add_argument("--run-id", required=True, help="the persisted run grant to use")
-    runner.add_argument("--controller", choices=("scripted", "openai-agents"), default="scripted")
+    runner.add_argument("--controller", choices=("scripted", "codex"), default="scripted",
+                        help="scripted: a registered stepwise strategy; codex: an LLM agent in the Codex CLI "
+                             "(codex_cli@1)")
     runner.add_argument("--strategy", default="scripted_search@1", help="scripted: the registered strategy")
     runner.add_argument("--param", action="append", default=[], metavar="NAME=JSON",
                         help="scripted: a strategy parameter (repeatable)")
     runner.add_argument("--model", default=None,
-                        help="openai-agents: the operator-chosen model name (credentials come from the SDK's "
-                             f"environment), or '{TEST_DOUBLE}<strategy>' for the offline SDK test double")
-    runner.add_argument("--max-turns", type=int, default=100, help="openai-agents: SDK turn limit (default 100)")
+                        help="codex: the operator-chosen model name (Codex reaches it through a local proxy that "
+                             "holds OPENAI_BASE_URL and OPENAI_API_KEY), or "
+                             f"'{TEST_DOUBLE}<strategy>' for the offline Codex stand-in")
+    runner.add_argument("--max-turns", type=int, default=100,
+                        help="codex: the limit on the agent's model requests (default 100)")
     runner.add_argument("--wall-clock-seconds", type=float, default=900.0,
                         help="controller wall-clock limit in seconds (default 900)")
     runner.add_argument("--setup", action="append", default=[],
@@ -235,8 +239,8 @@ def _run(args: argparse.Namespace) -> int:
                         "wall_clock_seconds": args.wall_clock_seconds}
     else:
         if not args.model:
-            raise WSEError(ErrorCode.INVALID_ARGUMENT, "--model is required for --controller openai-agents")
-        config = {"kind": "agent", "model": args.model, "max_turns": args.max_turns,
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, "--model is required for --controller codex")
+        config = {"kind": "agent", "adapter": "codex_cli@1", "model": args.model, "max_turns": args.max_turns,
                   "wall_clock_seconds": args.wall_clock_seconds}
     runner = ReferenceRunner(args.workspace, setup=args.setup, worker_args=shlex.split(args.worker_args))
     from wse.api import Engine

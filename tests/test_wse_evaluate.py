@@ -515,20 +515,16 @@ def test_a_killed_server_leaves_the_job_to_its_worker_and_a_new_server_returns_i
 
 def test_the_runner_cancels_a_blocking_evaluation_and_freezes_when_the_agent_stops(engine, trial, workspace,
                                                                                     signed_sum, tmp_path):
-    pytest.importorskip("agents", reason="the optional agents-openai extra is not installed")
-    from test_agent_adapter import ToolModel
-
-    from wse.agent_adapters.openai_agents import OpenAIAgentsAdapter
+    from test_agent_adapter import scripted
 
     base = trial["task_checkpoint_id"]
     _slow_task(engine, signed_sum, tmp_path / "started", sleep_seconds=60.0)
     run_id = engine.grant_run(SLOW_TASK, trial["policy_id"], base).run_id
 
-    def factory(config, eid):
-        return OpenAIAgentsAdapter(model=ToolModel([
-            ("call", "wse_get_experiment", {}),
-            ("call", "wse_evaluate", {"checkpoint_id": base, "idempotency_key": "slow"}),
-            ("say", "done")]))
+    def factory(config, eid):  # Codex's offline stand-in plays the agent
+        return scripted([("call", "wse_get_experiment", {}),
+                         ("call", "wse_evaluate", {"checkpoint_id": base, "idempotency_key": "slow"}),
+                         ("say", "done")])
 
     runner = ReferenceRunner(workspace, setup=["wse_test_plugins:setup"], worker_args=["--poll-seconds", "0.02"],
                              serve_env={"PYTHONPATH": str(TESTS_DIR)}, adapter_factory=factory,
@@ -543,8 +539,8 @@ def test_the_runner_cancels_a_blocking_evaluation_and_freezes_when_the_agent_sto
     assert result["finalization"]["cancelled_jobs"] == [job.job_id]
     assert (job.state, job.usage.evaluation_batches) == ("cancelled", 1)  # the batch it started stays charged
     assert job.error.details["reason"] == "cancelled" and engine.get_experiment(eid).state == "FROZEN"
-    # The SDK abandons the call without cancelling the request, so the server's wait ended when the finalization
-    # cancelled the job, and the server then closed at once: the job alone would have run for 30 s.
+    # Codex was stopped in the middle of the call; its server's wait ended with it, the adapter's worker kept the
+    # job until the finalization cancelled it, and nothing waited for the job's 60 s.
     assert elapsed < 30
     assert "Traceback" not in Path(runner.serve_log(run_id)).read_text(encoding="utf-8")
 

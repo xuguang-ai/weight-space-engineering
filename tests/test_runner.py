@@ -346,20 +346,19 @@ def test_the_cli_runs_a_scripted_controller(engine, workspace, prepared, capsys)
 
 
 
-# -- the optional SDK -----------------------------------------------------------------------------------------------
+# -- no agent SDK ---------------------------------------------------------------------------------------------------
 
 NO_SDK = """
 import importlib.abc, importlib.util, sys
 class Block(importlib.abc.MetaPathFinder):
     def find_spec(self, name, path=None, target=None):
         if name.split('.')[0] in ('agents', 'openai', 'claude_agent_sdk'):
-            raise ImportError('blocked optional SDK: ' + name)
+            raise ImportError('blocked agent SDK: ' + name)
 sys.meta_path.insert(0, Block())
-import asyncio, json
+import json
 import wse, wse.cli, wse.runner, wse.agent_adapters.base
-from wse.agent_adapters.openai_agents import OpenAIAgentsAdapter
+from wse.agent_adapters.codex_cli import CodexCLIAdapter
 from wse.api import Engine
-from wse.schemas import WSEError
 spec = importlib.util.spec_from_file_location('fixture', sys.argv[1])
 fixture = importlib.util.module_from_spec(spec); spec.loader.exec_module(fixture)
 with Engine(sys.argv[2]) as engine:
@@ -367,24 +366,20 @@ with Engine(sys.argv[2]) as engine:
     run_id = engine.grant_run(ids['task_id'], 'small_model_weights_only_v1', ids['task_checkpoint_id']).run_id
 runner = wse.runner.ReferenceRunner(sys.argv[2])
 eid = runner.run_experiment(run_id, ids['task_id'], 'small_model_weights_only_v1', {'kind': 'strategy'})
-try:
-    OpenAIAgentsAdapter('a-model')
-except WSEError as exc:
-    code = exc.code.value
-print(json.dumps({'state': runner.last_result['result']['finalization']['state'], 'code': code,
+adapter = CodexCLIAdapter(codex_command=['true'], provider_config={})
+print(json.dumps({'state': runner.last_result['result']['finalization']['state'], 'adapter': adapter.adapter_id,
                   'loaded': sorted(m for m in sys.modules if m.split('.')[0] in ('agents', 'openai'))}))
 """
 
 
-def test_the_base_package_and_scripted_runs_work_without_the_optional_sdk(tmp_path, signed_sum):
+def test_the_package_scripted_runs_and_the_codex_adapter_need_no_agent_sdk(tmp_path, signed_sum):
     import subprocess
     import sys
 
     probe = subprocess.run([sys.executable, "-c", NO_SDK, str(signed_sum.__file__), str(tmp_path / "ws"),
-                            str(tmp_path / "bundles")], capture_output=True, text=True, timeout=120,
-                           env={**__import__("os").environ, "OPENAI_AGENTS_DISABLE_TRACING": "1"})
+                            str(tmp_path / "bundles")], capture_output=True, text=True, timeout=120)
     assert probe.returncode == 0, probe.stderr
-    assert json.loads(probe.stdout.strip().splitlines()[-1]) == {"state": "FROZEN", "code": "UNSUPPORTED_CAPABILITY",
+    assert json.loads(probe.stdout.strip().splitlines()[-1]) == {"state": "FROZEN", "adapter": "codex_cli",
                                                                  "loaded": []}
 
 

@@ -12,9 +12,10 @@ tools: actions are named after the MCP tools and take the same arguments,
 and an observation carries the same ``result`` object a tool returns (or the
 same domain error body).
 
-Controllers that run a complete SDK tool loop use the separate
+Agent controllers, which run their own complete tool loop, use the separate
 ``AgentAdapter.run`` contract (``wse.agent_adapters.base``); a strategy is
-never nested inside an SDK loop by the runner.
+never nested inside an agent's loop by the runner (the Codex stand-in, a
+test double, plays a strategy through the MCP tools instead).
 
 Strategies are registered extensions (kind ``"strategy"``): the registered
 implementation is a factory, usually the strategy class, that accepts the

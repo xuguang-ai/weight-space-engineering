@@ -2,8 +2,8 @@
 
 Every test starts ``wse serve`` as a stdio subprocess and talks to it with an
 MCP client, never calling services directly: the official SDK client
-(``mcp.Client``) for the protocol tests, and OpenAI Agents SDK's
-``MCPServerStdio`` for the actual-host connection test. Operator setup
+(``mcp.Client``) for the protocol tests, and the Codex CLI (with a local
+scripted model endpoint) for the actual-host connection test. Operator setup
 (importing models, registering the task, policies, and suites, granting
 runs, freezing, final evaluation) happens outside the server, as it does in
 a trial. Every server and worker process is stopped when its client context
@@ -125,7 +125,7 @@ def _serve_args(workspace: Path, run_id: str, *, worker: bool, extra: tuple[str,
 
 
 def _env() -> dict[str, str]:
-    return {**os.environ, "PYTHONPATH": str(TESTS_DIR), "OPENAI_AGENTS_DISABLE_TRACING": "1"}
+    return {**os.environ, "PYTHONPATH": str(TESTS_DIR)}
 
 
 @asynccontextmanager
@@ -762,50 +762,72 @@ def test_managed_sdk_cli_and_mcp_agree_on_patches_policy_decisions_and_usage(eng
         assert mcp_report[field] == sdk_report.model_dump(mode="json")[field], field
 
 
-# -- an actual MCP host: OpenAI Agents SDK's stdio client -------------------------------------------------------
+# -- an actual MCP host: the Codex CLI ---------------------------------------------------------------------------
 
 
-def test_openai_agents_sdk_stdio_client_connects_and_sees_verbatim_tools(trial, tmp_path, monkeypatch):
-    monkeypatch.setenv("OPENAI_AGENTS_DISABLE_TRACING", "1")
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    agents = pytest.importorskip("agents", reason="the optional agents-openai extra is not installed")
-    from agents.mcp import MCPServerStdio
-
+def test_the_codex_cli_connects_and_offers_every_tool_verbatim(trial, tmp_path, monkeypatch):
+    """Codex 0.167 as the host, with a local scripted model endpoint: skipped without a Codex signed by OpenAI."""
     import asyncio
-    from importlib.metadata import version
 
-    params = {"command": sys.executable,
-              "args": _serve_args(tmp_path / "workspace", trial["run_id"], worker=False), "env": _env()}
-    observed: dict[str, Any] = {}
+    from wse.agent_adapters.base import AgentConfig, RunConnection
+    from wse.agent_adapters.codex_cli import PROXY_TOKEN_ENV, CodexCLIAdapter, find_codex
+    from wse.schemas import WSEError
+
+    if sys.platform != "darwin":
+        pytest.skip("needs macOS and a Codex CLI signed by OpenAI")
+    try:
+        binary = find_codex()
+    except WSEError:
+        pytest.skip("needs a Codex CLI signed by OpenAI")
+    sys.path.insert(0, str(TESTS_DIR))
+    from codex_fake_model import FakeResponses, message, wse_call
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    token = "wse-proxy-token-for-the-host-test"
+    fake = FakeResponses([[wse_call("wse_list_models", {}, 1)], [message("WSE-STOP: listed.", 2)]],
+                         token=token).start()
+    workspace = tmp_path / "workspace"
+    connection = RunConnection(workspace=str(workspace), run_id=trial["run_id"], experiment_id="exp_host_check",
+                               task_id=trial["task_id"], policy_id=trial["policy_id"],
+                               serve_command=[sys.executable, *_serve_args(workspace, trial["run_id"], worker=False)],
+                               serve_env={k: v for k, v in _env().items() if k in ("PATH", "HOME", "PYTHONPATH")},
+                               cwd=str(workspace), allowed_tools=sorted(TOOL_NAMES), instructions="List the models.",
+                               initial_message="Begin.", constraint_status="unverified")
+    config = AgentConfig(model="gpt-5.6-luna", wall_clock_seconds=300)
+    adapter = CodexCLIAdapter(codex_path=binary.path, provider_config=fake.provider_config(PROXY_TOKEN_ENV),
+                              proxy_token=token, log_dir=tmp_path / "logs")
 
     async def body():
-        server = MCPServerStdio(params, name="wse", client_session_timeout_seconds=60)
+        await adapter.start(connection, config)
         try:
-            await server.connect()
-            tools = await server.list_tools()
-            observed["names"] = [tool.name for tool in tools]
-            result = await server.call_tool("wse_list_models", {})
-            observed["result"] = result
-            observed["protocol_version"] = getattr(server.session, "protocol_version", None)
+            return await adapter.run(connection.experiment_id, config, lambda event: None)
         finally:
-            await server.cleanup()
+            await adapter.close(connection.experiment_id)
 
-    asyncio.run(body())
-    assert sorted(observed["names"]) == sorted(TOOL_NAMES)  # forwarded verbatim
-    result = observed["result"]
-    assert not result.is_error and result.structured_content is not None
-    assert json.loads(result.content[0].text) == result.structured_content
-    assert result.structured_content["result"]["models"][0]["checkpoint_id"] == trial["task_checkpoint_id"]
-    print(f"actual host: openai-agents {version('openai-agents')} with mcp {version('mcp')}; negotiated protocol "
-          f"{observed['protocol_version']}")
-    assert observed["protocol_version"] == "2026-07-28"
-    assert agents is not None
+    try:
+        result = asyncio.run(body())
+    finally:
+        fake.stop()
+    assert result.status == "completed", result.reason
+    offered = {tool["name"]: [t["name"] for t in tool.get("tools", [])]
+               for item in fake.requests[0]["body"]["input"] if item.get("type") == "additional_tools"
+               for tool in item["tools"]}
+    assert sorted(offered["mcp__wse"]) == sorted(TOOL_NAMES)  # forwarded verbatim, as functions with schemas
+    items = [json.loads(line)["item"] for segment in result.provider_metadata["segments"]
+             for line in Path(segment["log"]).read_text().splitlines()
+             if json.loads(line).get("type") == "item.completed"]
+    (call,) = [item for item in items if item.get("type") == "mcp_tool_call"]
+    assert call["tool"] == "wse_list_models" and call["status"] == "completed"
+    structured = call["result"]["structured_content"]
+    assert json.loads(call["result"]["content"][0]["text"]) == structured
+    assert structured["result"]["models"][0]["checkpoint_id"] == trial["task_checkpoint_id"]
+    print(f"actual host: {binary.version} with mcp {__import__('importlib.metadata').metadata.version('mcp')}")
 
 
 # -- module boundaries and legacy hosts ---------------------------------------------------------------------------
 
 
-def test_only_the_mcp_module_imports_the_mcp_sdk_and_only_the_openai_adapter_imports_an_agent_sdk_lazily():
+def test_only_the_mcp_module_imports_the_mcp_sdk_and_no_module_imports_an_agent_sdk():
     root = TESTS_DIR.parent / "src" / "wse"
     sources = sorted(root.rglob("*.py"))
     importers = {path.name for path in sources
@@ -814,12 +836,11 @@ def test_only_the_mcp_module_imports_the_mcp_sdk_and_only_the_openai_adapter_imp
     agent_sdk = r"(?:from|import)\s+(?:agents|openai|claude_agent_sdk)\b"
     importers = {path.relative_to(root).as_posix() for path in sources
                  if re.search(r"^\s*" + agent_sdk, path.read_text(encoding="utf-8"), re.M)}
-    assert importers == {"agent_adapters/openai_agents.py"}
-    adapter = (root / "agent_adapters" / "openai_agents.py").read_text(encoding="utf-8")
-    assert not re.search(r"^" + agent_sdk, adapter, re.M)  # only inside functions: imported lazily
+    assert importers == set()  # agents run in the Codex CLI, a separate program
     probe = subprocess.run([sys.executable, "-c", "import sys, wse, wse.mcp_server, wse.runner, wse.cli, "
-                            "wse.agent_adapters.openai_agents; print(sorted(m for m in sys.modules "
-                            "if m.split('.')[0] in ('agents', 'openai', 'claude_agent_sdk')))"],
+                            "wse.agent_adapters.codex_cli, wse.agent_adapters.codex_test_double; "
+                            "print(sorted(m for m in sys.modules if m.split('.')[0] in "
+                            "('agents', 'openai', 'claude_agent_sdk')))"],
                            capture_output=True, text=True, env=_env(), timeout=60)
     assert probe.returncode == 0 and probe.stdout.strip() == "[]", probe.stderr
 

@@ -1,26 +1,26 @@
 """The vendor-neutral ``AgentAdapter`` contract (Section 1.3 of the plan).
 
-An agent adapter runs one SDK's complete conversation/tool loop against the
-WSE MCP server of one run grant, reports normalized events and usage, and
-propagates cancellation. It owns no weight versions, evaluation results, or
-budgets: it never selects a checkpoint, freezes, or closes an experiment.
+An agent adapter runs one agent host's complete conversation/tool loop
+(``codex_cli@1``: the Codex CLI) against the WSE MCP server of one run grant,
+reports normalized events and usage, and propagates cancellation. It owns no
+weight versions, evaluation results, or budgets: it never selects a
+checkpoint, freezes, or closes an experiment.
 
 The reference runner (``wse.runner``) drives an adapter through its
-lifecycle, so the MCP connection and server outlive the SDK loop until the
+lifecycle, so the evaluation worker outlives the agent's loop until the
 runner has settled pending jobs and frozen the experiment:
 
-1. ``await adapter.start(connection, agent_config)`` starts the stdio server
-   bound to the run grant and connects to it. A failure is remembered and
-   reported by ``run`` as ``connection_failed``.
+1. ``await adapter.start(connection, agent_config)`` prepares the agent's
+   connection to the stdio server bound to the run grant. A failure is
+   remembered and reported by ``run`` as ``connection_failed``.
 2. ``await adapter.run(experiment_id, agent_config, event_sink)`` runs the
-   SDK loop to its end and returns an ``AgentRunResult``.
+   agent's loop to its end and returns an ``AgentRunResult``.
    ``adapter.cancel(experiment_id, reason)`` (thread-safe) stops a running
    loop, or a loop that has not started yet; the result then reports
    ``stopped`` with that reason.
 3. The runner settles jobs and freezes, then ``await adapter.close(...)``.
 
-This module imports no agent SDK; ``wse.agent_adapters.openai_agents``
-imports OpenAI Agents SDK lazily, inside its methods.
+This module imports no agent host and no agent SDK.
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ TerminationStatus = Literal["completed", "stopped", "max_turns", "timeout", "can
 def describe_exception(exc: BaseException, limit: int = 2000) -> str:
     """``Type: message`` of an exception, or of the innermost exceptions of an exception group.
 
-    SDK and transport failures usually arrive wrapped in task-group
+    Host and transport failures usually arrive wrapped in task-group
     exception groups whose own message ("unhandled errors in a TaskGroup")
     names no cause, so the leaves are reported instead.
     """
@@ -73,18 +73,20 @@ def describe_exception(exc: BaseException, limit: int = 2000) -> str:
 
 
 class AgentConfig(_Frozen):
-    """Operator configuration of an SDK-backed controller.
+    """Operator configuration of an agent controller.
 
-    ``model`` is the operator-chosen model name (credentials come from the
-    SDK's normal environment configuration and are never recorded).
-    ``max_turns`` and ``wall_clock_seconds`` are the pilot controller limits
-    (100 SDK turns, 900 s), independent of WSE's computation budget.
-    A ``benchmark`` configuration must disable SDK tracing, because the SDK
-    exports traces, including tool inputs and outputs, by default.
+    ``adapter`` names the agent host (``codex_cli@1``, the Codex CLI);
+    ``model`` is the operator-chosen model name (credentials stay with the
+    operator's process and are never recorded). ``max_turns`` (model
+    requests) and ``wall_clock_seconds`` are the controller's limits (100
+    requests, 900 s), independent of WSE's computation budget.
+    ``tracing_disabled`` keeps the host's own telemetry off; a ``benchmark``
+    configuration must keep it off, because tool inputs and outputs must not
+    leave the machine.
     """
 
     kind: Literal["agent"] = "agent"
-    adapter: str = Field(default="openai_agents@1", pattern=r"^[a-z][a-z0-9_]{0,63}@[0-9.]{1,20}$")
+    adapter: str = Field(default="codex_cli@1", pattern=r"^[a-z][a-z0-9_]{0,63}@[0-9.]{1,20}$")
     model: str = Field(min_length=1, max_length=200)
     max_turns: int = Field(default=DEFAULT_MAX_TURNS, ge=1, le=10_000)
     wall_clock_seconds: float = Field(default=DEFAULT_WALL_CLOCK_SECONDS, gt=0, allow_inf_nan=False)
@@ -97,7 +99,7 @@ class AgentConfig(_Frozen):
     @model_validator(mode="after")
     def _benchmark_disables_tracing(self) -> AgentConfig:
         if self.benchmark and not self.tracing_disabled:
-            raise ValueError("benchmark runs must disable SDK tracing (tracing_disabled=true)")
+            raise ValueError("benchmark runs must disable the agent host's tracing (tracing_disabled=true)")
         return self
 
 
@@ -174,7 +176,7 @@ EventSink = Callable[[AgentEvent], None]
 
 
 class AgentRunResult(_Frozen):
-    """How an SDK loop ended. It selects no checkpoint and closes nothing."""
+    """How an agent's loop ended. It selects no checkpoint and closes nothing."""
 
     status: TerminationStatus
     reason: str
@@ -188,18 +190,18 @@ class AgentRunResult(_Frozen):
 
 
 class AgentAdapter(abc.ABC):
-    """Runs one SDK's tool loop for one experiment at a time (see the module docstring)."""
+    """Runs one agent host's tool loop for one experiment at a time (see the module docstring)."""
 
     adapter_id: str
     version: str
 
     @abc.abstractmethod
     async def start(self, connection: RunConnection, agent_config: AgentConfig) -> None:
-        """Start and connect the run's MCP server; remember a failure for ``run`` to report."""
+        """Prepare the agent's connection to the run's MCP server; remember a failure for ``run`` to report."""
 
     @abc.abstractmethod
     async def run(self, experiment_id: str, agent_config: AgentConfig, event_sink: EventSink) -> AgentRunResult:
-        """Run the SDK loop to its end and report how it ended."""
+        """Run the agent's loop to its end and report how it ended."""
 
     @abc.abstractmethod
     def cancel(self, experiment_id: str, reason: str = "cancelled") -> None:
@@ -207,4 +209,4 @@ class AgentAdapter(abc.ABC):
 
     @abc.abstractmethod
     async def close(self, experiment_id: str) -> None:
-        """Disconnect and stop the MCP server (after the runner has frozen the experiment)."""
+        """Release what ``start`` began, such as the run's worker (after the runner has frozen the experiment)."""

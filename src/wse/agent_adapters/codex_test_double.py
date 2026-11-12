@@ -14,7 +14,7 @@ adapter's whole path runs without a model or the network:
 * the model name ``wse-test-double:<strategy>@<version>`` names a registered
   stepwise strategy (resolved with the built-in registry and the server's
   ``--setup`` hooks), which chooses every tool call from the tool results so
-  far, as the SDK test double does: the first call reads the experiment, and
+  far: the first call reads the experiment, and
   a ``stop`` action becomes the final message ``WSE-STOP: <reason>``;
 * it prints Codex-shaped JSONL events (``thread.started``, ``turn.started``,
   ``item.started``/``item.completed`` of ``mcp_tool_call`` items,
@@ -23,7 +23,16 @@ adapter's whole path runs without a model or the network:
   ``$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<time>-<session>.jsonl``;
   usage is synthetic (about four characters per token);
 * a session keeps its observations in ``$CODEX_HOME/test-double/<session>.json``,
-  so ``exec resume`` continues where the session stopped.
+  so ``exec resume`` continues where the session stopped, and each segment
+  appends what the model would be shown (the prompt and the offered tools
+  with their schemas) to ``<session>.requests.jsonl`` next to it.
+
+A script in place of a strategy (``WSE_CODEX_TEST_DOUBLE`` with ``"script"``,
+for tests of the adapter; any model name) plays fixed steps, one per model
+request: ``["call", tool, arguments]``, ``["say", text]`` (a final message),
+``["sleep", seconds]`` and ``["interrupt", seconds]`` (SIGINT to the runner,
+this process's parent, as from the operator's Ctrl-C), each followed by the
+final message ``done``. After its end the script repeats its last step.
 
 ``WSE_CODEX_TEST_DOUBLE`` (JSON) adds behaviors for tests of the adapter:
 ``end_turn_after`` (end the first segment after that many calls without
@@ -91,6 +100,7 @@ class Session:
         self.observations: list[dict[str, Any]] = state.get("observations", [])
         self.segments: int = int(state.get("segments", 0)) + 1
         self.calls: int = int(state.get("calls", 0))
+        self.step: int = int(state.get("step", 0))
         self.usage: dict[str, int] = state.get("usage") or {"input_tokens": 0, "cached_input_tokens": 0,
                                                              "cache_write_input_tokens": 0, "output_tokens": 0,
                                                              "reasoning_output_tokens": 0}
@@ -106,7 +116,8 @@ class Session:
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps({"observations": self.observations, "segments": self.segments,
-                                         "calls": self.calls, "usage": self.usage, "rollout": str(self.rollout)}))
+                                         "calls": self.calls, "step": self.step, "usage": self.usage,
+                                         "rollout": str(self.rollout)}))
 
     def charge(self, prompt_chars: int, produced_chars: int, record: bool, item: dict[str, Any] | None = None) -> None:
         """Count one model request; with ``record``, append its response item and usage to the session record."""
@@ -145,7 +156,7 @@ def strategy_for(model: str, server: dict[str, Any]) -> Any:
 
 
 def observe(tool: str, arguments: dict[str, Any], text: str, is_error: bool) -> dict[str, Any]:
-    """An ``Observation`` (as JSON) of one tool result, as the SDK test double builds it."""
+    """An ``Observation`` (as JSON) of one tool result, as a strategy receives it from the runner."""
     if is_error:
         body = text.split(": ", 1)[1] if ": " in text else text
         try:
@@ -181,7 +192,7 @@ def next_action(strategy: Any, observations: list[dict[str, Any]]) -> Any:
 
 
 class StdioClient:
-    """A minimal MCP client over stdio (JSON-RPC 2.0, one message per line), as a host other than the SDK speaks it.
+    """A minimal MCP client over stdio (JSON-RPC 2.0, one message per line), as a host other than the MCP SDK speaks it.
 
     It performs the legacy ``initialize`` handshake (protocol 2025-06-18, as
     Codex 0.167 does), lists tools, and calls them. The server runs in a
@@ -196,7 +207,7 @@ class StdioClient:
         self.process: asyncio.subprocess.Process | None = None
         self.next_id = 0
 
-    async def start(self) -> set[str]:
+    async def start(self) -> list[dict[str, Any]]:
         self.process = await asyncio.create_subprocess_exec(
             self.server["command"], *list(self.server.get("args") or []), cwd=self.server.get("cwd"),
             env=dict(self.server.get("env") or {}), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -204,13 +215,13 @@ class StdioClient:
         await self.request("initialize", {"protocolVersion": self.PROTOCOL, "capabilities": {},
                                           "clientInfo": {"name": "wse-codex-test-double", "version": "1"}})
         await self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        names, cursor = set(), None
+        tools, cursor = [], None
         while True:
             listed = await self.request("tools/list", {"cursor": cursor} if cursor else {})
-            names |= {tool["name"] for tool in listed.get("tools", [])}
+            tools += [tool for tool in listed.get("tools", []) if isinstance(tool, dict)]
             cursor = listed.get("nextCursor")
             if not cursor:
-                return names
+                return tools
 
     async def send(self, message: dict[str, Any]) -> None:
         assert self.process is not None and self.process.stdin is not None
@@ -260,7 +271,6 @@ class StdioClient:
 async def drive(options: dict[str, Any], config: dict[str, Any], session: Session, behavior: dict[str, Any]) -> int:
     server = config["mcp_servers"]["wse"]
     enabled = set(server.get("enabled_tools") or [])
-    strategy = strategy_for(options["model"], server)
     record = not behavior.get("no_rollout")
     first_segment = session.segments == 1
     client = StdioClient(server)
@@ -271,16 +281,39 @@ async def drive(options: dict[str, Any], config: dict[str, Any], session: Sessio
             print(f"Error: thread/start failed: required MCP servers failed to initialize: wse: {exc!r}",
                   file=sys.stderr)
             return 1
+        strategy = None
+        if behavior.get("script") is None:  # the model, like Codex's, matters only once the session exists
+            if not str(options["model"] or "").startswith(PREFIX):
+                print(f"Error: the Codex test double needs a model {PREFIX}<strategy>@<version> or a script, got "
+                      f"{options['model']!r}", file=sys.stderr)
+                return 2
+            strategy = strategy_for(options["model"], server)
         return await converse(client, listed, enabled, strategy, options, session, behavior, first_segment, record)
     finally:
         await client.close()
 
 
-async def converse(client: Any, listed: set[str], enabled: set[str], strategy: Any, options: dict[str, Any],
-                   session: Session, behavior: dict[str, Any], first_segment: bool, record: bool) -> int:
-    """One turn: tool calls chosen by the strategy until it stops, a behavior ends the turn, or a signal."""
+def script_step(script: list[list[Any]], session: Session) -> list[Any]:
+    """The next step of a script; after its end, its last step again."""
+    step = script[min(session.step, len(script) - 1)]
+    session.step += 1
+    return list(step)
+
+
+async def converse(client: Any, tools: list[dict[str, Any]], enabled: set[str], strategy: Any,
+                   options: dict[str, Any], session: Session, behavior: dict[str, Any], first_segment: bool,
+                   record: bool) -> int:
+    """One turn: the calls of the strategy or the script until it stops, a behavior ends the turn, or a signal."""
+    from wse.strategies.base import Action
+
     emit({"type": "thread.started", "thread_id": session.id})
     emit({"type": "turn.started"})
+    listed = {tool.get("name") for tool in tools}
+    offered = [tool for tool in tools if not enabled or tool.get("name") in enabled]
+    with (session.home / "test-double" / f"{session.id}.requests.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"segment": session.segments, "model": options["model"],
+                                 "prompt": options.get("prompt"), "tools": offered}) + "\n")
+    script = behavior.get("script")
     missing = sorted(enabled - listed)
     if missing:
         emit({"type": "error", "message": f"MCP server wse does not offer the enabled tools {missing}"})
@@ -308,7 +341,25 @@ async def converse(client: Any, listed: set[str], enabled: set[str], strategy: A
                 signal.signal(signal.SIGTERM, signal.SIG_IGN)
             await asyncio.sleep(3600)
         await asyncio.sleep(float(behavior.get("request_seconds", 0)))  # the latency of a model request
-        action = next_action(strategy, session.observations)
+        if script is not None:
+            step = script_step(script, session)
+            if step[0] in ("sleep", "interrupt"):  # one model request that takes this long, then says "done"
+                session.charge(prompt_chars, 4, record, {"type": "message", "role": "assistant"})
+                if step[0] == "interrupt":  # the operator's Ctrl-C reaches the runner, this process's parent
+                    os.kill(os.getppid(), signal.SIGINT)
+                await asyncio.sleep(float(step[1]))
+                emit({"type": "item.completed", "item": {"id": f"item_{calls}", "type": "agent_message",
+                                                         "text": "done"}})
+                break
+            if step[0] == "say":
+                text = str(step[1])
+                session.charge(prompt_chars, len(text), record, {"type": "message", "role": "assistant"})
+                emit({"type": "item.completed", "item": {"id": f"item_{calls}", "type": "agent_message",
+                                                         "text": text}})
+                break
+            action = Action(kind="call", tool=str(step[1]), arguments=dict(step[2]))
+        else:
+            action = next_action(strategy, session.observations)
         if action.kind == "stop":
             text = f"{STOP_MARKER}: {action.reason}"
             session.charge(prompt_chars, len(text), record, {"type": "message", "role": "assistant"})
@@ -342,13 +393,9 @@ def main(argv: list[str] | None = None) -> int:
     home = Path(os.environ["CODEX_HOME"])
     config = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))
     options["model"] = options["model"] or config.get("model")
-    if not str(options["model"] or "").startswith(PREFIX):
-        print(f"the Codex test double needs a model {PREFIX}<strategy>@<version>, got {options['model']!r}",
-              file=sys.stderr)
-        return 2
+    behavior = json.loads(os.environ.get("WSE_CODEX_TEST_DOUBLE") or "{}")
     if options["cd"]:
         os.chdir(options["cd"])
-    behavior = json.loads(os.environ.get("WSE_CODEX_TEST_DOUBLE") or "{}")
     session = Session(home, options["session_id"])
     session.save()
     try:

@@ -16,11 +16,11 @@ drives one trial on an operator-prepared workspace:
      The runner owns the evaluation worker for these runs: it starts one
      whenever the policy grants jobs (evaluation batches, generation passes,
      or probes).
-   * An SDK-backed agent (``AgentConfig``, the OpenAI Agents SDK adapter in
-     M1) runs its own complete tool loop against ``wse serve`` bound to the
-     run grant. That server process is the sole job-scheduler owner; the
-     runner starts no worker. The runner only listens to the adapter's
-     normalized events, persists them, and checks stop conditions.
+   * An agent (``AgentConfig``; the adapter ``codex_cli@1`` runs the Codex
+     CLI) runs its own complete tool loop against ``wse serve`` bound to the
+     run grant; the adapter owns the run's evaluation worker. The runner only
+     listens to the adapter's normalized events, persists them, and checks
+     stop conditions.
 
 3. **Stop conditions** are read from authoritative WSE state after every
    operation: a budget error (insufficient budget for the next operation,
@@ -36,13 +36,13 @@ drives one trial on an operator-prepared workspace:
    controller.
 4. **Finalize after the controller exits.** The runner cancels and settles
    every outstanding job (recovering jobs whose worker was lost), then
-   freezes the selected checkpoint, while an SDK adapter's MCP server stays
-   connected; only then is the adapter closed. Neither the SDK nor the runner
+   freezes the selected checkpoint, while an agent adapter's worker still
+   runs; only then is the adapter closed. Neither the agent nor the runner
    closes an experiment: final evaluation (``wse final-evaluate``) is a
    separate operator step. This holds however the controller ends, including
    a failure inside the runner (status ``error``) and an operator interrupt:
    the first Ctrl-C (SIGINT) while a controller runs stops it at its next
-   step or cancels the SDK loop, the trial is recorded as ``cancelled`` with
+   step or cancels the agent's loop, the trial is recorded as ``cancelled`` with
    the stop condition ``operator_interrupt``, and ``KeyboardInterrupt`` is
    raised to the caller only after the experiment is settled and frozen.
    A second Ctrl-C aborts at once and can leave the experiment open.
@@ -149,8 +149,7 @@ SANDBOX_TIME_LABEL = "sandbox wall-clock time (not metered computation)"
 SERVE_ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "PYTHONPATH", "VIRTUAL_ENV",
                        "SYSTEMROOT")
 SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE)
-AGENT_ADAPTERS = {"openai_agents@1": ("wse.agent_adapters.openai_agents", "OpenAIAgentsAdapter"),
-                  "codex_cli@1": ("wse.agent_adapters.codex_cli", "CodexCLIAdapter")}
+AGENT_ADAPTERS = {"codex_cli@1": ("wse.agent_adapters.codex_cli", "CodexCLIAdapter")}
 
 
 class StrategyConfig(_Frozen):
@@ -743,7 +742,7 @@ class _OperatorInterrupt:
     """While a controller runs, the first SIGINT requests a graceful stop; a second one raises at once.
 
     ``requested`` is polled by the strategy loop; an agent run registers a
-    callback (``on_request``) that cancels the SDK loop from the event loop.
+    callback (``on_request``) that cancels the agent's loop from the event loop.
     The handler is installed only in the main thread and is restored on exit.
     """
 
@@ -792,7 +791,7 @@ class ReferenceRunner:
     ``worker_args`` are extra worker options; ``serve_env`` adds variables
     to the allow-listed server environment (never credentials);
     ``adapter_factory(config, experiment_id)`` overrides adapter creation
-    (for example to supply an SDK test double). With ``baseline``, the base
+    (for example to supply a test double). With ``baseline``, the base
     checkpoint is evaluated on the task's full development suite before the
     controller starts (``Engine.ensure_baseline`` reuses an identical earlier
     evaluation when the engine provides it), and the instructions name that
@@ -1066,7 +1065,7 @@ class ReferenceRunner:
                               usage=usage, provider_metadata={"controller": "strategy",
                                                               "execution_channels": ["wse_engine_run_bound"]}), stop
 
-    # -- SDK-backed agents ---------------------------------------------------------------------
+    # -- agents --------------------------------------------------------------------------------
 
     def _make_adapter(self, config: AgentConfig, eid: str) -> AgentAdapter:
         if self.adapter_factory is not None:
@@ -1078,14 +1077,10 @@ class ReferenceRunner:
 
         module_name, class_name = AGENT_ADAPTERS[ref]
         adapter_class = getattr(importlib.import_module(module_name), class_name)
-        if config.model.startswith(TEST_DOUBLE_PREFIX):
+        if config.model.startswith(TEST_DOUBLE_PREFIX):  # the adapter's offline stand-in, driven by a strategy
             strategy_ref = self.registry.resolve_reference("strategy", config.model[len(TEST_DOUBLE_PREFIX):])
             strategy = self.registry.resolve("strategy", strategy_ref.extension_id, strategy_ref.version)()
-            if hasattr(adapter_class, "test_double"):  # an adapter with its own offline stand-in (codex_cli@1)
-                return adapter_class.test_double(strategy)
-            from wse.agent_adapters.openai_agents import strategy_model
-
-            return adapter_class(model=strategy_model(strategy, experiment_id=eid))
+            return adapter_class.test_double(strategy)
         return adapter_class()
 
     def serve_log(self, run_id: str) -> str:

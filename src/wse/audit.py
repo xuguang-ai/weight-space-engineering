@@ -320,7 +320,7 @@ class ReplayResult(_Frozen):
 
 def _package_versions() -> dict[str, str | None]:
     versions: dict[str, str | None] = {}
-    for package in ("wse", "torch", "numpy", "safetensors", "pydantic", "mcp", "openai-agents", "openai"):
+    for package in ("wse", "torch", "numpy", "safetensors", "pydantic", "mcp"):
         try:
             versions[package] = version(package)
         except PackageNotFoundError:

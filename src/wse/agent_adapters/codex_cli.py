@@ -961,6 +961,22 @@ class CodexCLIAdapter(AgentAdapter):
         options.setdefault("provider_config", {})
         return cls(model=_TestDoubleModel(strategy), **options)
 
+    @classmethod
+    def scripted(cls, script: Sequence[Sequence[Any]], **options: Any) -> CodexCLIAdapter:
+        """The offline stand-in playing fixed steps instead of a strategy, for tests of the adapter.
+
+        Steps are ``("call", tool, arguments)``, ``("say", text)``,
+        ``("sleep", seconds)``, and ``("interrupt", seconds)``
+        (``wse.agent_adapters.codex_test_double``); any model name works. A
+        final message ends the run unless ``max_resumes`` is given, as a
+        scripted model's final answer would.
+        """
+        env = dict(options.pop("extra_env", None) or {})
+        behavior = json.loads(env.get("WSE_CODEX_TEST_DOUBLE") or "{}")
+        env["WSE_CODEX_TEST_DOUBLE"] = json.dumps({**behavior, "script": [list(step) for step in script]})
+        options.setdefault("max_resumes", 0)
+        return cls.test_double(None, extra_env=env, **options)
+
     # -- lifecycle ---------------------------------------------------------------------
 
     def _binary(self) -> CodexBinary:
