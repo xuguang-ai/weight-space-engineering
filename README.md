@@ -34,6 +34,22 @@ Each example names the optional extra it needs, and `uv run --extra NAME` instal
 
 Asked 32 GSM8K practice problems with room for 8,192 new tokens, Qwen3.5-0.8B finishes 2 answers. The other 30 run into the limit, and 24 of those end by repeating the same lines. The four steps below measure this, look at the weights and activations of two MLP layers, edit those weights, and compare the edited model with the original on the same problems: 10 answers correct instead of 2, and 21 cut off instead of 30.
 
+Workflow overview: the shape of the four calls, with their arguments left out as `...`. It does not run on its own; the complete script follows.
+
+```python
+# Workflow overview (arguments left out; not runnable)
+base = WSE.from_pretrained("Qwen/Qwen3.5-0.8B", ...)
+
+# Diagnose
+run = base.evaluate(...)
+# Probe
+probe = base.probe(run, ...)
+# Edit
+edit = base.edit(...)
+# Evaluate
+comparison = base.compare(edit.save().model, ...)
+```
+
 The edit is recovered from p50c, the edit that GPT-6 Astra made in [Sparks of Weight-Space Programming: LLMs can natively read & write neural network weights](https://rikiyat.github.io/blog/weight-space-programming/) (Takehi, Teoh, Zhang, and Khattab, 2026): its layers, columns, and direction come from p50c's published change, so these steps reconstruct that repair rather than discover it.
 
 The script needs about 3 GB of disk and a Mac with Apple silicon: WSE generates text on Apple's MPS, or on the CPU, which is about 170 times slower. On an M4 Pro it took 1 hour 54 minutes, almost all of it in three generation passes of about 37 minutes each.
@@ -59,7 +75,7 @@ curl -L --create-dirs -o "$M/gsm8k/train.jsonl" \
 
 </details>
 
-The four steps are one script, [examples/p50c_four_steps.py](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/p50c_four_steps.py):
+**Run the complete script; the blocks below are a step-by-step walkthrough of it.** The script is [examples/p50c_four_steps.py](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/p50c_four_steps.py). Two helpers it calls, `ends_in_loop` and `recover`, sit in folded blocks, so the visible code alone does not run:
 
 ```bash
 uv run --extra models-hf python examples/p50c_four_steps.py ~/wse-data
@@ -150,6 +166,8 @@ mean_generated_tokens       8063.5 [7843.9, 8192.0]
 The model answers 2 of 32 problems correctly, and 30 answers reach the limit. The first of them, to problem `gsm8k_27`, asks itself the same two questions, about which download round 400 files belong to, from line 250 of its 369 lines until the limit.
 
 ### 2. Probe
+
+> **This walkthrough reconstructs a known intervention.** The probe examines its activation signature; it does not discover where or how to edit.
 
 Import p50c with `apply_patch`, which checks every tensor against its published SHA-256, and read where it changes the weights. `recover` takes the columns that p50c changes in one layer and the direction it acts on there, the top singular vector of its change. The probe then reads the activations at the output of those layers over the last 1,024 tokens of each answer, and contrasts the cut-off answers with the finished ones.
 
@@ -273,7 +291,7 @@ An agent edits weights through the same operations. The runner starts a `wse ser
 
 The example below repairs a classifier with 22 parameters, small enough for an agent to finish in under a minute. No LLM agent has run the Qwen experiment yet: a generation pass there takes about 37 minutes, and an agent waits for it by calling `wse_get_job`, which returns within 10 seconds. One pass therefore costs about 220 tool calls, which by our estimate fill a 128,000-token context before the pass ends. A scripted controller has run the Qwen reconstruction through the same MCP server ([results](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/results.md#4-through-the-mcp-tools-with-scripted-controllers)).
 
-The six steps are one script, [examples/signed_sum/agent_api.py](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/signed_sum/agent_api.py), and each is a piece you replace for your own experiment. The script takes a new directory and, for a live agent, `--model`, and opens a workspace in that directory with `Engine`.
+The six steps are one script, [examples/signed_sum/agent_api.py](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/signed_sum/agent_api.py), and each is a piece you replace for your own experiment. **Run the complete script; the steps below are a walkthrough of it.** Its setup, the longer definitions, and the result-reading code sit in folded blocks, so the visible code alone does not run. The script takes a new directory and, for a live agent, `--model`, and opens a workspace there with `Engine`.
 
 <details>
 <summary>The start of the script: imports, arguments, and the workspace</summary>
