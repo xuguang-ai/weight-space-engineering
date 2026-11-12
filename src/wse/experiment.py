@@ -299,7 +299,7 @@ class Experiment:
         config = parse_agent(agent, max_turns=max_turns if max_turns is not None else DEFAULT_MAX_TURNS,
                              wall_clock_seconds=3600.0 * (wall_clock_hours or DEFAULT_WALL_CLOCK_HOURS))
         root = Path(engine.store.workspace)
-        out = Path(out_dir).expanduser() if out_dir is not None else root / "experiments" / grant.run_id
+        out = (Path(out_dir).expanduser() if out_dir is not None else root / "experiments" / grant.run_id).resolve()
         runner = ReferenceRunner(root, registry=engine.registry, log_dir=out / "logs", baseline=True,
                                  worker_args=["--device", device] if device else ())
         try:

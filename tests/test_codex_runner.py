@@ -639,3 +639,21 @@ def test_the_search_prefers_path_then_the_newest_extension_bundle(tmp_path, monk
     assert [path.parts[-4] for _, path in found[1:]] == ["openai.chatgpt-26.1106.51428-darwin-arm64",
                                                          "openai.chatgpt-26.1021.22027-darwin-arm64",
                                                          "openai.chatgpt-26.1007.21434-darwin-arm64"]
+
+
+def test_a_runner_given_relative_paths_hands_codex_absolute_ones(engine, workspace, prepared, monkeypatch):
+    """Experiment passes paths as the user wrote them; Codex starts in the sandbox, so every path must be absolute."""
+    monkeypatch.chdir(workspace.parent)
+    run_id = engine.grant_run(prepared["task_id"], WEIGHTS_ONLY_POLICY_ID, prepared["task_checkpoint_id"]).run_id
+    runner = ReferenceRunner(Path(workspace.name), setup=["wse_test_plugins:setup"], worker_args=FAST_WORKER,
+                             serve_env={"PYTHONPATH": str(TESTS_DIR)}, settle_timeout_seconds=60,
+                             log_dir=Path("relative-logs"))
+    eid = runner.run_experiment(run_id, prepared["task_id"], WEIGHTS_ONLY_POLICY_ID,
+                                {"kind": "agent", "adapter": "codex_cli@1", "model": DOUBLE})
+    result = runner.last_result["result"]
+    assert result["status"] in ("stopped", "completed"), result
+    assert engine.get_experiment(eid).state == "FROZEN"
+    home = workspace.parent / "relative-logs" / f"codex-{run_id}" / "home"
+    assert (home / "config.toml").is_file()
+    written = tomllib.loads((home / "config.toml").read_text())
+    assert all(Path(path).is_absolute() for path in written["permissions"]["wse"]["filesystem"] if path[0] != ":")

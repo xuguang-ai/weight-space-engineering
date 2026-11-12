@@ -972,12 +972,17 @@ class CodexCLIAdapter(AgentAdapter):
         return find_codex(self.codex_path, verify=self.verify_signature)
 
     def _log_dir(self, connection: RunConnection) -> Path:
+        """The directory of the run's Codex home and logs, as an absolute path.
+
+        Codex starts in the sandbox directory, where a relative ``CODEX_HOME``
+        or analysis ``PYTHONPATH`` would not resolve.
+        """
         if self.log_dir is not None:
-            return self.log_dir
+            return Path(self.log_dir).expanduser().resolve()
         command = list(connection.serve_command)
         if "--log-file" in command and command.index("--log-file") + 1 < len(command):
-            return Path(command[command.index("--log-file") + 1]).parent
-        return Path(connection.workspace) / "logs"
+            return Path(command[command.index("--log-file") + 1]).expanduser().resolve().parent
+        return (Path(connection.workspace) / "logs").resolve()
 
     def _provider(self, session: _Session) -> tuple[dict[str, Any], str | None]:
         """The model provider fragment and token: the configured ones, else a model proxy started for this run."""

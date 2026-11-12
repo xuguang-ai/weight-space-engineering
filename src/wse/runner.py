@@ -840,7 +840,8 @@ class ReferenceRunner:
         self.serve_env = dict(serve_env or {})
         self.adapter_factory = adapter_factory
         self.settle_timeout_seconds = settle_timeout_seconds
-        self.log_dir = Path(log_dir) if log_dir is not None else self.workspace / "logs"
+        # Absolute, like the workspace: processes started elsewhere (wse serve, Codex) receive these paths.
+        self.log_dir = (Path(log_dir).expanduser() if log_dir is not None else self.workspace / "logs").resolve()
         self.last_result: dict[str, Any] | None = None
         self.last_experiment_id: str | None = None
         self.baseline = bool(baseline)
