@@ -179,3 +179,27 @@ def test_the_agents_inputs_hold_the_baseline_and_never_the_test_data(experiment_
     texts = "\n".join(path.read_text(encoding="utf-8", errors="ignore") for path in layout.root.rglob("*")
                       if path.is_file() and path.suffix in (".json", ".jsonl", ".txt", ".py"))
     assert not any(row["problem"] in texts for row in TEST_ROWS)
+
+
+def test_a_second_run_on_the_same_data_reuses_the_baseline_on_the_workers_device(experiment_setup) -> None:
+    from wse import Experiment
+    from wse.runner import render_instructions
+
+    model, experiment, tmp_path = experiment_setup
+    first = experiment.run(agent="strategy:experiment_check@1", sandbox=None, max_evaluations=3, device="cpu")
+    again = Experiment(model, "Make the model finish more answers.", tmp_path / "dev.jsonl", evaluator="math",
+                       minimize="limit_hit_rate", preserve=["accuracy"], max_new_tokens=6, profile="qwen35think@1")
+    second = again.run(agent="strategy:experiment_check@1", sandbox=None, max_evaluations=3, device="cpu")
+    engine = model.engine
+    [baseline] = [r for r in engine.list_reports(second.experiment_id) if r.checkpoint_id == model.checkpoint_id]
+    first_baseline = engine.list_reports(first.experiment_id)[0]
+    assert baseline.reused_from is not None and baseline.reused_from.report_id == first_baseline.report_id
+    assert baseline.metrics == first_baseline.metrics and baseline.execution.device == "cpu"
+    passes = engine.get_experiment(second.experiment_id).budget["generation_passes"]
+    assert (passes.consumed, passes.limit) == (2, 3)  # the reused baseline is charged as the evaluation it repeats
+    experiment_row = engine.get_experiment(second.experiment_id)
+    task = engine.get_task(experiment_row.task_id)
+    policy = engine.experiments.experiment_policy(second.experiment_id)
+    text = render_instructions(task, policy, experiment_id=second.experiment_id, tools=["wse_evaluate"],
+                               baseline={"report_id": baseline.report_id, "metrics": dict(baseline.metrics)})
+    assert "wse_evaluate on the original model returns this report without charging again" in text
