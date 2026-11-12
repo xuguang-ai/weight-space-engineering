@@ -128,8 +128,9 @@ def job_counters() -> dict[str, int]:
 
 
 def unused_counters() -> dict[str, int]:
-    """Zero for the ledger counters that no job charges: those of synchronous operations."""
-    return {"analysis_calls": 0, "tensor_read_calls": 0, "candidate_commits": 0, "patch_previews": 0}
+    """Zero for the ledger counters that no job charges: those of synchronous operations and the sandbox."""
+    return {"analysis_calls": 0, "tensor_read_calls": 0, "candidate_commits": 0, "patch_previews": 0,
+            "sandbox_calls": 0, "sandbox_seconds": 0}
 
 
 def queued_cancel_usage() -> Usage:

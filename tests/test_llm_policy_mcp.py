@@ -59,6 +59,7 @@ REVISION = "0123456789abcdef0123456789abcdef01234567"
 PROFILE = "llama_3_2_1b_instruct_default@1"
 TASK = "loops_v1"
 NEW_COUNTERS = ("generation_passes", "generated_tokens", "probe_calls", "teacher_forced_tokens")
+SANDBOX_COUNTERS = ("sandbox_calls", "sandbox_seconds")  # migration 12 (M3 plan Section 2.5)
 QWEN_LOOP_HASH = "sha256:cbf2ccceaca494aa0e4c96af88201a7aa28d0c77cdcb407aaa59978ee3a333f4"
 M1_HASHES = {SMALL_MODEL_POLICY_ID: "sha256:d8761471bfb88e1d322da1ca06003729886daafa028963f1dcf7ef807cc218b5",
              WEIGHTS_ONLY_POLICY_ID: "sha256:88d3c1e4f73e0eb8204c30b65aceb753608114c4ed05e074302db630e665fa75"}
@@ -236,7 +237,7 @@ def test_qwen_loop_v1_limits_and_protections(hf_snapshots, tmp_path):
         "candidate_commits": 20, "patch_previews": 50, "analysis_calls": 50, "tensor_read_calls": 100,
         "evaluation_batches": 0, "evaluated_examples": 0, "model_forward_calls": 0, "compute_seconds": 6 * 3600,
         "generation_passes": 10, "generated_tokens": 10 * 32 * 8192, "probe_calls": 25,
-        "teacher_forced_tokens": 25 * 64 * 1024}
+        "teacher_forced_tokens": 25 * 64 * 1024, "sandbox_calls": 0, "sandbox_seconds": 0}
     assert (budget.problems_per_generation_pass, budget.new_tokens_per_output) == (32, 8192)
     assert (budget.texts_per_probe_call, budget.tokens_per_probe_text) == (64, 1024)
     assert (budget.seconds_per_operation, budget.examples_per_batch) == (2 * 3600, 0)
@@ -259,7 +260,7 @@ def test_qwen_loop_v1_limits_and_protections(hf_snapshots, tmp_path):
         dumped = m1.model_dump(mode="json")["budget"]
         assert all(getattr(m1.budget, name) is None and name not in dumped for name in NEW_COUNTERS)
         assert all(m1.budget.ledger_limits()[name] == 0 for name in NEW_COUNTERS)
-    assert list(LEDGER_COUNTERS[-4:]) == list(NEW_COUNTERS)
+    assert list(LEDGER_COUNTERS[-6:]) == list(NEW_COUNTERS + SANDBOX_COUNTERS)
     # A weights_only policy grants no generation or probes; generation passes and probes need their per-call limits.
     no_inference = {"evaluation_batches": 0, "examples_per_batch": 0, "evaluated_examples": 0, "model_forward_calls": 0}
     for granted in ({"generation_passes": 1, "problems_per_generation_pass": 1, "new_tokens_per_output": 1,
@@ -396,11 +397,12 @@ def test_whole_tensor_scaling_is_refused_by_its_net_effect_on_the_experiments_ba
 
 
 def _downgrade_to_9(workspace: Path) -> None:
-    """Remove what migration 10 adds (the four counters' ledger rows), leaving a schema-9 workspace."""
+    """Remove what migrations 10 and 12 add (their counters' ledger rows and the constraint table): schema 9."""
     conn = sqlite3.connect(workspace / "metadata.sqlite")
     try:
-        conn.execute(f"DELETE FROM budget_ledger WHERE counter IN ({', '.join('?' * len(NEW_COUNTERS))})",
-                     NEW_COUNTERS)
+        counters = NEW_COUNTERS + SANDBOX_COUNTERS
+        conn.execute(f"DELETE FROM budget_ledger WHERE counter IN ({', '.join('?' * len(counters))})", counters)
+        conn.execute("DROP TABLE IF EXISTS run_constraints")
         conn.execute("PRAGMA user_version = 9")
         conn.commit()
     finally:
@@ -414,15 +416,17 @@ def _ledger_rows(workspace: Path) -> list[tuple]:
 
 
 def _assert_backfilled(workspace: Path, before: list[tuple], limits: dict[str, dict[str, int]]) -> None:
-    """Migration 10 added exactly the four counters of each experiment, with its policy's limits, and changed no row."""
+    """Migrations 10 and 12 added exactly their counters to each experiment, with its policy's limits, and changed
+    no row."""
     from wse.database import LATEST_SCHEMA_VERSION
 
     with Engine(workspace) as engine:
-        assert engine.store.db.schema_version() == LATEST_SCHEMA_VERSION == 11  # migration 11 rebuilt the jobs table
+        assert engine.store.db.schema_version() == LATEST_SCHEMA_VERSION >= 11  # migration 11 rebuilt the jobs table
         after = _ledger_rows(workspace)
         added = sorted(set(after) - set(before))
         assert sorted(set(before) - set(after)) == []
-        assert added == sorted((eid, name, limits[eid][name], 0, 0) for eid in limits for name in NEW_COUNTERS)
+        assert added == sorted((eid, name, limits[eid][name], 0, 0) for eid in limits
+                               for name in NEW_COUNTERS + SANDBOX_COUNTERS)
         for eid, expected in limits.items():
             budget = engine.get_experiment(eid).budget
             assert list(budget) == list(LEDGER_COUNTERS)
@@ -515,8 +519,9 @@ def test_migration_10_on_a_workspace_written_by_schema_9_code(workspace, bundles
     assert written.returncode == 0, written.stderr
     experiments = json.loads(written.stdout)
     before = _ledger_rows(workspace)
-    assert {row[1] for row in before} == set(LEDGER_COUNTERS) - set(NEW_COUNTERS)
-    _assert_backfilled(workspace, before, {eid: dict.fromkeys(NEW_COUNTERS, 0) for eid in experiments.values()})
+    assert {row[1] for row in before} == set(LEDGER_COUNTERS) - set(NEW_COUNTERS) - set(SANDBOX_COUNTERS)
+    _assert_backfilled(workspace, before, {eid: dict.fromkeys(NEW_COUNTERS + SANDBOX_COUNTERS, 0)
+                                           for eid in experiments.values()})
 
 
 # ---------------------------------------------------------------------------

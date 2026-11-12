@@ -466,6 +466,32 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             "CREATE INDEX jobs_experiment ON jobs (experiment_id, created_at)",
         ],
     ),
+    (
+        12,
+        [
+            # The sandbox ledger counters (M3 plan Section 2.5). Every existing experiment gets
+            # them with the limit its policy sets, which for every policy written before they
+            # existed is unset, so 0: not permitted. No existing row changes.
+            """
+            INSERT INTO budget_ledger (experiment_id, counter, limit_value, consumed, reserved)
+            SELECT e.experiment_id, c.counter,
+                   COALESCE(json_extract(p.policy_json, '$.budget.' || c.counter), 0), 0, 0
+            FROM experiments e
+            LEFT JOIN policies p ON p.policy_id = e.policy_id
+            CROSS JOIN (SELECT 'sandbox_calls' AS counter UNION ALL SELECT 'sandbox_seconds') c
+            WHERE NOT EXISTS (SELECT 1 FROM budget_ledger b
+                              WHERE b.experiment_id = e.experiment_id AND b.counter = c.counter)
+            """,
+            # Why a run is unverified when its policy, not its controller, decides it. A table of its
+            # own keeps this migration re-runnable, as every earlier one is.
+            """
+            CREATE TABLE IF NOT EXISTS run_constraints (
+                experiment_id  TEXT PRIMARY KEY REFERENCES experiments (experiment_id),
+                reason         TEXT NOT NULL
+            )
+            """,
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

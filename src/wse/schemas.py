@@ -603,7 +603,10 @@ class Usage(_Frozen):
     language-model counters (``generation_passes``, ``generated_tokens``,
     ``probe_calls``, ``teacher_forced_tokens``; M2 plan Section 5.5) are
     omitted from the JSON while unset, so records written before they existed
-    keep their content and hashes; settled jobs set every counter.
+    keep their content and hashes; settled jobs set every counter. The
+    sandbox counters (``sandbox_calls``, ``sandbox_seconds``; M3 plan Section
+    2.5) follow the same rule; ``sandbox_seconds`` is wall-clock time of the
+    agent's own code, not metered computation.
     """
 
     evaluation_batches: int | None = None
@@ -618,6 +621,8 @@ class Usage(_Frozen):
     generated_tokens: int | None = _optional()
     probe_calls: int | None = _optional()
     teacher_forced_tokens: int | None = _optional()
+    sandbox_calls: int | None = _optional()
+    sandbox_seconds: float | None = _optional()
     artifact_bytes: int | None = None
     peak_memory_bytes: int | None = None
     unavailable: dict[str, str] = Field(default_factory=dict)

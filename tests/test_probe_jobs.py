@@ -766,7 +766,7 @@ def test_migration_11_keeps_jobs_and_reports_written_by_schema_10_code(workspace
     jobs, reports = _table_rows(workspace, "jobs"), _table_rows(workspace, "reports")
     assert [row[0] for row in jobs] == sorted(ids["jobs"]) and len(reports) == 1
     with Engine(workspace) as engine:
-        assert engine.store.db.schema_version() == LATEST_SCHEMA_VERSION == 11
+        assert engine.store.db.schema_version() == LATEST_SCHEMA_VERSION >= 11
         conn = engine.store.db.conn
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

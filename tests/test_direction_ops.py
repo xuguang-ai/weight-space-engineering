@@ -225,6 +225,7 @@ def test_builtin_policies_do_not_permit_project_out_and_keep_their_hashes(task_m
         "small_model_v1": ["scale_slice", "set_slice"],
         "small_model_weights_only_v1": ["scale_slice", "set_slice"],
         "qwen_loop_v1": ["add_low_rank", "fill_slice", "project_out", "scale_slice", "set_slice"],
+        "qwen_loop_sandbox_v1": ["add_low_rank", "fill_slice", "project_out", "scale_slice", "set_slice"],
     }
     assert policies["small_model_v1"].policy_hash == (
         "sha256:d8761471bfb88e1d322da1ca06003729886daafa028963f1dcf7ef807cc218b5")

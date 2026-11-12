@@ -296,8 +296,9 @@ def _rows(conn: sqlite3.Connection, table: str) -> list[tuple]:
     return conn.execute(f"SELECT * FROM {table} ORDER BY 1, 2").fetchall()
 
 
-# The ledger counters that migration 10 adds to every experiment (M2 plan Section 5.5).
+# The ledger counters that migration 10 adds to every experiment (M2 plan Section 5.5), and migration 12's.
 M2_COUNTERS = ("generation_passes", "generated_tokens", "probe_calls", "teacher_forced_tokens")
+SANDBOX_COUNTERS = ("sandbox_calls", "sandbox_seconds")
 
 
 def _restore_m1_jobs_table(conn: sqlite3.Connection) -> None:
@@ -315,9 +316,12 @@ def _restore_m1_jobs_table(conn: sqlite3.Connection) -> None:
 
 
 def _downgrade_to_m1(workspace: Path) -> None:
-    """Remove every object of migrations 8-11 so the workspace is exactly what M1 (schema 7) wrote."""
+    """Remove every object of migrations 8-12 so the workspace is exactly what M1 (schema 7) wrote."""
     conn = sqlite3.connect(workspace / "metadata.sqlite")
     try:
+        conn.execute("DROP TABLE run_constraints")  # migration 12
+        conn.execute(f"DELETE FROM budget_ledger WHERE counter IN ({', '.join('?' * len(SANDBOX_COUNTERS))})",
+                     SANDBOX_COUNTERS)  # migration 12
         _restore_m1_jobs_table(conn)  # migration 11
         conn.execute(f"DELETE FROM budget_ledger WHERE counter IN ({', '.join('?' * len(M2_COUNTERS))})",
                      M2_COUNTERS)  # migration 10
@@ -379,7 +383,7 @@ def _assert_migration_8_keeps_identities(workspace: Path, base: ModelManifest, c
         assert after_rows == {table: rows for table, rows in before_rows.items() if table != "budget_ledger"}
         assert set(before_rows["budget_ledger"]) <= set(ledger)
         assert sorted(set(ledger) - set(before_rows["budget_ledger"])) == sorted(
-            (experiment_id, counter, 0, 0, 0) for counter in M2_COUNTERS)
+            (experiment_id, counter, 0, 0, 0) for counter in M2_COUNTERS + SANDBOX_COUNTERS)
         assert {path.relative_to(workspace): path.read_bytes()
                 for directory in ("weights", "manifests", "patches")
                 for path in (workspace / "artifacts" / directory).iterdir()} == artifact_files

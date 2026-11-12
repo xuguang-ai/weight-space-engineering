@@ -350,6 +350,7 @@ POLICY_ID_PATTERN = r"^[a-z][a-z0-9_]{0,63}$"
 SMALL_MODEL_POLICY_ID = "small_model_v1"
 WEIGHTS_ONLY_POLICY_ID = "small_model_weights_only_v1"
 QWEN_LOOP_POLICY_ID = "qwen_loop_v1"
+QWEN_LOOP_SANDBOX_POLICY_ID = "qwen_loop_sandbox_v1"
 
 # Ledger counters, in the order they are reported. ``examples_per_batch``,
 # ``seconds_per_operation``, and the per-pass and per-probe limits are
@@ -367,6 +368,8 @@ LEDGER_COUNTERS = (
     "generated_tokens",
     "probe_calls",
     "teacher_forced_tokens",
+    "sandbox_calls",
+    "sandbox_seconds",
 )
 # Each cumulative counter of language models and the per-operation limits that a policy granting it must set.
 GENERATION_LIMITS = ("problems_per_generation_pass", "new_tokens_per_output", "generated_tokens")
@@ -411,6 +414,10 @@ class BudgetLimits(_Frozen):
     texts_per_probe_call: int | None = _optional(ge=0, description="texts one probe may teacher-force")
     tokens_per_probe_text: int | None = _optional(ge=0, description="tokens one probed text may have")
     teacher_forced_tokens: int | None = _optional(ge=0, description="tokens teacher-forced by all probes")
+    sandbox_calls: int | None = _optional(ge=0, description="runs of agent-written code in the sandbox")
+    sandbox_seconds: float | None = _optional(ge=0, allow_inf_nan=False,
+                                              description="wall-clock seconds of all sandbox runs; not metered "
+                                                          "computation")
 
     @model_validator(mode="after")
     def _limits_of_granted_operations(self) -> BudgetLimits:
@@ -430,12 +437,38 @@ class BudgetLimits(_Frozen):
         return {counter: self.limit(counter) for counter in LEDGER_COUNTERS}
 
 
+class SandboxPolicy(_Frozen):
+    """How a run may execute its own Python in the sandbox (``wse.sandbox``; M3 plan Section 2.5).
+
+    ``seconds_per_call`` is each call's wall-clock limit; the CPU-time limit
+    of a call is that many seconds per CPU core, a backstop for a process
+    that outlives the server. ``max_output_bytes`` bounds each of standard
+    output and error in a tool result. ``readable_tensors`` lists
+    ``fnmatch`` patterns of the base checkpoint's tensors that the sandbox
+    may read; unset, it may read every tensor that the model family does not
+    protect. ``export_pass_texts`` exports the outputs of the run's
+    development generation passes. The calls and their total wall-clock time
+    are the ledger counters ``sandbox_calls`` and ``sandbox_seconds``.
+    """
+
+    seconds_per_call: float = Field(gt=0, le=3600, allow_inf_nan=False)
+    max_output_bytes: int = Field(default=16384, ge=1024, le=1 << 20)
+    readable_tensors: list[str] | None = _optional(min_length=1)
+    export_pass_texts: bool = True
+
+
 class ExperimentPolicy(_Frozen):
     """An immutable experiment policy: mode, budget limits, and permitted operations.
 
     ``mode`` cannot be overridden when an experiment is created. A
     ``weights_only`` policy must grant no evaluation batches, examples,
-    forward calls, generation passes, or probes.
+    forward calls, generation passes, probes, or sandbox. ``sandbox``
+    (``SandboxPolicy``) lets runs execute their own Python, which makes every
+    run of the policy unverified; it comes with the budget's
+    ``sandbox_calls`` and ``sandbox_seconds``. ``max_job_wait_seconds`` caps
+    how long ``wse_get_job`` waits for a job in one call (10 seconds when
+    unset). Both are omitted from the JSON while unset, so policies written
+    before they existed keep their content and hashes.
     """
 
     schema_version: Literal["1"] = "1"
@@ -443,14 +476,28 @@ class ExperimentPolicy(_Frozen):
     mode: ExperimentMode
     budget: BudgetLimits = Field(default_factory=BudgetLimits)
     operations: OperationPolicy = Field(default_factory=lambda: default_operation_policy())
+    sandbox: SandboxPolicy | None = _optional()
+    max_job_wait_seconds: float | None = _optional(gt=0, le=3600, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _weights_only_has_no_inference(self) -> ExperimentPolicy:
         if self.mode == "weights_only":
             granted = {name: getattr(self.budget, name) for name in INFERENCE_LIMITS
                        if getattr(self.budget, name) not in (None, 0)}
+            if self.sandbox is not None:
+                granted["sandbox"] = "granted"
             if granted:
                 raise ValueError(f"weights_only policies must not grant inference allowances: {granted}")
+        return self
+
+    @model_validator(mode="after")
+    def _sandbox_and_its_counters_come_together(self) -> ExperimentPolicy:
+        counters = {name: self.budget.limit(name) for name in ("sandbox_calls", "sandbox_seconds")}
+        if self.sandbox is not None and not all(counters.values()):
+            missing = [name for name, value in counters.items() if not value]
+            raise ValueError(f"a policy with a sandbox must also set {', '.join(missing)} above 0")
+        if self.sandbox is None and any(counters.values()):
+            raise ValueError("sandbox_calls and sandbox_seconds need a sandbox (SandboxPolicy)")
         return self
 
     @property
@@ -537,8 +584,28 @@ def qwen_loop_policy() -> ExperimentPolicy:
     return ExperimentPolicy(policy_id=QWEN_LOOP_POLICY_ID, mode="bounded_eval", budget=budget, operations=operations)
 
 
+def qwen_loop_sandbox_policy() -> ExperimentPolicy:
+    """``qwen_loop_sandbox_v1``: ``qwen_loop_v1`` plus the sandbox and long waits for jobs (M3 plan Section 2.5).
+
+    The sandbox allows 100 calls of at most 300 seconds each and 2 hours in
+    all, with 16 KiB of each output stream in a tool result; ``wse_get_job``
+    may wait 600 seconds per call. Everything else is ``qwen_loop_v1``'s.
+    Every run of this policy is unverified.
+    """
+    base = qwen_loop_policy()
+    budget = BudgetLimits(**{**base.budget.model_dump(), "sandbox_calls": 100, "sandbox_seconds": 7200.0})
+    return ExperimentPolicy(policy_id=QWEN_LOOP_SANDBOX_POLICY_ID, mode="bounded_eval", budget=budget,
+                            operations=base.operations, sandbox=SandboxPolicy(seconds_per_call=300.0),
+                            max_job_wait_seconds=600.0)
+
+
+def sandbox_available(policy: ExperimentPolicy) -> bool:
+    """Whether runs of ``policy`` may execute their own Python: a sandbox and a positive call allowance."""
+    return policy.sandbox is not None and policy.budget.limit("sandbox_calls") > 0
+
+
 def builtin_experiment_policies() -> dict[str, ExperimentPolicy]:
-    """``small_model_v1`` (bounded_eval), ``small_model_weights_only_v1`` (weights_only), and ``qwen_loop_v1``."""
+    """``small_model_v1``, ``small_model_weights_only_v1``, ``qwen_loop_v1``, and ``qwen_loop_sandbox_v1``."""
     bounded = ExperimentPolicy(policy_id=SMALL_MODEL_POLICY_ID, mode="bounded_eval")
     weights_only = ExperimentPolicy(
         policy_id=WEIGHTS_ONLY_POLICY_ID,
@@ -551,4 +618,5 @@ def builtin_experiment_policies() -> dict[str, ExperimentPolicy]:
             model_forward_calls=0,
         ),
     )
-    return {policy.policy_id: policy for policy in (bounded, weights_only, qwen_loop_policy())}
+    return {policy.policy_id: policy for policy in (bounded, weights_only, qwen_loop_policy(),
+                                                    qwen_loop_sandbox_policy())}

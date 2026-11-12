@@ -88,7 +88,7 @@ from wse.audit import (
     record_controller_end,
     record_controller_start,
 )
-from wse.policy import ExperimentPolicy
+from wse.policy import ExperimentPolicy, sandbox_available
 from wse.registry import Registry, builtin_registry
 from wse.schemas import (
     BudgetEntry,
@@ -120,6 +120,9 @@ __all__ = [
     "run_experiment",
     "serve_environment",
     "summarize_trial",
+    "constraint_for",
+    "SANDBOX_CONSTRAINT_REASON",
+    "SANDBOX_TIME_LABEL",
 ]
 
 logger = logging.getLogger("wse.runner")
@@ -132,6 +135,10 @@ IMPROVEMENT_TOLERANCE = 1e-9
 POLICY_DENIAL_LIMIT = 3
 TEST_DOUBLE_PREFIX = "wse-test-double:"
 OPERATOR_INTERRUPT = "operator_interrupt: the operator interrupted the run (SIGINT)"
+# Why a run whose policy grants the sandbox is unverified, whatever its controller (M3 plan Section 2.5).
+SANDBOX_CONSTRAINT_REASON = "sandbox code execution: WSE meters only its own calls"
+# How reports name the sandbox's usage, apart from the calls WSE meters.
+SANDBOX_TIME_LABEL = "sandbox wall-clock time (not metered computation)"
 SERVE_ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "PYTHONPATH", "VIRTUAL_ENV",
                        "SYSTEMROOT")
 SECRET_NAME = re.compile(r"KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL", re.IGNORECASE)
@@ -176,6 +183,19 @@ def probes_available(policy: ExperimentPolicy) -> bool:
 def jobs_available(policy: ExperimentPolicy) -> bool:
     """Whether runs of ``policy`` submit jobs (evaluations, generation passes, or probes), which a worker runs."""
     return policy.evaluation_available or probes_available(policy)
+
+
+def constraint_for(policy: ExperimentPolicy, verified: bool) -> tuple[str, str | None]:
+    """A run's ``constraint_status`` and, when its policy decides it, the reason.
+
+    A policy that grants the sandbox makes every run unverified, because the
+    agent's own code runs computation that WSE does not meter. Otherwise the
+    controller decides: ``verified`` when its only channel is the run-bound
+    interface (``verified``).
+    """
+    if sandbox_available(policy):
+        return "unverified", SANDBOX_CONSTRAINT_REASON
+    return ("verified" if verified else "unverified"), None
 
 
 def allowed_tools(policy: ExperimentPolicy) -> list[str]:
@@ -722,10 +742,11 @@ class ReferenceRunner:
     # -- records -----------------------------------------------------------------------------
 
     def _start_record(self, engine: Engine, eid: str, *, kind: str, ref: ExtensionRef, config: dict[str, Any],
-                      constraint_status: str, tracing: dict[str, Any]) -> None:
+                      constraint_status: str, tracing: dict[str, Any], constraint_reason: str | None = None) -> None:
         record_controller_start(engine.store.db, eid, kind=kind, controller_id=ref.extension_id,
                                 controller_version=ref.version, config=config,
-                                constraint_status=constraint_status, tracing=tracing)
+                                constraint_status=constraint_status, tracing=tracing,
+                                constraint_reason=constraint_reason)
 
     def _end_record(self, engine: Engine, eid: str, result: AgentRunResult, stop_condition: str | None,
                     finalization: dict[str, Any] | None, error: str | None = None,
@@ -793,10 +814,11 @@ class ReferenceRunner:
                     "allowed_tools": tools}
         run_id = None
         supervisor = None
+        constraint_status, constraint_reason = constraint_for(policy, True)
         with Engine(self.workspace, registry=self.registry) as operator:
             run_id = operator.get_experiment(eid).run_id
             self._start_record(operator, eid, kind="strategy", ref=ref, config=recorded,
-                               constraint_status="verified",
+                               constraint_status=constraint_status, constraint_reason=constraint_reason,
                                tracing={"sdk_tracing": "not applicable: no agent SDK runs"})
             monitor = StopMonitor(operator, eid, task)
             trace = _Trace(operator, eid)
@@ -832,7 +854,8 @@ class ReferenceRunner:
         status, reason, stop = "max_turns", f"the step limit of {config.max_steps} was reached", None
         steps = 0
         with Engine(self.workspace, registry=self.registry, run_id=run_id) as bound:
-            executor = ExperimentExecutor(bound, constraint_status="verified", tools=tools)
+            executor = ExperimentExecutor(bound, constraint_status=constraint_for(policy, True)[0]
+                                          if policy is not None else "verified", tools=tools)
 
             def execute(action: Action) -> Observation:
                 trace.emit("tool_call", tool=action.tool, arguments=action.arguments,
@@ -936,7 +959,7 @@ class ReferenceRunner:
     def _run_agent(self, run_id: str, eid: str, task: TaskDefinition, policy: ExperimentPolicy,
                    config: AgentConfig, interrupt: _OperatorInterrupt) -> None:
         adapter = self._make_adapter(config, eid)
-        constraint_status = "verified" if config.benchmark else "unverified"
+        constraint_status, constraint_reason = constraint_for(policy, config.benchmark)
         connection = self.connection(run_id, eid, task, policy, constraint_status)
         serve_log = self.serve_log(run_id)
         recorded = {**config.model_dump(mode="json"), "allowed_tools": connection.allowed_tools,
@@ -954,7 +977,8 @@ class ReferenceRunner:
         async def main() -> None:
             with Engine(self.workspace, registry=self.registry) as operator:
                 self._start_record(operator, eid, kind="agent", ref=ref, config=recorded,
-                                   constraint_status=constraint_status, tracing=tracing)
+                                   constraint_status=constraint_status, constraint_reason=constraint_reason,
+                                   tracing=tracing)
                 monitor = StopMonitor(operator, eid, task)
                 trace = _Trace(operator, eid)
                 stops: list[str] = []
@@ -1060,9 +1084,14 @@ def summarize_trial(engine: Engine, experiment_id: str, *, threshold: float = SU
                                if name in ("input_tokens", "output_tokens", "total_tokens")},
         "changed_elements": changed, "parameter_count": parameters,
         "changed_fraction": changed / parameters if parameters else 0.0,
-        "constraint_status": record.get("constraint_status"), "tracing": record.get("tracing"),
+        "constraint_status": record.get("constraint_status"), "constraint_reason": record.get("constraint_reason"),
+        "tracing": record.get("tracing"), "sandbox": None,
         "final": None, "success": None, "failure_cause": None,
     }
+    if sandbox_available(engine.experiment_policy(experiment_id)):
+        row["sandbox"] = {"calls": int(experiment.budget["sandbox_calls"].consumed),
+                          "wall_seconds": float(experiment.budget["sandbox_seconds"].consumed),
+                          "label": SANDBOX_TIME_LABEL}
     if experiment.state == "CLOSED":
         final = engine.get_final_report(experiment_id)
         comparison = final.comparison
@@ -1117,4 +1146,11 @@ def render_trials_markdown(rows: Sequence[Mapping[str, Any]], *, threshold: floa
     unavailable = {reason for row in rows for reason in row["tokens_unavailable"].values()}
     if unavailable:
         lines += ["", "Token counts reported as n/a: " + "; ".join(sorted(unavailable)) + "."]
+    sandboxed = [row for row in rows if row.get("sandbox")]
+    if sandboxed:
+        lines += ["", "Evaluated examples, candidates, and costs above are WSE-metered calls. Runs that executed "
+                      f"their own code also used {SANDBOX_TIME_LABEL}, which WSE does not meter; these runs are "
+                      "unverified:", ""]
+        lines += [f"- {_trial_name(row)}: {row['sandbox']['calls']} sandbox calls, "
+                  f"{row['sandbox']['wall_seconds']:.1f} s" for row in sandboxed]
     return "\n".join(lines) + "\n"

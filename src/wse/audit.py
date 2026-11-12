@@ -121,8 +121,12 @@ def experiment_events(db: Database, experiment_id: str) -> list[dict[str, Any]]:
 
 def record_controller_start(db: Database, experiment_id: str, *, kind: str, controller_id: str,
                             controller_version: str, config: Mapping[str, Any], constraint_status: str,
-                            tracing: Mapping[str, Any]) -> dict[str, Any]:
-    """Record which controller drives an experiment (once per experiment)."""
+                            tracing: Mapping[str, Any], constraint_reason: str | None = None) -> dict[str, Any]:
+    """Record which controller drives an experiment (once per experiment).
+
+    ``constraint_reason`` says why the run is unverified when its policy
+    decides it (a sandbox); the record names it only when it is set.
+    """
     config_json = canonical_json(dict(config))
     now = utc_now()
     with db.transaction() as conn:
@@ -138,11 +142,15 @@ def record_controller_start(db: Database, experiment_id: str, *, kind: str, cont
             "config_hash, constraint_status, tracing, started_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (experiment_id, kind, controller_id, controller_version, config_json,
              json_hash(json.loads(config_json)), constraint_status, canonical_json(dict(tracing)), now))
-        insert_audit_event(conn, "controller.started", experiment_id,
-                           {"kind": kind, "controller": f"{controller_id}@{controller_version}",
-                            "config_hash": json_hash(json.loads(config_json)),
-                            "constraint_status": constraint_status, "tracing": dict(tracing)},
-                           experiment_id=experiment_id)
+        if constraint_reason is not None:
+            conn.execute("INSERT INTO run_constraints (experiment_id, reason) VALUES (?, ?)",
+                         (experiment_id, constraint_reason))
+        payload = {"kind": kind, "controller": f"{controller_id}@{controller_version}",
+                   "config_hash": json_hash(json.loads(config_json)),
+                   "constraint_status": constraint_status, "tracing": dict(tracing)}
+        if constraint_reason is not None:
+            payload["constraint_reason"] = constraint_reason
+        insert_audit_event(conn, "controller.started", experiment_id, payload, experiment_id=experiment_id)
     return controller_record(db, experiment_id)
 
 
@@ -171,6 +179,8 @@ def controller_record(db: Database, experiment_id: str) -> dict[str, Any] | None
     row = db.conn.execute("SELECT * FROM controller_runs WHERE experiment_id = ?", (experiment_id,)).fetchone()
     if row is None:
         return None
+    reason = db.conn.execute("SELECT reason FROM run_constraints WHERE experiment_id = ?",
+                             (experiment_id,)).fetchone()
     return {
         "experiment_id": row["experiment_id"],
         "kind": row["kind"],
@@ -178,6 +188,7 @@ def controller_record(db: Database, experiment_id: str) -> dict[str, Any] | None
         "config": json.loads(row["config"]),
         "config_hash": row["config_hash"],
         "constraint_status": row["constraint_status"],
+        **({"constraint_reason": reason["reason"]} if reason is not None else {}),
         "tracing": json.loads(row["tracing"]),
         "started_at": row["started_at"],
         "ended_at": row["ended_at"],
