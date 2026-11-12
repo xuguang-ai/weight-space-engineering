@@ -211,6 +211,17 @@ SESSION_TIMEOUT_MARGIN_SECONDS = 20.0
 SANDBOX_CALL_MARGIN_SECONDS = 120.0  # exporting inputs before a call and storing its outputs after it
 
 
+def _worker_device(worker_args: Sequence[str]) -> str | None:
+    """The ``--device`` among the worker's options (``--device cpu`` or ``--device=cpu``), or ``None``."""
+    args = list(worker_args)
+    for index, arg in enumerate(args):
+        if arg == "--device" and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith("--device="):
+            return arg.split("=", 1)[1]
+    return None
+
+
 def agent_session_timeout(policy: ExperimentPolicy, configured: float) -> float:
     """The agent's MCP session timeout: ``configured``, raised above the longest tool call of ``policy``.
 
@@ -310,9 +321,10 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
                      "candidate on the full development set so the rule can consider it.")
     if baseline is not None:
         metrics = ", ".join(f"{name} {value:.4g}" for name, value in sorted(baseline["metrics"].items()))
+        again = ("wse_evaluate on the original model returns this report without charging again"
+                 if "wse_evaluate" in tools else "evaluating the original model again repeats it")
         lines.append(f"Baseline: the original model's full development evaluation is report "
-                     f"{baseline['report_id']} ({metrics}); it counts as one of the evaluations, and evaluating the "
-                     "original model again repeats it.")
+                     f"{baseline['report_id']} ({metrics}); it counts as one of the evaluations, and {again}.")
     if task.target_accuracy is not None:
         lines.append(f"The target is met only by a successful evaluation of development suite "
                      f"{task.development_suite_id} covering all {task.development_examples} examples with accuracy "
@@ -1121,7 +1133,7 @@ class ReferenceRunner:
                 try:
                     ensure = getattr(operator, "ensure_baseline", None)
                     if ensure is not None:
-                        ensure(eid)
+                        ensure(eid, device=_worker_device(self.worker_args))
                         return
                     suite = operator.get_suite(task.development_suite_id)
                     config = {"sample_count": max(suite.sample_counts), "seed": suite.seeds[0]}
