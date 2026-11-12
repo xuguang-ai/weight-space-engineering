@@ -202,7 +202,11 @@ def _preflight(config: Any, sandbox: str | None) -> None:
     if missing:
         raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY,
                        f"the Codex agent reaches its model through WSE's local proxy, which needs {' and '.join(missing)} "
-                       "in this process's environment, for example with `uv run --env-file .env`",
+                       "in this process's environment: OPENAI_API_KEY is your provider's API key, and OPENAI_BASE_URL "
+                       "its endpoint, the base URL of its API (WSE assumes none, so the key goes only where you say). "
+                       "For OpenAI's own API: `export OPENAI_BASE_URL=https://api.openai.com/v1`; for Azure OpenAI, "
+                       "your resource's endpoint followed by /openai/v1. From a source checkout, "
+                       "`uv run --env-file .env` loads both from .env",
                        details={"missing": missing})
     _checked_upstream(os.environ["OPENAI_BASE_URL"])
     _checked_key(os.environ["OPENAI_API_KEY"])

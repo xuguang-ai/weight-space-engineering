@@ -249,6 +249,14 @@ def test_a_run_without_its_model_endpoint_is_refused_before_anything_runs(experi
         experiment.run(agent="codex:some-model", sandbox=None, device="cpu")
     assert caught.value.code == ErrorCode.UNSUPPORTED_CAPABILITY and "OPENAI_API_KEY" in caught.value.message
     assert _counts(model.engine) == before
+    monkeypatch.setenv("OPENAI_API_KEY", "x" * 40)
+    monkeypatch.delenv("OPENAI_BASE_URL")
+    with pytest.raises(WSEError) as caught:  # no default endpoint: the key goes only where the user says
+        experiment.run(agent="codex:some-model", sandbox=None, device="cpu")
+    message = caught.value.message
+    assert caught.value.details["missing"] == ["OPENAI_BASE_URL"]
+    assert "endpoint" in message and "https://api.openai.com/v1" in message and "export OPENAI_BASE_URL=" in message
+    assert _counts(model.engine) == before
 
 
 def test_a_run_whose_agent_never_started_freezes_and_is_not_tested(experiment_setup, monkeypatch) -> None:
