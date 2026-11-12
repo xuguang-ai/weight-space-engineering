@@ -51,7 +51,7 @@ model = WSE.from_pretrained("~/models/Qwen3-0.6B", repo="Qwen/Qwen3-0.6B",
 A snapshot in the Hugging Face cache (`models--ORG--NAME/snapshots/SHA`) names its repository and commit by its path. From the command line:
 
 ```bash
-uv run --no-sync wse import-hf ~/models/Qwen3-0.6B --repo Qwen/Qwen3-0.6B \
+uv run --extra models-hf wse import-hf ~/models/Qwen3-0.6B --repo Qwen/Qwen3-0.6B \
   --revision c1899de289a04d12100db370d81485cdf75e47ca
 ```
 

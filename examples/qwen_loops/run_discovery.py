@@ -45,7 +45,7 @@ the record's other keys stay.
 Default: 32 problems at 8,192 tokens, three passes, about 2 hours on the
 operator's MPS. Keep the Mac awake (``caffeinate -is``)::
 
-    caffeinate -is uv run --no-sync python examples/qwen_loops/run_discovery.py OUT \\
+    caffeinate -is uv run --extra models-hf --extra agents-openai python examples/qwen_loops/run_discovery.py OUT \\
         --workspace ~/Desktop/wse-models/workspaces/q2 \\
         --snapshot ~/Desktop/wse-models/Qwen3.5-0.8B --repo Qwen/Qwen3.5-0.8B \\
         --revision 2fc06364715b967f1860aea9cf38778875588b17 --via-mcp

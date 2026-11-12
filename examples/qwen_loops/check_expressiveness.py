@@ -46,7 +46,7 @@ the script can be restarted; each invocation grants a new run.
 existing experiment in its run's record without running anything (for
 example after the process was killed); the record's other keys stay.
 
-    uv run --no-sync python examples/qwen_loops/check_expressiveness.py OUT \\
+    uv run --extra models-hf --extra agents-openai python examples/qwen_loops/check_expressiveness.py OUT \\
         --workspace ~/Desktop/wse-models/workspaces/q2 --recompute --via-mcp
 
 A short smoke run: ``--problems 4 --max-new-tokens 256``.

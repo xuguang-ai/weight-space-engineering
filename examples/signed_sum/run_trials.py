@@ -19,16 +19,17 @@ interrupt.
 
 Offline (no model, no network):
 
-    uv run --no-sync python examples/signed_sum/run_trials.py OUT --label scripted
-    uv run --no-sync python examples/signed_sum/run_trials.py OUT --label control \\
+    uv run python examples/signed_sum/run_trials.py OUT --label scripted
+    uv run python examples/signed_sum/run_trials.py OUT --label control \\
         --policy small_model_weights_only_v1
-    uv run --no-sync python examples/signed_sum/run_trials.py OUT --label sdk-double \\
+    uv run --extra agents-openai python examples/signed_sum/run_trials.py OUT --label sdk-double \\
         --controller openai-agents --model wse-test-double:scripted_search@1
 
-Live agent trials (the operator chooses the model and sets the SDK's
-credentials in the environment; nothing here reads, prints, or stores them):
+Live agent trials (the operator chooses the model; uv loads the key and
+endpoint from ``.env``, a copy of ``.env.example``, and nothing here reads,
+prints, or stores them):
 
-    uv run --no-sync python examples/signed_sum/run_trials.py OUT --label live \\
+    uv run --extra agents-openai --env-file .env python examples/signed_sum/run_trials.py OUT --label live \\
         --controller openai-agents --model MODEL_NAME --trials 5
 """
 

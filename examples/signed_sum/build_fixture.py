@@ -24,7 +24,7 @@ the workspace's evaluator storage, and registers their suites. The final
 seed is kept only in evaluator storage, next to the final examples.
 
 Usage:
-    uv run --no-sync python examples/signed_sum/build_fixture.py OUT_DIR [--with-reference]
+    uv run python examples/signed_sum/build_fixture.py OUT_DIR [--with-reference]
         [--workspace WORKSPACE]
 """
 
