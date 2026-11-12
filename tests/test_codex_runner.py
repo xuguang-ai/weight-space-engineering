@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import signal
 import subprocess
@@ -41,7 +42,7 @@ from wse.agent_adapters.codex_cli import (
 )
 from wse.api import Engine
 from wse.policy import SMALL_MODEL_POLICY_ID, WEIGHTS_ONLY_POLICY_ID
-from wse.runner import AGENT_ADAPTERS, ReferenceRunner, allowed_tools
+from wse.runner import AGENT_ADAPTERS, ReferenceRunner, agent_session_timeout, allowed_tools
 from wse.strategies.scripted import ScriptedSearchStrategy
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -144,7 +145,16 @@ def test_a_full_offline_run_through_wse_serve_freezes_the_expected_candidate(eng
     assert segment["kind"] == "initial" and segment["signals"] == ["SIGINT"] and segment["session_id"]
     assert result["conversation_ref"] == segment["session_id"] and metadata["test_double"] is True
     assert metadata["tool_call_counts"]["wse"] == len(results) and metadata["resumes"] == 0
-    assert metadata["tool_timeout_sec"] >= 900 and metadata["permission_profile"] == "wse"
+    assert metadata["permission_profile"] == "wse"
+    # Codex lets one WSE call run for the run's wall-clock limit, at least the policy's longest call.
+    longest = agent_session_timeout(engine.get_policy(SMALL_MODEL_POLICY_ID), 30.0)
+    assert metadata["tool_timeout_sec"] >= max(900, longest)
+    written = tomllib.loads((_codex_dir(workspace, run_id) / "home" / "config.toml").read_text())
+    assert written["mcp_servers"]["wse"]["tool_timeout_sec"] == metadata["tool_timeout_sec"]
+    assert written["mcp_servers"]["wse"]["args"][-1] == "--no-worker" and metadata["worker"] == "adapter"
+    assert not [line for line in subprocess.run(["/bin/ps", "-A", "-o", "command="], capture_output=True,
+                                                text=True).stdout.splitlines()
+                if "wse.worker" in line and str(workspace) in line]  # the adapter stopped its worker
     log = Path(segment["log"])
     lines = [json.loads(line) for line in log.read_text().splitlines()]
     assert lines[0]["type"] == "thread.started" and any(line["type"] == "item.completed" for line in lines)
@@ -208,6 +218,7 @@ def test_the_configuration_isolates_commands_and_round_trips_as_toml(tmp_path):
     assert tomllib.loads(text) == config and TOKEN not in text
     assert config["model"] == "gpt-5.6-luna" and config["model_reasoning_effort"] == "high"
     assert config["approval_policy"] == "never" and config["default_permissions"] == "wse"
+    assert config["allow_login_shell"] is False
     assert config["project_doc_max_bytes"] == 0 and config["project_root_markers"] == []
     assert config["model_provider"] == "wse_proxy"
     assert config["model_providers"]["wse_proxy"]["env_key"] == PROXY_TOKEN_ENV
@@ -233,12 +244,32 @@ def test_the_configuration_isolates_commands_and_round_trips_as_toml(tmp_path):
     assert server["enabled_tools"] == ["wse_get_experiment", "wse_preview_patch"]
     assert server["tool_timeout_sec"] == 7201 and server["startup_timeout_sec"] == 60
     assert server["default_tools_approval_mode"] == "approve" and server["startup_readiness"] == "catalog"
-    assert config["features"]["code_mode"] == {"direct_only_tool_namespaces": [MCP_NAMESPACE]}
+    assert config["features"]["code_mode"] == {"direct_only_tool_namespaces": [MCP_NAMESPACE],
+                                               "excluded_tool_namespaces": ["multi_agent_v1"]}
     assert config["features"]["multi_agent"] is False and config["skills"] == {"bundled": {"enabled": False}}
     with pytest.raises(codex_cli.WSEError, match="model setting"):
         codex_config(model="m", connection=_connection(tmp_path), sandbox_root=sandbox, skill_dir=tmp_path,
                      python=python, provider_config=None, startup_timeout_seconds=1, tool_timeout_seconds=1,
                      model_settings={"temperature": 0.2})
+
+
+def test_the_tool_timeout_covers_the_policys_longest_call_even_under_a_short_wall_clock(tmp_path):
+    """The runner raises client_session_timeout_seconds to agent_session_timeout(policy); Codex gets at least that."""
+    from wse.policy import ExperimentPolicy
+
+    policy = ExperimentPolicy.model_validate({"policy_id": "long_waits_v1", "mode": "bounded_eval",
+                                              "max_job_wait_seconds": 600.0,
+                                              "budget": {"evaluation_batches": 2, "seconds_per_operation": 3600.0}})
+    longest = agent_session_timeout(policy, 30.0)
+    assert longest > 3600
+    config = AgentConfig(adapter="codex_cli@1", model="gpt-5.6-luna", wall_clock_seconds=60,
+                         client_session_timeout_seconds=longest)
+    adapter = CodexCLIAdapter(codex_command=["true"], provider_config={})
+    asyncio.run(adapter.start(_connection(tmp_path / "workspace"), config))
+    session = adapter._sessions["exp_cfg"]
+    written = tomllib.loads((session.paths.home / "config.toml").read_text())
+    asyncio.run(adapter.close("exp_cfg"))
+    assert written["mcp_servers"]["wse"]["tool_timeout_sec"] == math.ceil(longest)
 
 
 def test_toml_dumps_quotes_keys_and_strings_that_need_it():
@@ -555,6 +586,13 @@ def test_without_a_provider_the_adapter_runs_a_model_proxy_for_the_operators_end
     missing = CodexCLIAdapter(codex_command=["true"])
     asyncio.run(missing.start(connection, config))
     assert "set OPENAI_BASE_URL and OPENAI_API_KEY" in missing._sessions["exp_cfg"].connect_error
+
+
+def test_worker_arguments_come_from_the_serve_command():
+    command = ["python", "-m", "wse.cli", "--workspace", "w", "serve", "--run-id", "r", "--setup", "a:b",
+               "--setup", "c:d", "--worker-args", "--poll-seconds 0.02 --device cpu"]
+    assert codex_cli.worker_arguments(command) == ["--setup", "a:b", "--setup", "c:d", "--poll-seconds", "0.02",
+                                                   "--device", "cpu"]
 
 
 def test_credentials_are_refused_in_codex_s_extra_environment():

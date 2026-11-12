@@ -175,8 +175,9 @@ def configured(engine, workspace, prepared):
     from safetensors.torch import save_file
 
     save_file({"layers.0.weight": torch.ones(2, 3)}, str(sandbox / "inputs" / "weights" / "base.safetensors"))
-    return {"workspace": workspace, "run_id": run_id, "session": session, "sandbox": sandbox,
-            "planted_env": prepared["planted_env"]}
+    yield {"workspace": workspace, "run_id": run_id, "session": session, "sandbox": sandbox,
+           "planted_env": prepared["planted_env"]}
+    asyncio.run(adapter.close(eid))  # stops the evaluation worker that start() began
 
 
 def _sandboxed(configured: dict[str, Any], command: str) -> subprocess.CompletedProcess[str]:
@@ -288,6 +289,7 @@ def test_a_real_codex_run_isolates_its_commands_and_keeps_credentials_out(engine
         "env; echo ENV-END",
         f"head -3 {codex_root / 'home' / 'skills' / 'wse' / 'SKILL.md'}",
         "python -c 'import numpy, torch, safetensors.torch; print(\"numpy\", numpy.__version__)'",
+        "echo INTERPRETERS $(command -v python) $(command -v python3)",
         "echo x > work/control.txt && cat work/control.txt > /dev/null && echo CONTROL-RUN-DIR-OK",
         f"cat {numpy_init} > /dev/null && echo CONTROL-NUMPY-OK",
         probe_script(probes),
@@ -321,6 +323,10 @@ def test_a_real_codex_run_isolates_its_commands_and_keeps_credentials_out(engine
     output = item["aggregated_output"]
     assert "CONTROL-RUN-DIR-OK" in output and "CONTROL-NUMPY-OK" in output and "numpy " in output
     assert "name: wse" in output  # the skill is readable
+    # Codex runs commands in a non-login shell, so both names find the environment's interpreter first.
+    (interpreters,) = [line.split()[1:] for line in output.splitlines() if line.startswith("INTERPRETERS ")]
+    bin_dir = result["provider_metadata"]["python"]["bin_dir"]
+    assert interpreters == [f"{bin_dir}/python", f"{bin_dir}/python3"] and "-lc" not in item["command"]
     assert probe_results(probes, output) == {label: "DENIED" for label in probes}
     # The command's environment is the allow-list: no token (by name or value) and no upstream credential.
     environment = dict(line.split("=", 1) for line in output.split("ENV-END")[0].splitlines() if "=" in line)
@@ -462,3 +468,27 @@ def test_codex_loads_no_instructions_or_configuration_from_around_the_run(signed
     sandbox = (workspace / "sandboxes" / run_id).resolve()
     assert "- wse: " in seen and "- canary" not in seen
     assert f"<root>{sandbox}</root>" in seen and f"<root>{checkout.resolve()}</root>" not in seen
+
+
+def test_codex_offers_no_sub_agents(engine, workspace, prepared):
+    """gpt-5.6-luna's code mode lists sub-agent tools; the adapter's configuration removes them."""
+    run_id = engine.grant_run(prepared["task_id"], SMALL_MODEL_POLICY_ID, prepared["task_checkpoint_id"]).run_id
+    script = ("try { const r = await tools.multi_agent_v1__spawn_agent({message: 'Say hello.'}); "
+              "text('SPAWNED ' + JSON.stringify(r)); } catch (e) { text('NO-SPAWN ' + String(e)); }")
+    probe = {"type": "custom_tool_call", "id": "ctc_1", "call_id": "call_1", "name": "exec", "input": script,
+             "status": "completed"}
+    fake = FakeResponses([[probe], [message("WSE-STOP: probed.", 2)]], token=TOKEN).start()
+    try:
+        runner = ReferenceRunner(workspace, setup=["wse_test_plugins:setup"], worker_args=FAST_WORKER,
+                                 serve_env={"PYTHONPATH": str(TESTS_DIR)}, settle_timeout_seconds=60,
+                                 adapter_factory=lambda config, eid: CodexCLIAdapter(
+                                     codex_path=BINARY.path, provider_config=fake.provider_config(PROXY_TOKEN_ENV),
+                                     proxy_token=TOKEN))
+        runner.run_experiment(run_id, prepared["task_id"], SMALL_MODEL_POLICY_ID,
+                              {"kind": "agent", "adapter": "codex_cli@1", "model": MODEL, "wall_clock_seconds": 300})
+    finally:
+        fake.stop()
+    assert runner.last_result["result"]["status"] == "completed"
+    (output,) = tool_outputs(fake.requests[1]["body"])
+    assert "NO-SPAWN" in output and "SPAWNED" not in output
+    assert len(fake.requests) == 2  # no sub-agent made a model request of its own

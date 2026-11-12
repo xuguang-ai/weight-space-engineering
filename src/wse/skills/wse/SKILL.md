@@ -98,7 +98,9 @@ starting model's evaluation so the two can be compared.
 
 - When `wse_evaluate` is listed, use it: one call waits until the evaluation finishes and returns the
   development report and its comparison with the starting model. An evaluation of a language model can take
-  many minutes; the call is allowed to take that long.
+  many minutes; the call is allowed to take that long. If a call is cut off before it returns, call it again
+  with the same `idempotency_key`: the evaluation keeps running, and the repeated call returns it without
+  charging again.
 - Otherwise submit with `wse_submit_evaluation` and wait with `wse_get_job`, always passing the largest
   `wait_seconds` it allows. Never poll in quick succession and never wait with shell `sleep` loops: each
   poll adds to your context and gains nothing.

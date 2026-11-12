@@ -36,8 +36,7 @@ def wse_call(tool: str, arguments: dict[str, Any], index: int) -> dict[str, Any]
 
 def shell(command: str, index: int) -> dict[str, Any]:
     """A shell command, run through Codex's code-mode ``exec`` tool (the tool surface of gpt-5.6-luna)."""
-    script = (f"const r = await tools.exec_command({{cmd: {json.dumps(command)}, login: false}});\n"
-              "text(r.output);\n")
+    script = f"const r = await tools.exec_command({{cmd: {json.dumps(command)}}});\ntext(r.output);\n"
     return {"type": "custom_tool_call", "id": f"ctc_{index}", "call_id": f"call_{index}", "name": "exec",
             "input": script, "status": "completed"}
 

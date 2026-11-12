@@ -12,10 +12,13 @@ JSONL events into the normalized ``AgentEvent`` records of
   run's log directory (``<log_dir>/codex-<run_id>/home``, outside the
   sandbox's readable roots): ``config.toml`` (``codex_config``) and the WSE
   skill at ``skills/wse/SKILL.md``, which Codex lists to the model in its
-  "## Skills" catalog. Bundled Codex skills, project documents, plugins,
-  apps, web search, image tools, sub-agent features, hooks, memories, and
-  analytics are switched off, and ``--strict-config`` makes Codex reject a
-  key it does not know.
+  "## Skills" catalog. Bundled Codex skills, project documents and project
+  roots (``project_doc_max_bytes = 0``, ``project_root_markers = []``: no
+  ``AGENTS.md`` or ``.codex`` configuration from the directories around the
+  run), plugins, apps, web search, image tools, sub-agents, hooks, memories,
+  and analytics are switched off; Codex's own home directory is an empty one
+  of the run, and ``--strict-config`` makes Codex reject a key it does not
+  know.
 * **Model access.** Codex talks to the model only through a provider
   fragment (``provider_config``, for example the local model proxy's
   ``codex_provider_config``) whose ``env_key`` names
@@ -38,13 +41,25 @@ JSONL events into the normalized ``AgentEvent`` records of
   own distribution, whose metadata holds its README, stays unreadable.
   ``/tmp`` is denied, because Codex otherwise grants writes there, and
   network access for commands is off. The shell environment is set
-  explicitly (``shell_environment_policy.inherit = "none"``).
+  explicitly (``shell_environment_policy.inherit = "none"``), and commands run
+  in a non-login shell (``allow_login_shell = false``), so macOS's
+  ``path_helper`` cannot put ``/usr/bin/python3`` before the environment's
+  interpreter.
 * **Tools.** The WSE MCP tools are exposed as direct function tools with
-  their schemas (``features.code_mode.direct_only_tool_namespaces``), limited
-  to the runner's allow-list (``enabled_tools``), approved without asking
-  (approval policy ``never``), and allowed to block for up to the run's
-  wall-clock limit (``tool_timeout_sec``), so a blocking evaluation needs one
-  call instead of many polls.
+  their schemas (``features.code_mode.direct_only_tool_namespaces``); Codex's
+  sub-agent tools are removed (``excluded_tool_namespaces``). The WSE tools
+  are limited to the runner's allow-list (``enabled_tools``), approved
+  without asking (approval policy ``never``), and each call may block for the
+  run's wall-clock limit, and at least for the runner's session timeout, which
+  covers the policy's longest call (``tool_timeout_sec``), so a blocking
+  evaluation needs one call instead of many polls.
+* **Jobs.** The adapter runs the workspace's evaluation worker itself
+  (``wse.worker.WorkerSupervisor``, with the server's allow-listed
+  environment and setup hooks) from ``start`` until ``close``, and starts
+  ``wse serve`` with ``--no-worker``: each Codex process starts its own MCP
+  server, so jobs outlive a server that ends with its segment, keep running
+  across resumes, and are settled by a live worker when the runner
+  finalizes.
 * **Segments and resume.** ``run`` starts ``codex exec`` in the sandbox
   directory. When Codex ends its turn while the runner has not asked it to
   stop (the runner's stop monitor checks after every tool result) and the
@@ -56,8 +71,8 @@ JSONL events into the normalized ``AgentEvent`` records of
   turn limit counts model requests. ``cancel`` (any thread), the wall-clock
   limit, and the turn limit stop Codex's process group with SIGINT, then
   SIGTERM and SIGKILL after grace periods; afterwards every descendant
-  process seen while Codex ran (its MCP server and that server's worker) is
-  waited for and, if still alive, terminated, so nothing outlives the run.
+  process seen while Codex ran (its MCP server among them) is waited for and,
+  if still alive, terminated, so nothing outlives the run.
 * **Events, usage, and logs.** Each segment's raw JSONL stream and standard
   error are kept in the run's log directory. ``mcp_tool_call`` items become
   ``tool_call``/``tool_result`` events (``ok`` or the WSE error code);
@@ -117,6 +132,7 @@ from wse.agent_adapters.base import (
 from wse.schemas import ErrorCode, WSEError, content_hash
 
 __all__ = [
+    "worker_arguments",
     "CODEX_PATH_ENV",
     "CODEX_TEAM_IDENTIFIER",
     "PROFILE_NAME",
@@ -164,6 +180,9 @@ VSCODE_EXTENSION_DIRS = ("~/.vscode/extensions", "~/.vscode-insiders/extensions"
 DISABLED_FEATURES = ("apps", "browser_use", "computer_use", "goals", "hooks", "image_generation", "in_app_browser",
                      "memories", "multi_agent", "plugins", "remote_plugin", "shell_snapshot", "tool_suggest",
                      "view_image")
+# Tool namespaces removed from Codex's code-mode tools: sub-agents (``features.multi_agent = false`` alone leaves
+# ``multi_agent_v1__spawn_agent`` callable for gpt-5.6-luna in 0.167), which would run model sessions of their own.
+EXCLUDED_TOOL_NAMESPACES = ("multi_agent_v1",)
 # Failures that a new turn cannot fix; anything else that ends a turn is retried by a resume.
 NON_RECOVERABLE = re.compile(r"\b(401|403|404)\b|unauthori[sz]ed|forbidden|invalid[_ ]api[_ ]key|model[_ ]not[_ ]found|"
                              r"context[_ ]window|configuration|config\.toml|not supported", re.IGNORECASE)
@@ -435,6 +454,9 @@ def codex_config(*, model: str, connection: RunConnection, sandbox_root: Path, s
     config: dict[str, Any] = {
         "model": model,
         "approval_policy": "never",
+        # A login shell runs /etc/profile, whose path_helper puts /usr/bin (and its python3) before the environment's
+        # interpreter; commands run as `bash -c` with exactly the PATH below.
+        "allow_login_shell": False,
         "default_permissions": PROFILE_NAME,
         "check_for_update_on_startup": False,
         "web_search": "disabled",
@@ -452,7 +474,8 @@ def codex_config(*, model: str, connection: RunConnection, sandbox_root: Path, s
         "history": {"persistence": "none"},
         "analytics": {"enabled": False},
         "features": {**{name: False for name in DISABLED_FEATURES},
-                     "code_mode": {"direct_only_tool_namespaces": [MCP_NAMESPACE]}},
+                     "code_mode": {"direct_only_tool_namespaces": [MCP_NAMESPACE],
+                                   "excluded_tool_namespaces": list(EXCLUDED_TOOL_NAMESPACES)}},
         "skills": {"bundled": {"enabled": False}},
         "shell_environment_policy": {"inherit": "none", "set": shell_environment(sandbox_root, python)},
         "permissions": {PROFILE_NAME: {"filesystem": filesystem_rules(sandbox_root, skill_dir, python),
@@ -835,6 +858,7 @@ class _Session:
     wake: asyncio.Event | None = None
     proxy: Any = None
     token: str | None = None
+    worker: Any = None
 
 
 @dataclass
@@ -1004,6 +1028,10 @@ class CodexCLIAdapter(AgentAdapter):
             (session.paths.skill / "SKILL.md").write_text(skill_text(), encoding="utf-8")
             python = await asyncio.to_thread(python_access, session.paths.pythonpath)
             provider, session.token = self._provider(session)
+            if "--no-worker" not in connection.serve_command:
+                session.worker = await asyncio.to_thread(self._start_worker, connection)
+                connection = connection.model_copy(update={"serve_command": [*connection.serve_command,
+                                                                             "--no-worker"]})
             tool_timeout = (self.tool_timeout_seconds if self.tool_timeout_seconds is not None else
                             max(agent_config.client_session_timeout_seconds, agent_config.wall_clock_seconds))
             config = codex_config(model=agent_config.model, connection=connection, sandbox_root=sandbox,
@@ -1011,7 +1039,8 @@ class CodexCLIAdapter(AgentAdapter):
                                   startup_timeout_seconds=agent_config.connect_timeout_seconds,
                                   tool_timeout_seconds=tool_timeout, model_settings=agent_config.model_settings)
             (session.paths.home / "config.toml").write_text(toml_dumps(config), encoding="utf-8")
-            session.settings = {"tool_timeout_sec": config["mcp_servers"][MCP_SERVER_NAME]["tool_timeout_sec"],
+            session.settings = {"worker": "adapter" if session.worker is not None else "runner",
+                                "tool_timeout_sec": config["mcp_servers"][MCP_SERVER_NAME]["tool_timeout_sec"],
                                 "startup_timeout_sec": config["mcp_servers"][MCP_SERVER_NAME]["startup_timeout_sec"],
                                 "python": {"bin_dir": python.bin_dir, "pythonpath": python.pythonpath,
                                            "linked": list(python.linked), "denied": list(python.denied)},
@@ -1023,6 +1052,15 @@ class CodexCLIAdapter(AgentAdapter):
         except Exception as exc:  # noqa: BLE001 - every setup failure is reported by run()
             session.connect_error = describe_exception(exc)
             await self._stop_proxy(session)
+            await self._stop_worker(session)
+
+    @staticmethod
+    def _start_worker(connection: RunConnection) -> Any:
+        """The workspace's evaluation worker, with the server's environment and setup hooks (module docstring)."""
+        from wse.worker import WorkerSupervisor
+
+        return WorkerSupervisor(connection.workspace, extra_args=worker_arguments(connection.serve_command),
+                                env=dict(connection.serve_env)).start()
 
     @staticmethod
     def prompt(connection: RunConnection, paths: _Paths) -> str:
@@ -1054,6 +1092,16 @@ class CodexCLIAdapter(AgentAdapter):
             session = self._sessions.pop(experiment_id, None)
         if session is not None:
             await self._stop_proxy(session)
+            await self._stop_worker(session)
+
+    @staticmethod
+    async def _stop_worker(session: _Session) -> None:
+        worker, session.worker = session.worker, None
+        if worker is not None:
+            try:
+                await asyncio.to_thread(worker.stop, 5.0)
+            except Exception:  # noqa: BLE001 - stopping the worker must not mask the run's outcome
+                logger.exception("stopping the evaluation worker failed")
 
     @staticmethod
     async def _stop_proxy(session: _Session) -> None:
@@ -1381,6 +1429,19 @@ def _stderr_errors(path: Path, tail_bytes: int = 8192) -> list[str]:
         return []
     errors = [line.strip() for line in lines if re.search(r"\berror\b", line, re.IGNORECASE)]
     return [line[:2000] for line in errors[-3:]]
+
+
+def worker_arguments(serve_command: Sequence[str]) -> list[str]:
+    """The worker options that a ``wse serve`` command would pass its worker: ``--setup`` hooks and ``--worker-args``."""
+    import shlex
+
+    command, arguments = list(serve_command), []
+    for index, item in enumerate(command[:-1]):
+        if item == "--setup":
+            arguments += ["--setup", command[index + 1]]
+        elif item == "--worker-args":
+            arguments += shlex.split(command[index + 1])
+    return arguments
 
 
 def _files_containing(root: Path, secret: str, max_bytes: int = 256 << 20) -> list[str]:
