@@ -98,7 +98,7 @@ import secrets
 import sqlite3
 import time
 from collections.abc import Callable, Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
@@ -167,6 +167,9 @@ if TYPE_CHECKING:
 PATCH_URI_PREFIX = "wse://patches/"
 TASK_ID_PATTERN = r"^[A-Za-z0-9_.\-]{1,128}$"
 INSPECTION_CURSOR_PREFIX = "tensors:"
+# The writer of a submitted file that no sandbox call listed (``ExperimentService._submission_source``).
+NOT_RECORDED_WRITER = ("not recorded: WSE did not record whether the agent's own commands or a sandbox call "
+                       "wrote this file")
 # The widest JSON form of a measured float (23 characters): agent-facing results are sized with it in place of
 # measured times and statistics, so that whether they fit never depends on a measurement.
 _WIDEST_FLOAT = 2.2250738585072014e-308
@@ -961,9 +964,10 @@ class ExperimentService:
         """Build a candidate from a stored tensor file of the run's sandbox (``CandidateSubmission``).
 
         ``tensor_file`` names a file a sandbox call saved (``wse://tensors/...``);
-        ``path`` instead names a ``.safetensors`` file that the agent's own
-        code wrote under ``outputs/`` or ``work/`` of the run's directory,
-        which is stored first (``wse.sandbox_runs.store_agent_tensor_file``).
+        ``path`` instead names a ``.safetensors`` file under ``outputs/`` or
+        ``work/`` of the run's directory, which is stored first
+        (``wse.sandbox_runs.store_agent_tensor_file``), once the budget is
+        known to cover the preview and the commit.
 
         Each named tensor (default: every tensor of the file) replaces the
         tensor of the same name in ``parent_checkpoint_id``, a checkpoint of
@@ -971,7 +975,8 @@ class ExperimentService:
         file's ownership and hash, each tensor's name, shape, stored dtype,
         and finiteness, and the protections of every edit, and the commit
         creates the candidate. It charges one preview and one commit. A
-        retry with the same key returns the first result.
+        retry with the same key returns the first result. The submission's
+        ``source`` comes from what it used (``_submission_source``).
         """
         _check_key(key)
         row = self._experiment_row(experiment_id)
@@ -993,10 +998,18 @@ class ExperimentService:
             raise WSEError(ErrorCode.POLICY_DENIED, f"policy {policy.policy_id} does not permit replace_tensor, so "
                            "tensors computed in the sandbox cannot be submitted",
                            details={"policy_id": policy.policy_id})
+        if not isinstance(hypothesis, str) or not hypothesis.strip():
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, "hypothesis must state, in one or two sentences, the evidence "
+                           "for this candidate")
+        # Before any file is copied into the store: the submission must be able to preview and commit.
+        self.ledger.require(self.db.conn, experiment_id,
+                            {"patch_previews": 1, "candidate_commits": 1, "compute_seconds": 0})
+        submitted_path = None
         if path is not None:
             from wse.sandbox_runs import store_agent_tensor_file
 
             tensor_file = store_agent_tensor_file(self, experiment_id, path)
+            submitted_path = str(PurePosixPath(path))
         file_row = self.db.conn.execute(
             "SELECT * FROM tensor_files WHERE uri = ? AND experiment_id = ?",
             (tensor_file if isinstance(tensor_file, str) else "", experiment_id)).fetchone()
@@ -1015,9 +1028,6 @@ class ExperimentService:
             names = list(tensors)
         else:
             raise WSEError(ErrorCode.INVALID_ARGUMENT, "tensors must be a non-empty list of tensor names, or omitted")
-        if not isinstance(hypothesis, str) or not hypothesis.strip():
-            raise WSEError(ErrorCode.INVALID_ARGUMENT, "hypothesis must state, in one or two sentences, the evidence "
-                           "for this candidate")
         limit = policy.operations.limits.max_patch_operations
         if len(names) > limit:
             raise WSEError(ErrorCode.INVALID_ARGUMENT, f"a candidate replaces at most {limit} tensors; this file "
@@ -1042,10 +1052,7 @@ class ExperimentService:
             raise WSEError(ErrorCode.INVALID_PATCH, "the submitted tensors equal the parent checkpoint's; there is no "
                            "candidate to commit", details={"patch_id": preview.patch_id})
         candidate = self.apply_patch(experiment_id, preview.patch_id, f"submission-{stem}-apply")
-        call = int(file_row["call"])
-        source = {"tensor_file": tensor_file, "call": call, "path": file_row["path"], "sha256": file_row["sha256"],
-                  "code_sha256": self._call_code_hash(experiment_id, call) if call else None,
-                  "written_by": "a sandbox call" if call else "the agent's own code"}
+        source = self._submission_source(experiment_id, str(tensor_file), file_row, submitted_path)
         diffs = {diff.tensor: diff for diff in preview.tensors}
         submission = CandidateSubmission(
             patch_id=preview.patch_id, checkpoint_id=candidate.checkpoint_id,
@@ -1075,6 +1082,52 @@ class ExperimentService:
             if event.get("event_type") == "sandbox.ran" and payload.get("call") == call:
                 return payload.get("code_sha256")
         return None
+
+    def _submission_source(self, experiment_id: str, uri: str, file_row: sqlite3.Row,
+                           path: str | None) -> dict[str, Any]:
+        """Where a submission's values came from, from what this submission used (``CandidateSubmission.source``).
+
+        The sandbox calls' listings come from their ``sandbox.ran`` events. A
+        ``tensor_file`` (``path`` is ``None``) names the latest call that
+        listed it; a ``path`` names a call only when that call listed exactly
+        that file: the same path under ``outputs/`` and the same SHA-256. The
+        ``tensor_files`` row, which keeps whichever route stored the bytes
+        first, never decides the source of a submission by the other route.
+        """
+        sha256 = file_row["sha256"]
+        listings = [((event.get("payload") or {}).get("call"), (event.get("payload") or {}).get("code_sha256"),
+                     (event.get("payload") or {}).get("outputs") or [])
+                    for event in self.audit_log(experiment_id) if event.get("event_type") == "sandbox.ran"]
+
+        def lists_file(entry: dict[str, Any]) -> bool:
+            if "tensor_file" in entry:
+                return entry["tensor_file"] == uri
+            # An event recorded before outputs named their tensor files: the same bytes in a .safetensors output.
+            return entry.get("sha256") == sha256 and str(entry.get("path", "")).endswith(".safetensors")
+
+        unrecorded = {"tensor_file": uri, "call": None, "path": path if path is not None else file_row["path"],
+                      "sha256": sha256, "code_sha256": None, "written_by": NOT_RECORDED_WRITER}
+        if path is not None:
+            parts = PurePosixPath(path).parts
+            inside = "/".join(parts[1:]) if parts[0] == "outputs" else None
+            matches = [(call, code) for call, code, outputs in listings for entry in outputs
+                       if inside is not None and entry.get("path") == inside and entry.get("sha256") == sha256]
+            if not matches:
+                return unrecorded
+            call, code = matches[-1]
+            return {"tensor_file": uri, "call": call, "path": path, "sha256": sha256, "code_sha256": code,
+                    "written_by": "a sandbox call"}
+        matches_by_uri = [(call, code, entry.get("path")) for call, code, outputs in listings for entry in outputs
+                          if lists_file(entry)]
+        if matches_by_uri:
+            call, code, listed = matches_by_uri[-1]
+            return {"tensor_file": uri, "call": call, "path": listed, "sha256": sha256, "code_sha256": code,
+                    "written_by": "a sandbox call"}
+        stored_by = int(file_row["call"])
+        if stored_by:  # a sandbox call's record without a listing event
+            return {"tensor_file": uri, "call": stored_by, "path": file_row["path"], "sha256": sha256,
+                    "code_sha256": self._call_code_hash(experiment_id, stored_by), "written_by": "a sandbox call"}
+        return unrecorded
 
     def experiment_results(self, experiment_id: str) -> Callable[[Any], dict[str, Any]]:
         """A reader of the stored results that ``experiment_id`` produced: its analyses and generation outputs.

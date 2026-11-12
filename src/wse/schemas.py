@@ -718,8 +718,12 @@ class SandboxRun(_Frozen):
     under ``inputs/``; ``outputs`` what it left in ``outputs/`` (at most
     ``MAX_LISTED_OUTPUTS``; ``outputs_not_listed`` counts the rest);
     ``refused_outputs`` the links and other non-regular files there, which
-    WSE never follows. ``usage`` is what the call charged: one sandbox call
-    and its wall-clock seconds, not metered computation.
+    WSE never follows. ``repairs``, when present, says which of the run's
+    directories (``inputs/``, ``work/``, ``outputs/``, ``tmp/``, ``calls/``)
+    was not a real directory before or after the call (a link, say) and was
+    replaced by a new, empty one; WSE removed the entry itself, never what it
+    pointed to. ``usage`` is what the call charged: one sandbox call and its
+    wall-clock seconds, not metered computation.
     """
 
     schema_version: Literal["1"] = SCHEMA_VERSION
@@ -747,6 +751,7 @@ class SandboxRun(_Frozen):
     restarted: bool
     state_kept: bool
     outputs_not_listed: int | None = _optional(ge=1)
+    repairs: list[str] | None = _optional()
 
 
 class SubmittedTensor(_Frozen):
@@ -764,9 +769,16 @@ class CandidateSubmission(_Frozen):
     The candidate is the parent checkpoint with each named tensor replaced by
     the file's tensor of the same name (``replace_tensor@1``), recorded as an
     exact patch (``patch_id``) after the checks of every edit. ``source``
-    records where the values came from: the tensor file, the sandbox call
-    that saved it, its path in ``outputs/``, its SHA-256, and that call's code
-    hash. ``usage`` is one preview and one commit.
+    records where the values came from, from what this submission used: the
+    tensor file and its SHA-256, and ``call``, ``path``, ``code_sha256``, and
+    ``written_by``. A ``tensor_file`` that a sandbox call listed names that
+    call (the latest one, if several did), its code hash, and the file's path
+    in ``outputs/``. A ``path`` names that path, relative to the run's
+    directory, and a sandbox call only when that call listed exactly that
+    file (the same path under ``outputs/`` and the same SHA-256); otherwise
+    ``call`` and ``code_sha256`` are ``None`` and ``written_by`` says that WSE
+    did not record whether the agent's commands or a sandbox call wrote it.
+    ``usage`` is one preview and one commit.
     """
 
     schema_version: Literal["1"] = SCHEMA_VERSION

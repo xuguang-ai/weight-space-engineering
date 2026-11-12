@@ -19,7 +19,11 @@ libraries, devices, and services every process needs), and then allows only:
   package stay unreadable;
 * reading ``inputs/`` and ``calls/``, and the sandbox root itself, which
   Python needs to resolve its working directory;
-* reading and writing ``work/``, ``outputs/``, and ``tmp/``;
+* reading and writing what is inside ``work/``, ``outputs/``, and ``tmp/``,
+  but not those directories themselves: a rule after the allow (Seatbelt
+  applies the last matching rule) denies removing, renaming, replacing, or
+  changing the entries ``inputs``, ``work``, ``outputs``, and ``tmp``, so the
+  code cannot put a link where WSE expects one of them;
 * the metadata of the directories above those paths, which path
   resolution needs, and nothing else of them.
 
@@ -28,6 +32,15 @@ and the database among it), the repository, the user's files, other
 executables, new processes, and the network. The profile is written next to
 the sandbox directory, not inside it. The environment is an allow-list
 (``ENVIRONMENT_NAMES``), so no credential reaches the process.
+
+**The host side.** WSE never resolves a path inside the sandbox directory
+that agent code can change, and never follows a link there. It opens the
+root without following a link, and ``inputs/``, ``work/``, ``outputs/``,
+``tmp/``, and ``calls/`` relative to it the same way; an entry that is not a
+real directory (a link, a file, a FIFO that the agent's own commands left)
+is removed itself, never what it points to, a new directory is made in its
+place, and the result of the call says so (``repairs``). WSE checks before
+each call and again after it, before it lists ``outputs/``.
 
 A framework build of Python (python.org's macOS installer) starts its real
 interpreter from a launcher with ``posix_spawn``; the sandbox runs that
@@ -57,12 +70,20 @@ start and end around a marker) and stored, up to its first
 ``STORED_OUTPUT_BYTES`` and last ``TAIL_BYTES``, in ``calls/<n>/``.
 
 ``outputs/`` is emptied before each call, so a call's outputs are the files
-it wrote there; ``work/`` keeps files between calls. Only regular files
-with a single link count as outputs. The server never follows a symbolic
-link or a hard link that the sandboxed code made: either could point at a
-file the sandbox itself cannot read. Each call keeps a copy of its output
-files of at most ``KEPT_OUTPUT_BYTES`` in ``calls/<n>/outputs/``, for the
-record.
+it wrote there; ``work/`` keeps files between calls. WSE empties it by
+renaming the directory aside (relative to the root's descriptor), making a
+new one, and deleting the old tree by descriptor without following a link.
+Only regular files with a single link count as outputs. WSE lists
+``outputs/`` from descriptors only: each entry is opened relative to its
+directory's descriptor without following a link and without waiting on a
+FIFO, and is listed only if that descriptor is a regular file with a single
+link (a hard link could name a file the sandbox itself cannot read); links,
+FIFOs, sockets, hard-linked files, and directories deeper than
+``MAX_OUTPUT_DEPTH`` are refused, never followed. Each file is hashed, kept,
+and handed on from the one descriptor it was opened as: a call keeps a copy
+of its output files of at most ``KEPT_OUTPUT_BYTES`` in
+``calls/<n>/outputs/``, for the record, and ``run_python``'s ``use_output``
+reads the first ones from their descriptors.
 
 The isolation is offered only on macOS with ``/usr/bin/sandbox-exec``, and
 only after a self-check confirms that an allowed read works and a read
@@ -72,7 +93,10 @@ outside the allow-list fails (``available``). Elsewhere it fails closed.
 from __future__ import annotations
 
 import atexit
+import bisect
+import contextlib
 import ctypes
+import errno
 import functools
 import hashlib
 import importlib.metadata
@@ -90,8 +114,9 @@ import sys
 import tempfile
 import threading
 import time
-from dataclasses import asdict, dataclass
-from pathlib import Path
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, dataclass, field
+from pathlib import Path, PurePosixPath
 from typing import IO, Any
 
 from wse.schemas import ErrorCode, WSEError
@@ -107,7 +132,14 @@ OUTPUT_SETTLE_SECONDS = 2.0  # how long the end-of-call markers may trail the ke
 # The libraries agent code may import; their declared dependencies come with them (``_analysis_entries``).
 ANALYSIS_DISTRIBUTIONS = ("numpy", "torch", "safetensors")
 KEPT_OUTPUT_BYTES = 1 << 20
-ENVIRONMENT_NAMES = ("HOME", "LANG", "MPLCONFIGDIR", "PATH", "PYTHONIOENCODING", "TMPDIR", "XDG_CACHE_HOME",
+MAX_OUTPUT_DEPTH = 32  # levels of directories in outputs/ that are listed; a directory deeper is refused
+SANDBOX_DIRECTORIES = ("inputs", "work", "outputs", "tmp", "calls")  # each a real directory, checked by descriptor
+PROTECTED_DIRECTORIES = ("inputs", "work", "outputs", "tmp")  # entries the kernel may not remove, rename, or replace
+_REMOVED_PREFIX = ".wse-removed-"  # an emptied outputs/, renamed aside in the root until it is deleted
+# Opening an entry agent code may have made: never through a link, never waiting on a FIFO.
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+ENVIRONMENT_NAMES =("HOME", "LANG", "MPLCONFIGDIR", "PATH", "PYTHONIOENCODING", "TMPDIR", "XDG_CACHE_HOME",
                      "__PYVENV_LAUNCHER__")
 # The kernel: limits, then one call per request line, in one namespace. Requests arrive on their own descriptor and
 # replies leave on another, so the code's standard input is empty and its standard output is its own.
@@ -184,8 +216,94 @@ serve()
 """
 
 __all__ = ["ANALYSIS_DISTRIBUTIONS", "DEFAULT_MEMORY_LIMIT", "ENVIRONMENT_NAMES", "KEPT_OUTPUT_BYTES", "Kernel",
-           "OutputFile", "SandboxLayout", "SandboxResult", "available", "close_kernels", "footprint", "kernel_for",
-           "profile_text", "read_output", "run_python", "shorten"]
+           "MAX_OUTPUT_DEPTH", "NotRegularFile", "OutputFile", "SandboxLayout", "SandboxResult", "available",
+           "close_kernels", "footprint", "kernel_for", "list_outputs", "open_beneath", "profile_text", "read_output",
+           "run_python", "shorten"]
+
+
+class NotRegularFile(OSError):
+    """An entry of the sandbox directory that is not a regular file: a FIFO, a socket, a directory, or a device."""
+
+
+def _kind(mode: int) -> str:
+    """What a file of ``mode`` is, as a phrase."""
+    if stat.S_ISLNK(mode):
+        return "a symbolic link"
+    if stat.S_ISREG(mode):
+        return "a regular file"
+    if stat.S_ISDIR(mode):
+        return "a directory"
+    if stat.S_ISFIFO(mode):
+        return "a FIFO"
+    if stat.S_ISSOCK(mode):
+        return "a socket"
+    return "a device or other special file"
+
+
+def _open_root(root: Path) -> int:
+    """Open a sandbox's root, which only WSE writes, as a directory; its last level is never followed as a link."""
+    root.mkdir(parents=True, exist_ok=True)
+    return os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+
+def _ensure_directory(parent: int, name: str) -> tuple[int, str | None]:
+    """Open ``name`` in the directory ``parent`` as a real directory, making it when missing; return it and what it replaced.
+
+    The entry is opened without following a link. An entry of any other kind
+    (a link, a file, a FIFO) is removed itself, never what it points to, and a
+    new, empty directory is made in its place; the second value then says
+    what the entry was.
+    """
+    replaced = None
+    for _ in range(8):  # an entry that agent code keeps changing is retried, then reported as an error
+        try:
+            return os.open(name, _DIRECTORY_FLAGS, dir_fd=parent), replaced
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            if exc.errno not in (errno.ELOOP, errno.ENOTDIR):
+                raise
+            try:
+                info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                info = None
+            if info is not None and not stat.S_ISDIR(info.st_mode):
+                os.unlink(name, dir_fd=parent)  # unlink removes the entry itself; it never follows a link
+                replaced = _kind(info.st_mode)
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(name, dir_fd=parent)
+    raise OSError(errno.EAGAIN, f"{name} kept changing while WSE made it a directory")
+
+
+def _repair_note(name: str, kind: str, when: str) -> str:
+    return (f"{name}/ was {kind}, not a directory, {when}: WSE removed that entry itself (not what it pointed to) "
+            f"and made a new, empty {name}/")
+
+
+def _open_layout(root: Path, when: str) -> tuple[int, list[str]]:
+    """Open the sandbox root and make each of ``SANDBOX_DIRECTORIES`` a real directory; return the root and the repairs."""
+    descriptor = _open_root(root)
+    repairs = []
+    try:
+        for name in SANDBOX_DIRECTORIES:
+            child, replaced = _ensure_directory(descriptor, name)
+            os.close(child)
+            if replaced is not None:
+                repairs.append(_repair_note(name, replaced, when))
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, repairs
+
+
+# Repairs made outside a call (``SandboxLayout.create``), which the next call in this process reports.
+_PENDING_REPAIRS: dict[Path, list[str]] = {}
+_PENDING_LOCK = threading.Lock()
+
+
+def _take_repairs(root: Path) -> list[str]:
+    with _PENDING_LOCK:
+        return _PENDING_REPAIRS.pop(root, [])
 
 
 @dataclass(frozen=True)
@@ -223,8 +341,17 @@ class SandboxLayout:
         return self.root.parent / f"{self.root.name}.sb"
 
     def create(self) -> SandboxLayout:
-        for directory in (self.inputs, self.work, self.outputs, self.tmp, self.calls):
-            directory.mkdir(parents=True, exist_ok=True)
+        """Make the sandbox's directories, each a real directory, opened by descriptor without following a link.
+
+        An entry that is not a directory is removed itself, never what it
+        points to, and replaced by a new directory; the next call's result
+        says so (``SandboxResult.repairs``).
+        """
+        descriptor, repairs = _open_layout(self.root, "found outside a call")
+        os.close(descriptor)
+        if repairs:
+            with _PENDING_LOCK:
+                _PENDING_REPAIRS.setdefault(self.root, []).extend(repairs)
         return self
 
 
@@ -249,7 +376,9 @@ class SandboxResult:
     and ``signal``). ``stdout`` and ``stderr`` are bounded for the agent;
     ``calls/<call>/`` stores them (``STORED_OUTPUT_BYTES`` and ``TAIL_BYTES``).
     ``session`` counts the kernels this sandbox started, and ``session_call``
-    the calls of this kernel, this one included.
+    the calls of this kernel, this one included. ``repairs`` says which of
+    the sandbox's directories was not a real directory before or after the
+    call and was replaced (module docstring).
     """
 
     call: int
@@ -273,6 +402,7 @@ class SandboxResult:
     session_call: int
     restarted: bool
     state_kept: bool
+    repairs: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -397,6 +527,9 @@ def profile_text(layout: SandboxLayout) -> str:
         f"{group('literal', list(runtime.files))})",
         f"(allow file-read* (literal {_quoted(layout.root)}) {group('subpath', [layout.inputs, layout.calls])})",
         f"(allow file-read* file-write* {group('subpath', [layout.work, layout.outputs, layout.tmp])})",
+        # After the allow it narrows, because Seatbelt applies the last matching rule: the directory entries
+        # themselves cannot be removed, renamed, replaced, or changed, only what is inside them.
+        f"(deny file-write* {group('literal', [layout.root / name for name in PROTECTED_DIRECTORIES])})",
         f"(allow file-read-metadata {group('literal', _ancestors(allowed))})",
         "(allow signal (target self))",
     ]
@@ -562,76 +695,277 @@ def footprint(pid: int) -> int | None:
         return None
 
 
-def _sha256_file(path: Path) -> str:
+def open_beneath(directory: int, parts: Sequence[str]) -> tuple[int, os.stat_result]:
+    """Open the regular file ``parts`` below the directory ``directory`` for reading; return it and its status.
+
+    Each level is opened relative to the descriptor of the one above it,
+    without following a link and without waiting on a FIFO; the file's
+    descriptor is returned in blocking mode. ``NotRegularFile`` (an
+    ``OSError``) when the entry is not a regular file, ``ValueError`` for a
+    part that cannot name an entry below ``directory`` (empty, ``.``, ``..``,
+    or holding a NUL byte).
+    """
+    if not parts or any(part in ("", ".", "..") or "/" in part for part in parts):
+        raise ValueError(f"{'/'.join(parts)!r} does not name an entry below the directory")
+    current = directory
+    try:
+        for part in parts[:-1]:
+            child = os.open(part, _DIRECTORY_FLAGS, dir_fd=current)
+            if current != directory:
+                os.close(current)
+            current = child
+        descriptor = os.open(parts[-1], _FILE_FLAGS, dir_fd=current)
+    finally:
+        if current != directory:
+            os.close(current)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise NotRegularFile(errno.EINVAL, f"{'/'.join(parts)} is {_kind(info.st_mode)}, not a regular file")
+        os.set_blocking(descriptor, True)
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, info
+
+
+def read_descriptor(descriptor: int, limit: int) -> tuple[str, int, bytes | None]:
+    """The SHA-256 and length of the file open at ``descriptor``, read from its start, and its bytes if at most ``limit``.
+
+    The descriptor is left at the file's start.
+    """
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return "sha256:" + digest.hexdigest()
+    kept: bytearray | None = bytearray()
+    total = 0
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while block := os.read(descriptor, 1 << 20):
+        digest.update(block)
+        total += len(block)
+        if kept is not None:
+            kept += block
+            if len(kept) > limit:
+                kept = None
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return "sha256:" + digest.hexdigest(), total, None if kept is None else bytes(kept)
+
+
+def _write_copy(target: Path, data: bytes) -> None:
+    """Write a kept copy below ``calls/<n>/outputs/``, which only WSE writes; a path too long to copy is skipped."""
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    except OSError as exc:
+        if exc.errno != errno.ENAMETOOLONG:
+            raise
+
+
+@dataclass
+class _Listing:
+    """``outputs/`` as listed by descriptor; ``held`` keeps the descriptors of its first files, sorted by path."""
+
+    outputs: list[OutputFile] = field(default_factory=list)
+    refused: list[str] = field(default_factory=list)
+    held: list[tuple[str, int]] = field(default_factory=list)
+
+    def close(self) -> None:
+        held, self.held = self.held, []
+        for _, descriptor in held:
+            os.close(descriptor)
+
+
+def _hold(listing: _Listing, path: str, descriptor: int, hold: int) -> bool:
+    """Keep ``descriptor`` if ``path`` is among the first ``hold`` paths so far; whether it was kept."""
+    if hold <= 0:
+        return False
+    bisect.insort(listing.held, (path, descriptor))
+    if len(listing.held) <= hold:
+        return True
+    dropped_path, dropped = listing.held.pop()
+    if dropped_path == path:
+        return False
+    os.close(dropped)
+    return True
+
+
+def _walk(directory: int, prefix: str, depth: int, listing: _Listing, copies: Path | None, hold: int) -> None:
+    with os.scandir(directory) as entries:
+        names = sorted(entry.name for entry in entries)
+    for name in names:
+        relative = prefix + name
+        try:
+            descriptor = os.open(name, _FILE_FLAGS, dir_fd=directory)
+        except FileNotFoundError:
+            continue  # removed since the directory was listed
+        except OSError:  # a link (never followed), a socket, or anything else that cannot be opened as it is
+            listing.refused.append(relative)
+            continue
+        held = False
+        try:
+            info = os.fstat(descriptor)
+            if stat.S_ISDIR(info.st_mode):
+                if depth + 1 < MAX_OUTPUT_DEPTH:
+                    _walk(descriptor, relative + "/", depth + 1, listing, copies, hold)
+                else:
+                    listing.refused.append(relative)
+            elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                listing.refused.append(relative)  # a FIFO, a device, or a file with another link
+            else:
+                os.set_blocking(descriptor, True)
+                sha256, size, data = read_descriptor(descriptor, KEPT_OUTPUT_BYTES if copies is not None else -1)
+                listing.outputs.append(OutputFile(relative, size, sha256))
+                if copies is not None and data is not None:
+                    _write_copy(copies / relative, data)
+                held = _hold(listing, relative, descriptor, hold)
+        finally:
+            if not held:
+                os.close(descriptor)
+
+
+def _list_descriptor(outputs: int, *, copies: Path | None = None, hold: int = 0) -> _Listing:
+    """List the directory open at ``outputs`` by descriptor (module docstring); keep copies in ``copies``.
+
+    The listing holds the descriptors of its first ``hold`` files; the caller
+    closes them (``_Listing.close``).
+    """
+    listing = _Listing()
+    try:
+        _walk(outputs, "", 0, listing, copies, hold)
+    except BaseException:
+        listing.close()
+        raise
+    listing.outputs.sort(key=lambda output: output.path)
+    listing.refused.sort()
+    return listing
 
 
 def list_outputs(layout: SandboxLayout) -> tuple[tuple[OutputFile, ...], tuple[str, ...]]:
-    """The regular, singly linked files of ``outputs/`` with their hashes, and every other entry, refused."""
-    files: list[OutputFile] = []
-    refused: list[str] = []
-    for directory, subdirectories, names in os.walk(layout.outputs, followlinks=False):
-        base = Path(directory)
-        for name in sorted(subdirectories):
-            if (base / name).is_symlink():
-                refused.append(str((base / name).relative_to(layout.outputs)))
-        for name in sorted(names):
-            path = base / name
-            relative = str(path.relative_to(layout.outputs))
-            info = os.lstat(path)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                refused.append(relative)
-                continue
-            files.append(OutputFile(relative, info.st_size, _sha256_file(path)))
-    return tuple(sorted(files, key=lambda f: f.path)), tuple(sorted(refused))
+    """The regular, singly linked files of ``outputs/`` with their hashes, and every other entry, refused.
+
+    The walk opens every level by descriptor without following a link; an
+    ``outputs`` that is not a real directory lists nothing.
+    """
+    root = _open_root(layout.root)
+    try:
+        try:
+            outputs = os.open("outputs", _DIRECTORY_FLAGS, dir_fd=root)
+        except OSError:
+            return (), ()
+        try:
+            listing = _list_descriptor(outputs)
+        finally:
+            os.close(outputs)
+    finally:
+        os.close(root)
+    return tuple(listing.outputs), tuple(listing.refused)
 
 
 def read_output(layout: SandboxLayout, output: OutputFile, limit: int) -> bytes | None:
     """The bytes of ``output`` if it is still a regular, singly linked file of at most ``limit`` bytes with its hash.
 
-    The file is opened without following a link, so a link the sandboxed
+    The file is opened level by level from the sandbox root's descriptor
+    without following a link (``open_beneath``), so a link the sandboxed
     code made is never read through.
     """
     try:
-        descriptor = os.open(layout.outputs / output.path, os.O_RDONLY | os.O_NOFOLLOW)
+        root = _open_root(layout.root)
     except OSError:
         return None
     try:
-        info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > limit:
+        descriptor, info = open_beneath(root, ("outputs", *PurePosixPath(output.path).parts))
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(root)
+    try:
+        if info.st_nlink != 1 or info.st_size > limit:
             return None
-        with os.fdopen(os.dup(descriptor), "rb") as handle:
-            data = handle.read(limit + 1)
+        sha256, _, data = read_descriptor(descriptor, limit)
     finally:
         os.close(descriptor)
-    if len(data) > limit or "sha256:" + hashlib.sha256(data).hexdigest() != output.sha256:
-        return None
-    return data
+    return data if data is not None and sha256 == output.sha256 else None
 
 
-def _empty(directory: Path) -> None:
-    """Remove everything inside ``directory`` without following links."""
-    with os.scandir(directory) as entries:
-        for entry in list(entries):
-            if entry.is_dir(follow_symlinks=False):
-                shutil.rmtree(entry.path)
+def _remove_tree(parent: int, name: str) -> None:
+    """Delete the directory ``name`` of ``parent`` and all it holds by descriptor, never following a link (best effort)."""
+    try:
+        descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(name, dir_fd=parent)  # no longer a directory: the entry itself goes
+        return
+    try:
+        with os.scandir(descriptor) as entries:
+            children = [(entry.name, entry.is_dir(follow_symlinks=False)) for entry in entries]
+        for child, is_directory in children:
+            if is_directory:
+                _remove_tree(descriptor, child)
             else:
-                os.unlink(entry.path)
+                with contextlib.suppress(OSError):
+                    os.unlink(child, dir_fd=descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+    with contextlib.suppress(OSError):
+        os.rmdir(name, dir_fd=parent)
+
+
+def _remove_entry(parent: int, name: str) -> int | None:
+    """Remove the entry ``name`` of ``parent`` without following a link; return its mode (``None``: it was gone).
+
+    A directory goes with everything in it: through ``shutil.rmtree`` relative
+    to ``parent`` where it resists symbolic link attacks on this platform,
+    and otherwise by descriptor (``_remove_tree``). Deleting is best effort:
+    what cannot be deleted stays under its removed name and is retried when
+    ``outputs/`` is next emptied.
+    """
+    try:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name, dir_fd=parent)
+    elif shutil.rmtree.avoids_symlink_attacks:
+        shutil.rmtree(name, ignore_errors=True, dir_fd=parent)
+    else:
+        _remove_tree(parent, name)
+    return info.st_mode
+
+
+def _empty_outputs(root: int) -> str | None:
+    """Give the sandbox a new, empty ``outputs/`` without following a link; return what it was if not a directory.
+
+    The old directory is renamed aside relative to the root's descriptor,
+    where the sandboxed code can neither read nor write it, and then deleted.
+    """
+    with os.scandir(root) as entries:
+        stale = [entry.name for entry in entries if entry.name.startswith(_REMOVED_PREFIX)]
+    for name in stale:
+        _remove_entry(root, name)
+    aside: str | None = _REMOVED_PREFIX + secrets.token_hex(8)
+    try:
+        os.rename("outputs", aside, src_dir_fd=root, dst_dir_fd=root)
+    except FileNotFoundError:
+        aside = None
+    descriptor, _ = _ensure_directory(root, "outputs")
+    os.close(descriptor)
+    mode = _remove_entry(root, aside) if aside is not None else None
+    return None if mode is None or stat.S_ISDIR(mode) else _kind(mode)
 
 
 def _keep(layout: SandboxLayout, directory: Path, outputs: tuple[OutputFile, ...]) -> None:
-    """Copy each output file of at most ``KEPT_OUTPUT_BYTES`` into ``directory/outputs``."""
+    """Copy each listed output file of at most ``KEPT_OUTPUT_BYTES`` into ``directory/outputs``.
+
+    Each file is read from a descriptor opened without following a link at
+    any level (``read_output``) and copied only if it still has its listed
+    hash. ``run_python`` keeps its copies while it lists, from the
+    descriptor each file was hashed from.
+    """
     for output in outputs:
         data = read_output(layout, output, KEPT_OUTPUT_BYTES)
-        if data is None:
-            continue
-        target = directory / "outputs" / output.path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
+        if data is not None:
+            _write_copy(directory / "outputs" / output.path, data)
 
 
 def _new_call(layout: SandboxLayout) -> tuple[int, Path]:
@@ -925,30 +1259,64 @@ def available() -> tuple[bool, str]:
 
 
 def run_python(layout: SandboxLayout, code: str, *, wall_seconds: float, cpu_seconds: int, max_output_bytes: int,
-               max_memory_bytes: int | None = None, restart: bool = False) -> SandboxResult:
+               max_memory_bytes: int | None = None, restart: bool = False,
+               use_output: Callable[[int, OutputFile, int], None] | None = None,
+               use_first: int = 0) -> SandboxResult:
     """Run ``code`` as the next call of ``layout``'s kernel (module docstring); raise if the sandbox is unavailable.
 
     ``restart`` ends the kernel first, so the code runs in a new one.
     ``cpu_seconds`` and ``max_memory_bytes`` apply when this call starts the
-    sandbox's first kernel.
+    sandbox's first kernel. ``use_output(call, output, descriptor)`` is called
+    for each of the first ``use_first`` output files, in path order, with the
+    descriptor that file was listed and hashed from (at its start, in
+    blocking mode); WSE closes it afterwards.
     """
     ok, reason = available()
     if not ok:
         raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY, f"code execution is not available here: {reason}",
                        details={"reason": reason})
-    layout.create()
-    kernel = kernel_for(layout, cpu_seconds=cpu_seconds, max_memory_bytes=max_memory_bytes)
-    number, directory = _new_call(layout)
-    _empty(layout.outputs)
-    result, stdout, stderr = kernel.run(code, number, directory, wall_seconds=wall_seconds,
-                                        max_output_bytes=max_output_bytes, restart=restart)
-    (directory / "stdout.txt").write_bytes(stdout)
-    (directory / "stderr.txt").write_bytes(stderr)
-    outputs, refused = list_outputs(layout)
-    _keep(layout, directory, outputs)
-    from dataclasses import replace
+    root, found = _open_layout(layout.root, "before this call")
+    try:
+        repairs = _take_repairs(layout.root) + found
+        kernel = kernel_for(layout, cpu_seconds=cpu_seconds, max_memory_bytes=max_memory_bytes)
+        number, directory = _new_call(layout)
+        replaced = _empty_outputs(root)
+        if replaced is not None:
+            repairs.append(_repair_note("outputs", replaced, "before this call"))
+        result, stdout, stderr = kernel.run(code, number, directory, wall_seconds=wall_seconds,
+                                            max_output_bytes=max_output_bytes, restart=restart)
+        (directory / "stdout.txt").write_bytes(stdout)
+        (directory / "stderr.txt").write_bytes(stderr)
+        outputs = -1
+        try:
+            for name in SANDBOX_DIRECTORIES:  # the code (or a command that ran meanwhile) may have replaced one
+                descriptor, replaced = _ensure_directory(root, name)
+                if replaced is not None:
+                    repairs.append(_repair_note(name, replaced, "after this call")
+                                   + ("; the call lists no outputs" if name == "outputs" else ""))
+                if name == "outputs":
+                    outputs = descriptor
+                else:
+                    os.close(descriptor)
+            listing = _list_descriptor(outputs, copies=directory / "outputs",
+                                       hold=use_first if use_output is not None else 0)
+        finally:
+            if outputs >= 0:
+                os.close(outputs)
+    finally:
+        os.close(root)
+    try:
+        from dataclasses import replace
 
-    result = replace(result, outputs=outputs, refused_outputs=refused)
-    summary = {key: value for key, value in asdict(result).items() if key not in ("stdout", "stderr")}
-    (directory / "result.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        result = replace(result, outputs=tuple(listing.outputs), refused_outputs=tuple(listing.refused),
+                         repairs=tuple(repairs))
+        summary = {key: value for key, value in asdict(result).items() if key not in ("stdout", "stderr")}
+        (directory / "result.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n",
+                                               encoding="utf-8")
+        if use_output is not None:
+            listed = {output.path: output for output in listing.outputs}
+            for path, descriptor in listing.held:
+                use_output(number, listed[path], descriptor)
+    finally:
+        listing.close()
     return result

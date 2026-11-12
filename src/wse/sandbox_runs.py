@@ -37,18 +37,24 @@ is listed with its size and SHA-256. A ``.safetensors`` file of
 floating-point tensors, of at most ``MAX_TENSOR_FILE_BYTES``, is stored as
 a run-scoped tensor file (``wse://tensors/<sha256>``, table
 ``tensor_files``) that ``submit_candidate`` turns into a candidate: WSE
-opens it without following links, checks that it is a regular, singly
-linked file whose header lists only floating-point tensors, and copies it
-from that open descriptor, checking its SHA-256. A ``.npy`` file holding a finite numeric array of one or two
-dimensions, of at most ``MAX_REFERENCE_ELEMENTS`` values, is also stored as a
-run-scoped result (``kind: sandbox_array``) whose pointer ``#/values`` (or
+reads it from the descriptor the listing opened it as (never through a
+link), checks that it is a regular, singly linked file, copies it into the
+store from that descriptor, checks the copy's SHA-256, and only then parses
+the copy's header, which must list only floating-point tensors; a file that
+fails is never published. An experiment's tensor files hold at most
+``MAX_EXPERIMENT_TENSOR_BYTES``, checked before anything is copied. A
+``.npy`` file holding a finite numeric array of one or two dimensions, of at
+most ``MAX_REFERENCE_ELEMENTS`` values, is also stored as a run-scoped
+result (``kind: sandbox_array``) whose pointer ``#/values`` (or
 ``#/values/<row>`` for a row of a matrix) names a stored vector, which edits
 such as ``project_out`` and analyses such as ``direction_projection``
-accept. Files are read without following links (``wse.sandbox``).
+accept; it is parsed from its listing descriptor too (``wse.sandbox``).
 
 The call is recorded in the audit log (``sandbox.ran``) with its code hash,
-ending, times, and output files, and it is idempotent by its key: a retry
-with the same code returns the first result without running again.
+ending, times, and output files (each ``.safetensors`` output with the
+tensor file it was stored as, or ``None``), and it is idempotent by its
+key: a retry with the same code returns the first result without running
+again.
 """
 
 from __future__ import annotations
@@ -69,6 +75,7 @@ from wse import sandbox
 from wse.database import insert_audit_event, utc_now
 from wse.policy import ExperimentPolicy, sandbox_available
 from wse.sandbox import SandboxLayout
+from wse.store import TENSOR_URI_PREFIX
 from wse.schemas import (
     IDEMPOTENCY_KEY_PATTERN,
     Experiment,
@@ -85,8 +92,9 @@ from wse.schemas import (
 if TYPE_CHECKING:
     from wse.experiments import ExperimentService
 
-__all__ = ["MAX_CODE_BYTES", "MAX_LISTED_OUTPUTS", "MAX_REFERENCE_ELEMENTS", "layout_for", "readable_tensors",
-           "refresh_inputs", "run_python", "store_agent_tensor_file", "sync_inputs"]
+__all__ = ["MAX_CODE_BYTES", "MAX_EXPERIMENT_TENSOR_BYTES", "MAX_LISTED_OUTPUTS", "MAX_REFERENCE_ELEMENTS",
+           "layout_for", "readable_tensors", "refresh_inputs", "run_python", "store_agent_tensor_file",
+           "sync_inputs"]
 
 OPERATION = "run_python"
 MAX_CODE_BYTES = 256 * 1024
@@ -94,6 +102,7 @@ MAX_REFERENCE_ELEMENTS = 65536
 MAX_ARRAY_FILE_BYTES = 64 * 1024 * 1024
 MAX_LISTED_OUTPUTS = 32  # output files listed and stored per call; calls/<n>/result.json lists every one
 MAX_TENSOR_FILE_BYTES = 8 << 30
+MAX_EXPERIMENT_TENSOR_BYTES = 32 << 30  # tensor-file bytes stored per experiment, by sandbox calls and paths alike
 MAX_SAFETENSORS_HEADER_BYTES = 100 << 20
 MAX_LISTED_TENSORS = 16
 SAFETENSORS_FLOAT_DTYPES = {"F16": "float16", "BF16": "bfloat16", "F32": "float32", "F64": "float64"}
@@ -248,10 +257,13 @@ def refresh_inputs(service: ExperimentService, experiment_id: str) -> list[str] 
     return sync_inputs(service, experiment, policy, layout_for(service, experiment.run_id).create())
 
 
-def _load_array(layout: SandboxLayout, output: sandbox.OutputFile) -> np.ndarray | None:
-    """The array in ``output`` when it is a regular, singly linked ``.npy`` file that still has its listed hash."""
-    data = sandbox.read_output(layout, output, MAX_ARRAY_FILE_BYTES)
-    if data is None:
+def _load_array(descriptor: int, output: sandbox.OutputFile) -> np.ndarray | None:
+    """The array in the ``.npy`` file open at ``descriptor`` if it is at most ``MAX_ARRAY_FILE_BYTES`` with its hash."""
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > MAX_ARRAY_FILE_BYTES:
+        return None
+    digest, _, data = sandbox.read_descriptor(descriptor, MAX_ARRAY_FILE_BYTES)
+    if data is None or digest != output.sha256:
         return None
     try:
         return np.load(io.BytesIO(data), allow_pickle=False)
@@ -274,16 +286,20 @@ def _safetensors_header(handle: Any) -> dict[str, Any]:
 
 
 def _open_beneath(root: Path, relative: PurePosixPath) -> int:
-    """Open ``root / relative`` for reading without following a link at any level below ``root``."""
-    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    """Open the regular file ``root / relative`` for reading: no level below ``root`` may be a link (``open_beneath``).
+
+    Every level is opened without following a link and the file without
+    waiting on a FIFO, so a FIFO cannot block the server. Raises ``OSError``
+    (``wse.sandbox.NotRegularFile`` for an entry that is not a regular file)
+    or ``ValueError`` (a part that cannot name an entry, such as one holding
+    a NUL byte).
+    """
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        for part in relative.parts[:-1]:
-            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
-            os.close(directory)
-            directory = child
-        return os.open(relative.parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+        descriptor, _ = sandbox.open_beneath(directory, relative.parts)
     finally:
         os.close(directory)
+    return descriptor
 
 
 def _file_sha256(handle: Any) -> str:
@@ -294,47 +310,87 @@ def _file_sha256(handle: Any) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+class _NotStored(Exception):
+    """Why a file is not stored as a tensor file: the ``SandboxOutput.note`` it gets."""
+
+
+def _header_tensors(path: Path) -> list[SandboxTensor]:
+    """The tensors that the safetensors file at ``path`` lists; raise ``_NotStored`` unless all are floating point."""
+    try:
+        with path.open("rb") as handle:
+            header = _safetensors_header(handle)
+        tensors = []
+        for name, entry in sorted(header.items()):
+            if name == "__metadata__":
+                continue
+            dtype = entry.get("dtype") if isinstance(entry, dict) else None
+            shape = entry.get("shape") if isinstance(entry, dict) else None
+            if dtype not in SAFETENSORS_FLOAT_DTYPES or not isinstance(shape, list):
+                raise _NotStored(f"not stored: tensor {name!r} has dtype {dtype}; tensor files hold floating-point "
+                                 f"tensors ({sorted(SAFETENSORS_FLOAT_DTYPES.values())})")
+            tensors.append(SandboxTensor(name=name, shape=[int(size) for size in shape],
+                                         dtype=SAFETENSORS_FLOAT_DTYPES[dtype]))
+    except (ValueError, TypeError) as exc:
+        raise _NotStored(f"not stored: not a safetensors file ({exc})") from None
+    if not tensors:
+        raise _NotStored("not stored: the file holds no tensors")
+    return tensors
+
+
+def _over_the_limit(service: ExperimentService, experiment_id: str, uri: str, size: int) -> str | None:
+    """Why storing ``size`` more bytes as ``uri`` would pass ``MAX_EXPERIMENT_TENSOR_BYTES``, or ``None``."""
+    conn = service.db.conn
+    if conn.execute("SELECT 1 FROM tensor_files WHERE uri = ? AND experiment_id = ?", (uri, experiment_id)).fetchone():
+        return None  # already stored for this experiment: no new bytes
+    stored = int(conn.execute("SELECT COALESCE(SUM(size_bytes), 0) FROM tensor_files WHERE experiment_id = ?",
+                              (experiment_id,)).fetchone()[0])
+    if stored + size <= MAX_EXPERIMENT_TENSOR_BYTES:
+        return None
+    return (f"not stored: this experiment's tensor files hold {stored} bytes, and this file's {size} bytes would "
+            f"pass the limit of {MAX_EXPERIMENT_TENSOR_BYTES} bytes ({MAX_EXPERIMENT_TENSOR_BYTES / 2**30:g} GiB) "
+            "of tensor files per experiment")
+
+
 def _store_tensor_file(service: ExperimentService, experiment_id: str, descriptor: int, label: str, call: int,
                        sha256: str | None = None) -> dict[str, Any]:
     """Store the ``.safetensors`` file open at ``descriptor`` as a tensor file; return ``SandboxOutput`` fields.
 
     The file must be regular, singly linked, at most ``MAX_TENSOR_FILE_BYTES``,
-    and hold only floating-point tensors; it is read and copied from this
-    descriptor only. ``label`` is its path in the run's sandbox directory and
-    ``call`` the sandbox call that wrote it (0: the agent's own code).
-    ``sha256``, when given, is the hash it must still have.
+    and within the experiment's ``MAX_EXPERIMENT_TENSOR_BYTES``, all checked
+    before anything is copied. It is copied from this descriptor only (which
+    the caller closes); the header is parsed from the store's copy after its
+    hash check, and a file whose copy fails is never published. ``label`` is
+    its path (in ``outputs/`` for a call's output, in the run's directory for
+    a path) and ``call`` the sandbox call that listed it (0: stored from a
+    path). ``sha256``, when given, is the hash the call listed.
     """
-    with os.fdopen(descriptor, "rb") as handle:
-        info = os.fstat(handle.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            return {"note": "not stored: not a regular file with a single link"}
-        if info.st_size > MAX_TENSOR_FILE_BYTES:
-            return {"note": f"not stored: tensor files hold at most {MAX_TENSOR_FILE_BYTES} bytes"}
-        digest = _file_sha256(handle)
-        if sha256 is not None and digest != sha256:
-            return {"note": "not stored: the file changed after the call listed it"}
-        try:
-            header = _safetensors_header(handle)
-            tensors = []
-            for name, entry in sorted(header.items()):
-                if name == "__metadata__":
-                    continue
-                dtype = entry.get("dtype") if isinstance(entry, dict) else None
-                shape = entry.get("shape") if isinstance(entry, dict) else None
-                if dtype not in SAFETENSORS_FLOAT_DTYPES or not isinstance(shape, list):
-                    return {"note": f"not stored: tensor {name!r} has dtype {dtype}; tensor files hold "
-                                    f"floating-point tensors ({sorted(SAFETENSORS_FLOAT_DTYPES.values())})"}
-                tensors.append(SandboxTensor(name=name, shape=[int(size) for size in shape],
-                                             dtype=SAFETENSORS_FLOAT_DTYPES[dtype]))
-        except (ValueError, TypeError) as exc:
-            return {"note": f"not stored: not a safetensors file ({exc})"}
-        if not tensors:
-            return {"note": "not stored: the file holds no tensors"}
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        return {"note": "not stored: not a regular file with a single link"}
+    if info.st_size > MAX_TENSOR_FILE_BYTES:
+        return {"note": f"not stored: tensor files hold at most {MAX_TENSOR_FILE_BYTES} bytes"}
+    found: dict[str, list[SandboxTensor]] = {}
+
+    def check(copy: Path) -> None:
+        found["tensors"] = _header_tensors(copy)
+
+    with os.fdopen(os.dup(descriptor), "rb") as handle:
         handle.seek(0)
+        digest = sha256 if sha256 is not None else _file_sha256(handle)
+        uri = TENSOR_URI_PREFIX + digest.removeprefix("sha256:")
+        refusal = _over_the_limit(service, experiment_id, uri, info.st_size)
+        if refusal is not None:
+            return {"note": refusal}
         try:
-            uri = service.store.publish_tensor_file(handle, digest.removeprefix("sha256:"))
+            uri = service.store.publish_tensor_file(handle, digest.removeprefix("sha256:"), check=check)
+        except _NotStored as exc:
+            return {"note": str(exc)}
         except WSEError as exc:
+            if exc.code == ErrorCode.ARTIFACT_CORRUPT:  # the copy did not have the hash
+                return {"note": "not stored: the file changed after the call listed it" if sha256 is not None
+                        else "not stored: the file changed while WSE copied it"}
             return {"note": f"not stored: {exc.message}"}
+    tensors = found["tensors"]
     with service.db.transaction() as conn:
         conn.execute("INSERT OR IGNORE INTO tensor_files (uri, experiment_id, call, path, sha256, size_bytes, "
                      "tensors_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -344,13 +400,15 @@ def _store_tensor_file(service: ExperimentService, experiment_id: str, descripto
 
 
 def store_agent_tensor_file(service: ExperimentService, experiment_id: str, path: Any) -> str:
-    """Store a ``.safetensors`` file that the agent's own code wrote in ``outputs/`` or ``work/``; return its URI.
+    """Store a ``.safetensors`` file under ``outputs/`` or ``work/`` of the run's directory; return its URI.
 
     ``path`` is relative to the run's sandbox directory. No level of it may
-    be a link (``_open_beneath``), so a file outside the directory can never
-    be reached through one; the checks of ``_store_tensor_file`` apply.
+    be a link and the file must be a regular file (``_open_beneath``), so a
+    file outside the directory can never be reached through a link and a
+    FIFO cannot block the server; the checks of ``_store_tensor_file`` apply.
+    A path that cannot name a file (a NUL byte, say) is ``INVALID_ARGUMENT``.
     """
-    relative = PurePosixPath(path) if isinstance(path, str) else None
+    relative = PurePosixPath(path) if isinstance(path, str) and "\x00" not in path else None
     if (relative is None or relative.is_absolute() or ".." in relative.parts or len(relative.parts) < 2
             or relative.parts[0] not in ("outputs", "work") or relative.suffix != ".safetensors"):
         raise WSEError(ErrorCode.INVALID_ARGUMENT, "path must name a .safetensors file under outputs/ or work/ of "
@@ -360,10 +418,19 @@ def store_agent_tensor_file(service: ExperimentService, experiment_id: str, path
     layout = layout_for(service, experiment.run_id).create()
     try:
         descriptor = _open_beneath(layout.root, relative)
+    except sandbox.NotRegularFile as exc:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, f"{relative} is not a regular file: {exc.strerror}",
+                       details={"path": str(relative)}) from exc
+    except ValueError as exc:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, f"path cannot name a file of the run's directory: {exc}",
+                       details={"path": str(relative)}) from exc
     except OSError as exc:
         raise WSEError(ErrorCode.NOT_FOUND, f"{relative} cannot be opened as a file of the run's directory without "
                        f"following a link: {exc.strerror}", details={"path": str(relative)}) from exc
-    fields = _store_tensor_file(service, experiment_id, descriptor, str(relative), 0)
+    try:
+        fields = _store_tensor_file(service, experiment_id, descriptor, str(relative), 0)
+    finally:
+        os.close(descriptor)
     if "note" in fields:
         raise WSEError(ErrorCode.INVALID_ARGUMENT, f"{relative} was {fields['note']}", details={"path": str(relative)})
     return fields["tensor_file"]
@@ -375,37 +442,31 @@ def _referenceable(array: np.ndarray) -> bool:
             and bool(np.isfinite(array).all()))
 
 
-def _outputs(service: ExperimentService, experiment_id: str, layout: SandboxLayout,
-             result: sandbox.SandboxResult) -> list[SandboxOutput]:
-    outputs = []
-    for output in result.outputs[:MAX_LISTED_OUTPUTS]:
-        shape = dtype = pointer = None
-        if output.path.endswith(".safetensors"):
-            try:
-                descriptor = os.open(layout.outputs / output.path, os.O_RDONLY | os.O_NOFOLLOW)
-            except OSError:
-                fields: dict[str, Any] = {"note": "not stored: the file could not be opened without following a link"}
-            else:
-                fields = _store_tensor_file(service, experiment_id, descriptor, output.path, result.call,
-                                            output.sha256)
-            outputs.append(SandboxOutput(path=output.path, size=output.size, sha256=output.sha256, **fields))
-            continue
-        if output.path.endswith(".npy"):
-            array = _load_array(layout, output)
-            if array is not None:
-                shape, dtype = list(array.shape), str(array.dtype)
-                if _referenceable(array):
-                    document = {"kind": ARRAY_KIND, "experiment_id": experiment_id, "call": result.call,
-                                "path": output.path, "sha256": output.sha256, "shape": shape, "dtype": dtype,
-                                "values": array.astype(np.float64).tolist()}
-                    uri = service.store.put_analysis_result(canonical_json(document).encode("utf-8"))
-                    with service.db.transaction() as conn:
-                        conn.execute("INSERT OR IGNORE INTO analysis_results (uri, experiment_id, created_at) "
-                                     "VALUES (?, ?, ?)", (uri, experiment_id, utc_now()))
-                    pointer = f"{uri}#/values"
-        outputs.append(SandboxOutput(path=output.path, size=output.size, sha256=output.sha256, shape=shape,
-                                     dtype=dtype, pointer=pointer))
-    return outputs
+def _array_fields(service: ExperimentService, experiment_id: str, call: int, output: sandbox.OutputFile,
+                  descriptor: int) -> dict[str, Any]:
+    """The ``SandboxOutput`` fields of a ``.npy`` output open at ``descriptor``: its shape, dtype, and pointer."""
+    array = _load_array(descriptor, output)
+    if array is None:
+        return {}
+    shape, dtype, pointer = list(array.shape), str(array.dtype), None
+    if _referenceable(array):
+        document = {"kind": ARRAY_KIND, "experiment_id": experiment_id, "call": call, "path": output.path,
+                    "sha256": output.sha256, "shape": shape, "dtype": dtype,
+                    "values": array.astype(np.float64).tolist()}
+        uri = service.store.put_analysis_result(canonical_json(document).encode("utf-8"))
+        with service.db.transaction() as conn:
+            conn.execute("INSERT OR IGNORE INTO analysis_results (uri, experiment_id, created_at) VALUES (?, ?, ?)",
+                         (uri, experiment_id, utc_now()))
+        pointer = f"{uri}#/values"
+    return {"shape": shape, "dtype": dtype, "pointer": pointer}
+
+
+def _output_record(output: SandboxOutput) -> dict[str, Any]:
+    """An output as the ``sandbox.ran`` event records it; a ``.safetensors`` output names its tensor file or ``None``."""
+    record: dict[str, Any] = {"path": output.path, "size": output.size, "sha256": output.sha256}
+    if output.path.endswith(".safetensors"):
+        record["tensor_file"] = output.tensor_file
+    return record
 
 
 def _fitted(run: SandboxRun, directory: Path, budget: int, limit: int) -> SandboxRun:
@@ -472,11 +533,23 @@ def run_python(service: ExperimentService, experiment_id: str, code: Any, key: A
     layout = layout_for(service, experiment.run_id).create()
     inputs = sync_inputs(service, experiment, policy, layout)
     lifetime_cpu = max(1, math.ceil(float(policy.budget.limit("sandbox_seconds")) * (os.cpu_count() or 1)))
+    fields: dict[str, dict[str, Any]] = {}
+
+    def use(call: int, output: sandbox.OutputFile, descriptor: int) -> None:
+        # The descriptor the listing hashed the file from: a link, or a file swapped in since, is never read.
+        if output.path.endswith(".safetensors"):
+            fields[output.path] = _store_tensor_file(service, experiment_id, descriptor, output.path, call,
+                                                     output.sha256)
+        elif output.path.endswith(".npy"):
+            fields[output.path] = _array_fields(service, experiment_id, call, output, descriptor)
+
     result = sandbox.run_python(layout, code, wall_seconds=wall, cpu_seconds=lifetime_cpu,
                                 max_output_bytes=policy.sandbox.max_output_bytes,
-                                max_memory_bytes=policy.sandbox.max_memory_bytes, restart=restart)
+                                max_memory_bytes=policy.sandbox.max_memory_bytes, restart=restart,
+                                use_output=use, use_first=MAX_LISTED_OUTPUTS)
     seconds = round(min(result.wall_seconds, wall), 3)
-    outputs = _outputs(service, experiment_id, layout, result)
+    outputs = [SandboxOutput(path=o.path, size=o.size, sha256=o.sha256, **fields.get(o.path, {}))
+               for o in result.outputs[:MAX_LISTED_OUTPUTS]]
     run = SandboxRun(
         call=result.call, ending=result.ending, exit_code=result.exit_code, signal=result.signal, error=result.error,
         wall_seconds=result.wall_seconds, cpu_seconds=result.cpu_seconds,
@@ -485,7 +558,8 @@ def run_python(service: ExperimentService, experiment_id: str, code: Any, key: A
         stderr_truncated=result.stderr_truncated, outputs=outputs, refused_outputs=list(result.refused_outputs),
         inputs=inputs, code_sha256=result.code_sha256, usage=Usage(sandbox_calls=1, sandbox_seconds=seconds),
         session=result.session, session_call=result.session_call, restarted=result.restarted,
-        state_kept=result.state_kept, outputs_not_listed=max(0, len(result.outputs) - MAX_LISTED_OUTPUTS) or None)
+        state_kept=result.state_kept, outputs_not_listed=max(0, len(result.outputs) - MAX_LISTED_OUTPUTS) or None,
+        repairs=list(result.repairs) or None)
     run = _fitted(run, layout.calls / str(result.call), 2 * policy.operations.limits.max_result_json_bytes,
                   policy.sandbox.max_output_bytes)
     with service.db.transaction() as conn:
@@ -497,7 +571,8 @@ def run_python(service: ExperimentService, experiment_id: str, code: Any, key: A
             "signal": run.signal, "error": run.error, "wall_seconds": run.wall_seconds,
             "cpu_seconds": run.cpu_seconds, "peak_memory_bytes": run.peak_memory_bytes, "session": run.session,
             "session_call": run.session_call, "restarted": run.restarted, "state_kept": run.state_kept,
-            "outputs": [{"path": o.path, "size": o.size, "sha256": o.sha256} for o in outputs],
+            "outputs": [_output_record(o) for o in outputs],
             "refused_outputs": run.refused_outputs, "charged": {"sandbox_calls": 1, "sandbox_seconds": seconds},
+            **({"repairs": run.repairs} if run.repairs else {}),
         }, experiment_id=experiment_id)
     return run

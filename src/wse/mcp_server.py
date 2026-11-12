@@ -652,10 +652,14 @@ class WSEMCPServer:
 
         Save the new values with safetensors.torch.save_file to outputs/<name>.safetensors, under the tensors' full
         checkpoint names, in their stored dtype and full shape; the wse_run_python call returns the file's
-        tensor_file. A file your own code wrote under outputs/ or work/ is named by path instead. Each tensor then replaces the tensor of the same name in parent_checkpoint_id (a checkpoint of
-        this experiment). WSE checks the names, shapes, dtypes, finite values, and the protected tensors, records the
-        exact patch with the sandbox call that saved the file, and returns the candidate's checkpoint_id, which
-        wse_submit_evaluation or wse_evaluate can measure.
+        tensor_file. A file your own commands wrote under outputs/ or work/ is named by path instead. Each tensor
+        then replaces the tensor of the same name in parent_checkpoint_id (a checkpoint of this experiment). WSE
+        checks the names, shapes, dtypes, finite values, and the protected tensors, records the exact patch, and
+        returns the candidate's checkpoint_id, which wse_submit_evaluation or wse_evaluate can measure. The record's
+        source comes from what you submitted: a tensor_file names the sandbox call that listed it and that call's
+        code hash; a path names the path, and a sandbox call only when that call listed exactly that file (the same
+        path under outputs/ and the same SHA-256); otherwise it says that WSE did not record whether your commands
+        or a sandbox call wrote the file, with no code hash.
         """
         def run() -> ToolResponse[CandidateSubmission]:
             eid = self._experiment_id(experiment_id)

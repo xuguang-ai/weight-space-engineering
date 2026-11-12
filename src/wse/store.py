@@ -234,12 +234,15 @@ class ArtifactStore:
     # -- publishing -----------------------------------------------------------
 
     def _publish(
-        self, relpath: str, write: Callable[[Path], None], *, expected_sha256: str | None = None
+        self, relpath: str, write: Callable[[Path], None], *, expected_sha256: str | None = None,
+        check: Callable[[Path], None] | None = None,
     ) -> tuple[str, int]:
         """Write a file through ``tmp/`` and publish it at ``relpath``.
 
         Returns the file's SHA-256 hex digest and size. When ``expected_sha256``
-        is given, a written file with another digest is never published. The
+        is given, a written file with another digest is never published.
+        ``check``, when given, reads the written file after that hash check;
+        an exception it raises publishes nothing. The
         fresh file always replaces any existing file at ``relpath`` (same
         content, by construction), so a published file is never older than the
         recovery grace period when its database commit runs, even if an earlier
@@ -258,6 +261,8 @@ class ArtifactStore:
                     f"written artifact {relpath} did not read back with its expected SHA-256",
                     retryable=True,
                 )
+            if check is not None:
+                check(temp)
             os.replace(temp, final)
             _fsync_path(final.parent)
         except BaseException:
@@ -580,23 +585,30 @@ class ArtifactStore:
                           expected_sha256=digest)
         return digest
 
-    def publish_tensor_file(self, source: IO[bytes], digest: str) -> str:
+    def publish_tensor_file(self, source: IO[bytes], digest: str,
+                            check: Callable[[Path], None] | None = None) -> str:
         """Publish a sandbox call's tensor file by its SHA-256 hex ``digest``; return its ``wse://tensors/`` URI.
 
         ``source`` is a readable binary file object positioned at the start;
-        the copy is published only if it has ``digest``. Files are
-        content-addressed and immutable, so an identical file is stored once.
+        the copy is published only if it has ``digest``. ``check``, when given,
+        reads the copy after that hash check (or the stored file, when one with
+        ``digest`` is already there); an exception it raises publishes nothing
+        and propagates. Files are content-addressed and immutable, so an
+        identical file is stored once.
         """
         if not re.fullmatch(r"[0-9a-f]{64}", digest):
             raise WSEError(ErrorCode.INVALID_ARGUMENT, "a tensor file digest is 64 hexadecimal digits")
         relpath = f"{TENSORS_DIR}/{digest}.safetensors"
         path = self._artifact_path(relpath)
-        if not (path.is_file() and _file_sha256(path) == digest):
+        if path.is_file() and _file_sha256(path) == digest:
+            if check is not None:
+                check(path)
+        else:
             def write(target: Path) -> None:
                 with target.open("wb") as handle:
                     shutil.copyfileobj(source, handle, 1 << 22)
 
-            self._publish(relpath, write, expected_sha256=digest)
+            self._publish(relpath, write, expected_sha256=digest, check=check)
         return TENSOR_URI_PREFIX + digest
 
     def tensor_file_path(self, uri: str) -> Path:
