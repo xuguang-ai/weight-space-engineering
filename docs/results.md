@@ -404,6 +404,14 @@ One run of [examples/experiment_quickstart.py](../examples/experiment_quickstart
 - Every candidate's exact patch replayed to identical weights in a new workspace (8 of 8).
 - A scan found no API key, endpoint host, or p50c terms in 703 files (9.07 GB): the workspace, both exports, the run's logs, the preflight's Codex and proxy logs, and the printed output; it found none of the 16 test problems in the 60 files of the agent's sandbox directory and Codex's home and logs, which hold everything the model was sent and wrote. The 4 `wse_run_python` calls only read `inputs/` and wrote candidate files to `outputs/`, and the 6 shell commands only read.
 
+**A second run on the final code.** The same command, at commit d4711f6 (after the review fixes: the preflight, the host-side sandbox hardening, and the rule's instructions), in a new workspace, on 2026-11-12:
+
+- The agent worked for 10 minutes 37 seconds: 26 model requests, all served by `gpt-5.6-luna-2026-07-09`, and 24 tool calls, all successful (4 shell commands, all reads; one probe; 6 previews, 6 commits, and 6 `wse_evaluate` calls). It used 1,196,254 tokens: 1,190,334 input (1,119,733 cached) and 5,920 output.
+- This time it edited through WSE's `scale_slice` operator rather than computed tensors: each candidate scaled half of the channels of a late MLP's `down_proj` (layer 27, or 26, or both) by 0.6 to 0.8. It stopped itself after 7 of its 10 evaluations, the original's included.
+- The rule chose the one that scales half of layer 27's channels by 0.8: on the development problems 5 → 7 of 16 correct and 10 → 8 cut off; 5 of the 6 evaluated candidates qualified.
+- On the 16 test problems, which no earlier run of that workspace had registered: 4 → 3 correct (−0.062 [−0.188, +0.000], paired) and 11 → 12 cut off. Again the development gain did not carry over.
+- Every candidate replayed to identical weights in a new workspace (6 of 6). The scan found no key, endpoint host, or p50c terms in 549 files (5.22 GB), and none of the 16 test problems in the 33 files of the agent's sandbox directory and Codex's home and logs.
+
 ## 7. Other models
 
 - **Qwen3-0.6B and gemma-3-1b-it** at Level 0, with no new code:

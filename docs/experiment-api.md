@@ -2,7 +2,7 @@
 
 `Experiment` gives one model to an agent, with a goal and a fixed way to measure it. The agent investigates the model and proposes weight edits. WSE evaluates candidates on the same development problems, selects by a rule stated before the run, and freezes the choice. Only then does it test the frozen choice against the original model, on test problems registered at that moment.
 
-> **Status: one live run.** With Codex and `gpt-5.6-luna`, `Experiment` ran once on Qwen3-0.6B ([results](results.md#6-a-live-llm-agent-edits-a-language-model-through-experiment)): the agent's choice improved the 16 development problems and did not improve 16 test problems. The Qwen3.5-0.8B example below has not been run.
+> **Status: two live runs.** With Codex and `gpt-5.6-luna`, `Experiment` ran twice on Qwen3-0.6B ([results](results.md#6-a-live-llm-agent-edits-a-language-model-through-experiment)): each run's choice improved the 16 development problems and did not improve 16 test problems. The Qwen3.5-0.8B example below has not been run.
 
 ```python
 from wse import Experiment
@@ -100,7 +100,7 @@ The `math` evaluator also accepts:
 
 ## Run
 
-Two example scripts write out every argument. The small one has run once with a live agent; the Qwen3.5-0.8B one has not been run.
+Two example scripts write out every argument. The small one has run twice with a live agent; the Qwen3.5-0.8B one has not been run.
 
 **A small model, in minutes per evaluation.** [examples/experiment_quickstart.py](../examples/experiment_quickstart.py) runs Qwen3-0.6B on the 16 development problems at 1,024 tokens, with up to 10 evaluations, and tests on the 16 test problems:
 
@@ -200,7 +200,7 @@ These rules were measured with codex-cli 0.167.0-alpha.4.1 on macOS, with the ru
 
 ## Current limits
 
-- **One live run** (above), on a small model with 16 development and 16 test problems: too few to show that an edit generalizes.
+- **Two live runs** (above), on a small model with 16 development and 16 test problems: too few to show that an edit generalizes.
 - **macOS only.** The agent's sandbox has been configured and tested on macOS only.
 - **One Codex version tested.** WSE writes its Codex config with `--strict-config`, using keys of codex-cli 0.167.0-alpha.4.1 (permission profiles among them); another version may reject a key or treat it differently. On macOS, WSE runs a Codex binary only after its code signature names OpenAI (Team ID `2DC432GLL2`). It runs the binary that `WSE_CODEX_PATH` names, else the `codex` on your `PATH`, else the newest one bundled with OpenAI's VS Code extension.
 - **The turn limit can be passed by one request.** WSE counts model requests from Codex's session record, so a fast loop can make one request more than `max_turns` before it is stopped.

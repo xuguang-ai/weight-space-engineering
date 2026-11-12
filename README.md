@@ -10,7 +10,7 @@ WSE is a Python framework and MCP harness for experiments that edit a model's we
 
 [Experiment](https://github.com/xuguang-ai/weight-space-engineering#an-experiment-in-a-few-lines) · [Install](https://github.com/xuguang-ai/weight-space-engineering#install) · [Python API](https://github.com/xuguang-ai/weight-space-engineering#use-the-python-api) · [Agents](https://github.com/xuguang-ai/weight-space-engineering#use-an-agent) · [Results](https://github.com/xuguang-ai/weight-space-engineering#results) · [Documentation](https://github.com/xuguang-ai/weight-space-engineering#documentation)
 
-> **Current release: alpha.** A live LLM agent has repaired a small neural network through WSE's MCP tools. Language-model edits have run from Python and, with scripted controllers, through MCP. Through the `Experiment` API below, a live LLM agent has edited a language model once, Qwen3-0.6B: its choice improved the development problems and did not improve the test problems. Development and testing have used macOS on Apple silicon.
+> **Current release: alpha.** A live LLM agent has repaired a small neural network through WSE's MCP tools. Language-model edits have run from Python and, with scripted controllers, through MCP. Through the `Experiment` API below, a live LLM agent has edited a language model in two runs, on Qwen3-0.6B: each choice improved the development problems and did not improve the test problems. Development and testing have used macOS on Apple silicon.
 
 ## An experiment in a few lines
 
@@ -42,7 +42,7 @@ print(report.compare())
 result.export("artifacts/fix-loops")
 ```
 
-> **This Qwen3.5-0.8B example has not been run.** The same API has run once with a live agent, on Qwen3-0.6B ([Results](https://github.com/xuguang-ai/weight-space-engineering#an-agent-edits-a-small-language-model)).
+> **This Qwen3.5-0.8B example has not been run.** The same API has run twice with a live agent, on Qwen3-0.6B ([Results](https://github.com/xuguang-ai/weight-space-engineering#an-agent-edits-a-small-language-model)).
 
 <details>
 <summary>What the same calls printed on Qwen3-0.6B (examples/experiment_quickstart.py, 2026-11-12)</summary>
@@ -349,7 +349,7 @@ OPENAI_BASE_URL=https://api.openai.com/v1
 
 For Azure OpenAI, set `OPENAI_BASE_URL` to your resource's endpoint, `https://YOUR-RESOURCE.services.ai.azure.com/openai/v1`, and put your deployment's name after `codex:`. Codex reaches the provider through a local proxy that WSE runs and that adds the key, so neither Codex nor the agent's code holds it ([credentials](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/experiment-api.md#agent-credentials)).
 
-**3. Run an experiment.** The small script below has run once with a live agent ([Results](https://github.com/xuguang-ai/weight-space-engineering#an-agent-edits-a-small-language-model)); the Qwen3.5-0.8B one has not been run. With your model's name, or your deployment's name, in place of `YOUR_AGENT_MODEL`, the small one runs Qwen3-0.6B on the 16 development problems at 1,024 tokens, with up to 10 evaluations (about a minute and a half each, by the model quickstart's timing), and then tests on 16 GSM8K test problems:
+**3. Run an experiment.** The small script below has run twice with a live agent ([Results](https://github.com/xuguang-ai/weight-space-engineering#an-agent-edits-a-small-language-model)); the Qwen3.5-0.8B one has not been run. With your model's name, or your deployment's name, in place of `YOUR_AGENT_MODEL`, the small one runs Qwen3-0.6B on the 16 development problems at 1,024 tokens, with up to 10 evaluations (about a minute and a half each, by the model quickstart's timing), and then tests on 16 GSM8K test problems:
 
 ```bash
 uv run --extra models-hf --env-file .env \
@@ -403,7 +403,7 @@ An LLM agent, `gpt-5.6-luna` through the OpenAI Agents SDK runner that WSE used 
 
 ### An agent edits a small language model
 
-Through `Experiment`, Codex with `gpt-5.6-luna` worked on Qwen3-0.6B's answers to 16 GSM8K training problems at 1,024 new tokens, to cut fewer answers off at the limit without losing accuracy ([examples/experiment_quickstart.py](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/experiment_quickstart.py)). In 13 minutes it probed the residual stream, computed 8 candidates in Python, each scaling down 32 to 128 entries of the final RMSNorm weight (one also scaled layer 27's input norm), evaluated 7, and stopped itself. WSE's rule chose the one that halves 64 entries: on the development problems 5 → 7 correct and 10 → 7 cut off. On 16 GSM8K test problems, none of which appears in anything the agent was sent or wrote, it did not help: 4 → 3 correct and 11 → 12 cut off (accuracy difference −0.062 [−0.188, +0.000]). The run shows the whole path working with a live agent, not an edit that generalizes ([the run](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/results.md#6-a-live-llm-agent-edits-a-language-model-through-experiment)).
+Through `Experiment`, Codex with `gpt-5.6-luna` worked on Qwen3-0.6B's answers to 16 GSM8K training problems at 1,024 new tokens, to cut fewer answers off at the limit without losing accuracy ([examples/experiment_quickstart.py](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/experiment_quickstart.py)). In 13 minutes it probed the residual stream, computed 8 candidates in Python, each scaling down 32 to 128 entries of the final RMSNorm weight (one also scaled layer 27's input norm), evaluated 7, and stopped itself. WSE's rule chose the one that halves 64 entries: on the development problems 5 → 7 correct and 10 → 7 cut off. On 16 GSM8K test problems, none of which appears in anything the agent was sent or wrote, it did not help: 4 → 3 correct and 11 → 12 cut off (accuracy difference −0.062 [−0.188, +0.000]). A second run on this version's code chose another edit, through WSE's `scale_slice` operator: half of layer 27's MLP down-projection channels scaled by 0.8, 5 → 7 correct and 10 → 8 cut off on the development problems, and again 4 → 3 correct and 11 → 12 cut off on the test problems. The runs show the whole path working with a live agent, not an edit that generalizes ([the runs](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/results.md#6-a-live-llm-agent-edits-a-language-model-through-experiment)).
 
 ### What has been demonstrated
 
@@ -413,15 +413,15 @@ Through `Experiment`, Codex with `gpt-5.6-luna` worked on Qwen3-0.6B's answers t
 | Apply published p50c to Qwen3.5-0.8B | Command line, same runner as Python | 3/25 → 13/25 correct on MATH-500, with a 32,768-token limit |
 | Reconstruct p50c's projection edit with WSE operators | Direct Python | 2/32 → 10/32 correct on GSM8K practice problems; answers cut off at the limit fell from 30/32 to 21/32 |
 | Apply that reconstruction through MCP | Scripted controller | Answers cut off at the limit fell from 30/32 to 19/32 on another practice set |
-| An agent edits a language model (`Experiment` with Codex) | Live LLM agent | One run on Qwen3-0.6B: 5/16 → 7/16 correct on the development problems it was chosen on, 4/16 → 3/16 on test problems |
+| An agent edits a language model (`Experiment` with Codex) | Live LLM agent | Two runs on Qwen3-0.6B: 5/16 → 7/16 correct on the development problems each choice was made on, 4/16 → 3/16 on test problems |
 
-The article's three Qwen3.5-0.8B edits import to their published hashes, and WSE's own `fill_slice@1` operator reproduces one of them, p25c, hash-exactly. The reconstruction takes its direction and columns from p50c's published change; a scripted search that used its form without its values found no repair. One live agent run has edited a language model, and its gain on the development problems did not carry over to the test problems.
+The article's three Qwen3.5-0.8B edits import to their published hashes, and WSE's own `fill_slice@1` operator reproduces one of them, p25c, hash-exactly. The reconstruction takes its direction and columns from p50c's published change; a scripted search that used its form without its values found no repair. Two live agent runs have edited a language model, and in both the gain on the development problems did not carry over to the test problems.
 
 ## Current support
 
 | Area | Status |
 | --- | --- |
-| Agent interface | `Experiment` with the Codex CLI (one live run, on Qwen3-0.6B); the MCP server for other MCP clients |
+| Agent interface | `Experiment` with the Codex CLI (two live runs, on Qwen3-0.6B); the MCP server for other MCP clients |
 | Language-model weights | Unquantized safetensors for causal models implemented natively by `transformers` |
 | Verified model imports | Qwen3.5-0.8B, Llama-3.2-1B-Instruct, Qwen3-0.6B, and gemma-3-1b-it |
 | Generation and activation probes | Apple MPS and CPU, tested on macOS with Apple silicon |

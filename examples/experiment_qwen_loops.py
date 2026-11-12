@@ -18,7 +18,7 @@ answers reached the limit and 2 were correct (docs/results.md, Section 3). This 
 The limit-hit rate is the share of answers cut off at the token limit. It is not a repetition rate: an answer
 can repeat itself and still finish, or reach the limit without repeating.
 
-Status: not run yet. The same API has run once with a live agent, on Qwen3-0.6B (docs/results.md, Section 6).
+Status: not run yet. The same API has run twice with a live agent, on Qwen3-0.6B (docs/results.md, Section 6).
 
 Time: on an M4 Pro (MPS), one evaluation of the 32 problems took 37 to 40 minutes in the recorded runs, so ten
 evaluations take 6.2 to 6.6 hours, and the test (two models on 16 problems, as many answers as one evaluation)
