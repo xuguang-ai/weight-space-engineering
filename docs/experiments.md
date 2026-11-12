@@ -201,10 +201,12 @@ fixture builder nor any reference model or oracle.
 --json`, as the agent of one run grant. The operator chooses the model
 name, which must name a model with tool calls at the provider; the recorded
 Codex run used `gpt-5.6-luna` ([results](results.md#6-a-live-llm-agent-edits-a-language-model-through-experiment)).
-WSE runs the binary that `WSE_CODEX_PATH` names, else the `codex` on `PATH`,
-else the newest one bundled with OpenAI's VS Code extension, and on macOS
-only after its code signature names OpenAI (Team ID `2DC432GLL2`); it has
-been tested with codex-cli 0.167.0-alpha.4.1.
+WSE runs the binary that `WSE_CODEX_PATH` names, else the `codex` on `PATH`
+(for an npm install, `npm install -g @openai/codex`, the native binary that
+its Node launcher starts), else the newest one bundled with OpenAI's VS Code
+extension. On macOS it runs a binary only after its code signature names
+OpenAI (Team ID `2DC432GLL2`), and it skips a release older than 0.167.0;
+it has been tested with codex-cli 0.167.0-alpha.4.1.
 
 | Setting | Value |
 | --- | --- |

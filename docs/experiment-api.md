@@ -2,19 +2,17 @@
 
 `Experiment` gives one model to an agent, with a goal and a fixed way to measure it. The agent investigates the model and proposes weight edits. WSE evaluates candidates on the same development problems, selects by a rule stated before the run, and freezes the choice. Only then does it test the frozen choice against the original model, on test problems registered at that moment.
 
-> **Status: two live runs.** With Codex and `gpt-5.6-luna`, `Experiment` ran twice on Qwen3-0.6B ([results](results.md#6-a-live-llm-agent-edits-a-language-model-through-experiment)): each run's choice improved the 16 development problems and did not improve 16 test problems. The Qwen3.5-0.8B example below has not been run.
-
 ```python
 from wse import Experiment
 
 experiment = Experiment(
-    model="Qwen/Qwen3.5-0.8B",
+    model="Qwen/Qwen3-0.6B",
     goal="Reduce repetitive reasoning so the model finishes more math answers.",
-    dev="examples/data/math_dev.jsonl",
+    dev="math_dev.jsonl",
     evaluator="math",
     minimize="limit_hit_rate",
     preserve=["accuracy"],
-    max_new_tokens=8192,
+    max_new_tokens=1024,
     workspace="runs/fix-loops",
 )
 result = experiment.run(
@@ -24,11 +22,12 @@ result = experiment.run(
 )
 print(result.summary())
 
-selected = result.model
-report = result.test("examples/data/math_test.jsonl")
+report = result.test("math_test.jsonl")  # only the frozen choice and the original, on new problems
 print(report.compare())
 result.export("artifacts/fix-loops")
 ```
+
+This is the README's example, [examples/experiment_quickstart.py](../examples/experiment_quickstart.py). With Codex and `gpt-5.6-luna`, this configuration ran twice on 2026-11-12 ([results](results.md#6-a-live-llm-agent-edits-a-language-model-through-experiment)): each run's choice improved the 16 development problems and did not improve the 16 test problems.
 
 | Argument | What it sets |
 | --- | --- |
@@ -50,32 +49,23 @@ result.export("artifacts/fix-loops")
 
 ## Install
 
-The examples run from a source checkout, with Python 3.11 or later and [uv](https://docs.astral.sh/uv/):
-
 ```bash
-git clone https://github.com/xuguang-ai/weight-space-engineering.git
-cd weight-space-engineering
-uv sync
+pip install "wse[models-hf]"
+npm install -g @openai/codex
 ```
 
-Language models need the `models-hf` extra, which `uv run --extra models-hf` installs the first time a command uses it.
-
-The agent is the [Codex CLI](https://github.com/openai/codex), which you install separately. WSE runs the binary that the environment variable `WSE_CODEX_PATH` names, else the `codex` on your `PATH`, else the newest one bundled with OpenAI's VS Code extension; on macOS it first checks that the binary's code signature names OpenAI. Check that `codex --version` runs. WSE has been tested with codex-cli 0.167.0-alpha.4.1.
+WSE needs Python 3.11 or later; language models need the `models-hf` extra. The agent is OpenAI's [Codex CLI](https://github.com/openai/codex), release 0.167 or later. WSE runs the binary that the environment variable `WSE_CODEX_PATH` names, else the `codex` on your `PATH`, else the newest one bundled with OpenAI's VS Code extension. An npm install puts a Node launcher script on `PATH`; WSE runs the native binary that the launcher would start, from the same install. On macOS, WSE first checks that the binary's code signature verifies and names OpenAI (Team ID `2DC432GLL2`); it then reads `codex --version` and skips a release older than 0.167.0. A binary that `WSE_CODEX_PATH` names and that fails a check is an error. WSE has been tested with codex-cli 0.167.0-alpha.4.1.
 
 ## Agent credentials
 
-The agent's model runs at your provider. Copy the template, [.env.example](../.env.example), to `.env`, which git ignores, and fill in your key and endpoint:
+The agent's model runs at your provider. WSE reads the key and the endpoint from its own environment:
 
 ```bash
-cp .env.example .env
+export OPENAI_API_KEY=your-api-key
+export OPENAI_BASE_URL=https://api.openai.com/v1
 ```
 
-```text
-OPENAI_API_KEY=your-api-key
-OPENAI_BASE_URL=https://api.openai.com/v1
-```
-
-For Azure OpenAI, set `OPENAI_BASE_URL` to your resource's endpoint, `https://YOUR-RESOURCE.services.ai.azure.com/openai/v1`, and put your deployment's name after `codex:`. `uv run --env-file .env` loads the file for one command only.
+For Azure OpenAI, set `OPENAI_BASE_URL` to your resource's endpoint, `https://YOUR-RESOURCE.services.ai.azure.com/openai/v1`, and put your deployment's name after `codex:`. In a source checkout, you can instead copy [.env.example](../.env.example) to `.env`, which git ignores, fill it in, and load it for one command with `uv run --env-file .env`.
 
 The key stays outside the agent: Codex reaches your provider through a proxy on `127.0.0.1` that WSE runs for the experiment and that adds the key to each request (`wse.model_proxy`). The agent's process holds only a random token for that proxy, valid while the run lasts; neither Codex nor the code the agent writes holds the key, and the proxy's log records no key, token, or request body.
 
@@ -100,19 +90,16 @@ The `math` evaluator also accepts:
 
 ## Run
 
-Two example scripts write out every argument. The small one has run twice with a live agent; the Qwen3.5-0.8B one has not been run.
-
-**A small model, in minutes per evaluation.** [examples/experiment_quickstart.py](../examples/experiment_quickstart.py) runs Qwen3-0.6B on the 16 development problems at 1,024 tokens, with up to 10 evaluations, and tests on the 16 test problems:
+**The README's example.** Download the problems into a directory, save the code above there, put your model's name in place of `YOUR_AGENT_MODEL`, and run it:
 
 ```bash
-uv run --extra models-hf --env-file .env \
-  python examples/experiment_quickstart.py \
-  --agent codex:YOUR_AGENT_MODEL
+curl -fLO "https://raw.githubusercontent.com/xuguang-ai/weight-space-engineering/main/examples/data/math_{dev,test}.jsonl"
+python fix_loops.py
 ```
 
-One evaluation should take about a minute and a half on an M4 Pro: in the model quickstart, Qwen3-0.6B answered a batch of 8 of these problems at 1,024 tokens in 46 to 49 seconds on MPS ([models.md](models.md#the-quickstart)).
+It runs Qwen3-0.6B on the 16 development problems at 1,024 tokens, with up to 10 evaluations, and tests on the 16 test problems. One evaluation takes about a minute and a half on an M4 Pro (87 to 91 seconds of WSE-metered computation per evaluation in the recorded runs), and a whole run took 15 to 17 minutes there.
 
-**Qwen3.5-0.8B's reasoning loops.** [examples/experiment_qwen_loops.py](../examples/experiment_qwen_loops.py) runs the full-size case: the 32 development problems of the recorded diagnosis, on which the original answered 2 correctly and ran 30 to the limit, at 8,192 tokens with the article's sampling profile, `qwen35think@1`:
+**Qwen3.5-0.8B's reasoning loops, not yet run with an agent.** [examples/experiment_qwen_loops.py](../examples/experiment_qwen_loops.py) sets up the full-size case: the 32 development problems of the recorded diagnosis, on which the original answered 2 correctly and ran 30 to the limit, at 8,192 tokens with the article's sampling profile, `qwen35think@1`. From a source checkout:
 
 ```bash
 caffeinate -is uv run --extra models-hf --env-file .env \
@@ -120,9 +107,7 @@ caffeinate -is uv run --extra models-hf --env-file .env \
   --agent codex:YOUR_AGENT_MODEL
 ```
 
-One evaluation of the 32 problems took 37 to 40 minutes on an M4 Pro in the recorded runs, so 10 evaluations take 6.2 to 6.6 hours. The agent's time limit includes its waits for evaluations; `run`'s default, 12 hours, leaves room for ten. `caffeinate -is` keeps the Mac awake.
-
-Both scripts take `--model`, `--repo`, and `--revision` for another model or a local snapshot, `--dev` and `--test` for other problems, and `--workspace` and `--export` for where results go.
+One evaluation of the 32 problems took 37 to 40 minutes on an M4 Pro in the recorded runs, so 10 evaluations take 6.2 to 6.6 hours. The agent's time limit includes its waits for evaluations; `run`'s default, 12 hours, leaves room for ten. `caffeinate -is` keeps the Mac awake. The script takes `--model`, `--repo`, and `--revision` for another model or a local snapshot, `--dev` and `--test` for other problems, and `--workspace` and `--export` for where results go.
 
 ## What happens during a run
 

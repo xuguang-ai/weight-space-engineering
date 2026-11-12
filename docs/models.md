@@ -43,17 +43,15 @@ from wse import Model, compare_models
 
 ### The quickstart
 
-[examples/model_quickstart.py](../examples/model_quickstart.py) runs each step on Qwen3-0.6B: it loads the model, inspects one attention layer, generates one answer, zeroes the 128 input columns of attention head 7 in layer 14's output projection with `fill_slice`, verifies and saves the edit, compares the edited model with the original on 8 of the 16 problems in [examples/data/math_dev.jsonl](../examples/data/math_dev.jsonl) at 1,024 tokens, and exports the patch and the edited model. The [README](../README.md#use-the-python-api) walks through it. From a local snapshot of the commit below, on an M4 Pro with MPS, it took 140 to 149 seconds in each of three runs:
+[examples/model_quickstart.py](../examples/model_quickstart.py) runs each step on Qwen3-0.6B: it loads the model at commit `c1899de289a04d12100db370d81485cdf75e47ca`, inspects one attention layer, generates one answer, zeroes the 128 input columns of attention head 7 in layer 14's output projection with `fill_slice`, verifies and saves the edit, compares the edited model with the original on 8 of the 16 problems in [examples/data/math_dev.jsonl](../examples/data/math_dev.jsonl) at 1,024 tokens, and exports the patch and the edited model. The [README](../README.md#use-the-python-api) walks through it. Run it in a directory that holds `math_dev.jsonl`, with WSE installed (`pip install "wse[models-hf]"`):
 
 ```bash
-uv run --extra models-hf python examples/model_quickstart.py \
-  runs/model-quickstart \
-  --model ~/models/Qwen3-0.6B \
-  --repo Qwen/Qwen3-0.6B \
-  --revision c1899de289a04d12100db370d81485cdf75e47ca
+curl -fLO https://raw.githubusercontent.com/xuguang-ai/weight-space-engineering/main/examples/data/math_dev.jsonl
+curl -fLO https://raw.githubusercontent.com/xuguang-ai/weight-space-engineering/main/examples/model_quickstart.py
+python model_quickstart.py
 ```
 
-The edit and the comparison printed:
+On an M4 Pro with MPS, an earlier version of the script, which took the model from a local copy of the same commit, ran in 140 to 149 seconds in each of three runs. The edit and the comparison printed:
 
 ```text
 1 tensor changed, 131,072 entries; weights 92865a3c8750 -> 092773d60909

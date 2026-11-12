@@ -8,25 +8,52 @@
 
 WSE is a Python framework and MCP harness for experiments that edit a model's weights directly. You state a goal and how it is measured. An agent investigates the model and proposes weight edits; WSE evaluates candidates on the same problems, selects one by your rule, freezes it, and only then tests it on problems the agent never saw. Every edit is an exact patch that replays to identical weights, so each result can be checked and reproduced.
 
-[Experiment](https://github.com/xuguang-ai/weight-space-engineering#an-experiment-in-a-few-lines) · [Install](https://github.com/xuguang-ai/weight-space-engineering#install) · [Python API](https://github.com/xuguang-ai/weight-space-engineering#use-the-python-api) · [Agents](https://github.com/xuguang-ai/weight-space-engineering#use-an-agent) · [Results](https://github.com/xuguang-ai/weight-space-engineering#results) · [Documentation](https://github.com/xuguang-ai/weight-space-engineering#documentation)
+[Install](https://github.com/xuguang-ai/weight-space-engineering#install) · [Quick start](https://github.com/xuguang-ai/weight-space-engineering#quick-start) · [Python API](https://github.com/xuguang-ai/weight-space-engineering#use-the-python-api) · [Agents](https://github.com/xuguang-ai/weight-space-engineering#how-the-agent-works) · [Results](https://github.com/xuguang-ai/weight-space-engineering#results) · [Documentation](https://github.com/xuguang-ai/weight-space-engineering#documentation)
 
-> **Current release: alpha.** A live LLM agent has repaired a small neural network through WSE's MCP tools. Language-model edits have run from Python and, with scripted controllers, through MCP. Through the `Experiment` API below, a live LLM agent has edited a language model in two runs, on Qwen3-0.6B: each choice improved the development problems and did not improve the test problems. Development and testing have used macOS on Apple silicon.
+## Install
 
-## An experiment in a few lines
+```bash
+pip install "wse[models-hf]"
+```
 
-An agent edits Qwen3.5-0.8B's weights so that it finishes more of its math answers within 8,192 tokens; WSE evaluates candidates on fixed development problems, keeps the one that cuts off the fewest answers without losing accuracy, and only then tests it against the original on problems registered after the choice is frozen.
+WSE needs Python 3.11 or later; `models-hf` adds the Hugging Face model support. An agent experiment, on macOS for now, also needs OpenAI's [Codex CLI](https://github.com/openai/codex), release 0.167 or later, which runs the agent:
+
+```bash
+npm install -g @openai/codex
+```
+
+## Quick start
+
+An agent edits Qwen3-0.6B's weights so that it finishes more of its math answers within 1,024 tokens. WSE evaluates every candidate on the same 16 development problems, keeps the one that cuts off the fewest answers without losing accuracy, freezes that choice, and only then tests it against the original on 16 problems the agent never saw.
+
+**1. Download the problems**: 16 GSM8K training problems to develop on and 16 GSM8K test problems, one JSON object per line ([format](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/experiment-api.md#data)).
+
+```bash
+curl -fLO "https://raw.githubusercontent.com/xuguang-ai/weight-space-engineering/main/examples/data/math_{dev,test}.jsonl"
+```
+
+**2. Set your key.** WSE reads your model provider's key and endpoint from the environment. Codex reaches the provider through a local proxy that WSE runs and that adds the key, so neither Codex nor the agent's code holds it.
+
+```bash
+export OPENAI_API_KEY=your-api-key
+export OPENAI_BASE_URL=https://api.openai.com/v1
+```
+
+For Azure OpenAI, set `OPENAI_BASE_URL` to your resource's endpoint, `https://YOUR-RESOURCE.services.ai.azure.com/openai/v1`, and use your deployment's name in step 3.
+
+**3. Run it.** Save this code as `fix_loops.py` next to the problems, put your model's name, or your deployment's, in place of `YOUR_AGENT_MODEL` (the recorded runs used `gpt-5.6-luna`), and run `python fix_loops.py`:
 
 ```python
 from wse import Experiment
 
 experiment = Experiment(
-    model="Qwen/Qwen3.5-0.8B",
+    model="Qwen/Qwen3-0.6B",
     goal="Reduce repetitive reasoning so the model finishes more math answers.",
-    dev="examples/data/math_dev.jsonl",
+    dev="math_dev.jsonl",
     evaluator="math",
     minimize="limit_hit_rate",
     preserve=["accuracy"],
-    max_new_tokens=8192,
+    max_new_tokens=1024,
     workspace="runs/fix-loops",
 )
 result = experiment.run(
@@ -34,127 +61,46 @@ result = experiment.run(
     sandbox="python",
     max_evaluations=10,
 )
-print(result.summary())  # behavior change, candidates, where they changed, why the choice; audit details after
+print(result.summary())
 
-selected = result.model  # the frozen choice, a Model; the original when no candidate qualifies
-report = result.test("examples/data/math_test.jsonl")  # only the frozen choice and the original, on new problems
+report = result.test("math_test.jsonl")  # only the frozen choice and the original, on new problems
 print(report.compare())
 result.export("artifacts/fix-loops")
 ```
 
-> **This Qwen3.5-0.8B example has not been run.** The same API has run twice with a live agent, on Qwen3-0.6B ([Results](https://github.com/xuguang-ai/weight-space-engineering#an-agent-edits-a-small-language-model)).
+**4. Read the result.** `result.summary()` reports what the agent tried, what WSE kept, and why; `report.compare()` reports the test. The run takes about 15 minutes on an M4 Pro. In the recorded run of this configuration on WSE's final code (2026-11-12, `gpt-5.6-luna`), the agent scaled half of the channels of a late MLP layer's down-projection, and WSE kept the candidate that scales layer 27's by 0.8:
 
-<details>
-<summary>What the same calls printed on Qwen3-0.6B (examples/experiment_quickstart.py, 2026-11-12)</summary>
+| 16 problems in each set | Original | WSE's choice |
+| --- | --- | --- |
+| Development problems answered correctly | 5 | 7 |
+| Development answers cut off at 1,024 tokens | 10 | 8 |
+| Test problems answered correctly | 4 | 3 |
+| Test answers cut off at 1,024 tokens | 11 | 12 |
 
-`result.summary()` for that run, as this version prints it after the test (so the state reads CLOSED; at the end of `run` it reads FROZEN and ends with the path of the run's logs), with two of the seven candidates shown:
-
-```text
-Experiment exp_0a0f8280e629ba70fdab1083806fcdee (CLOSED): Reduce repetitive reasoning so the model finishes more math answers.
-Rule: WSE keeps the candidate with the lowest limit_hit_rate on the full development set among those that improve on the baseline's limit_hit_rate, with accuracy no worse than the baseline's; when none does, it keeps the original model.
-
-Behavior on the development set (point estimates):
-  metric                    original  selected
-  accuracy                     0.312     0.438
-  limit_hit_rate               0.625     0.438
-  mean_generated_tokens        893.9     844.2
-Choice: ckpt_9a07584b2251d762ac22fbce5c5c1918 was kept: limit_hit_rate 0.625 -> 0.4375, accuracy 0.3125 -> 0.4375; 5 of 7 evaluated candidates qualified
-
-Candidates (7 evaluated):
-  - ckpt_9a07584b2251d762ac22fbce5c5c1918: accuracy 0.4375, limit_hit_rate 0.4375, mean_generated_tokens 844.2; 64 elements in model.norm.weight; selected
-    hypothesis: The final residual probe shows the largest finished-vs-limit contrast at residual:28. Halving only the 64 strongest corresponding model.norm dimensions should reduce late repetitive continuation while preserving most output features.
-  - ckpt_c12a1e8686479788a317b0f08699539d: accuracy 0.3125, limit_hit_rate 0.5625, mean_generated_tokens 904.1; 64 elements in model.norm.weight; qualified; another candidate scored better
-    hypothesis: A stronger version of the successful late-norm intervention tests whether more suppression of the same 64 high-contrast dimensions further lowers looping.
-  ... (5 more candidates)
-Candidates without a full development evaluation (1): ckpt_68d97766330258baf71c35413fa6ec55
-
-The agent's final message: WSE-STOP: Best evaluated candidate is `ckpt_9a07584b2251d762ac22fbce5c5c1918`, improving accuracy to 0.4375 and reducing limit-hit rate to 0.4375 from 0.625.
-
-Audit:
-  controller codex_cli@1 model gpt-5.6-luna, ended completed (the agent stopped: WSE-STOP: Best evaluated candidate is `ckpt_9a07584b2251d762ac22fbce5c5c1918`, improving accuracy to 0.4375 and reducing limit-hit rate to 0.4375 from 0.625.)
-  evaluations 8 of 10 (the baseline included)
-  constraint status unverified (the agent runs its own commands (Codex's shell), whose computation WSE does not meter: WSE meters only its own calls; sandbox code execution: WSE meters only its own calls)
-  WSE-metered computation 699.1 s; agent tokens 1,583,478 (input 1,577,323, output 6,155)
-  sandbox calls 4, 1.0 s of sandbox wall-clock time (not metered computation)
-```
-
-`report.compare()` on the 16 test problems:
-
-```text
-test data examples/data/math_test.jsonl: 16 problems; selected ckpt_9a07584b2251d762ac22fbce5c5c1918, original ckpt_60a7ac2ff87136505570931729913354
-metric                    original  selected   difference [95% interval]
-accuracy                     0.250     0.188   -0.062 [-0.188, +0.000] paired
-limit_hit_rate               0.688     0.750   +0.062 original [0.438, 0.875]; selected [0.562, 0.938]
-mean_generated_tokens        922.3     945.9   +23.6 original [823.2, 1001.6]; selected [863.6, 1009.9]
-```
-
-</details>
+The choice improved the problems it was chosen on, not the new ones; the other recorded run ended the same way ([Results](https://github.com/xuguang-ai/weight-space-engineering#an-agent-edits-a-small-language-model)).
 
 - **`goal` guides; `minimize` and `preserve` decide.** A candidate qualifies when its development limit-hit rate is below the original's and its development accuracy is at least the original's; WSE keeps the qualifying candidate with the lowest limit-hit rate, and when none qualifies, `result.model` is the original. These are point estimates, not significance tests.
 - **The evaluation is fixed.** Every model is evaluated on the same problems, prompts, sampling settings, seeds, and token limit, and the agent cannot change the grading. `max_evaluations` counts the evaluations of whole models on the development problems, the original's included.
 - **The limit-hit rate** is the share of answers cut off at the token limit. It is not a repetition rate.
 
-[Use an agent](https://github.com/xuguang-ai/weight-space-engineering#use-an-agent) gives the setup; the [Experiment API](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/experiment-api.md) covers the data format, where results go, test isolation, and what WSE does and does not verify.
-
-## Install
-
-The examples run from a source checkout. You need Python 3.11 or later and [uv](https://docs.astral.sh/uv/).
-
-```bash
-git clone https://github.com/xuguang-ai/weight-space-engineering.git
-cd weight-space-engineering
-uv sync
-```
-
-Each command names the optional extra it needs, and `uv run --extra models-hf` installs the Hugging Face model support the first time a command uses it. An agent also needs the Codex CLI ([below](https://github.com/xuguang-ai/weight-space-engineering#use-an-agent)). The release on PyPI, 0.1.2, predates the `Model` and `Experiment` APIs.
+[How the agent works](https://github.com/xuguang-ai/weight-space-engineering#how-the-agent-works) explains what Codex can and cannot reach; the [Experiment API](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/experiment-api.md) covers every argument, where results go, test isolation, and what WSE does and does not verify.
 
 ## Use the Python API
 
-A `Model` is one version of a model in a workspace: load it, inspect it, generate, edit its weights, and compare the edit with the original. [examples/model_quickstart.py](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/model_quickstart.py) runs each step on Qwen3-0.6B and takes about two and a half minutes on an M4 Pro, after a download of 1.5 GB; its output directory takes another 2.7 GB, 1.5 GB of it the exported model:
-
-```bash
-uv run --extra models-hf python examples/model_quickstart.py \
-  runs/model-quickstart \
-  --revision c1899de289a04d12100db370d81485cdf75e47ca
-```
-
-`--revision` fixes the model's commit. The output below came from a run of this script on a local copy of that commit, on an M4 Pro with MPS; checkpoint and patch IDs differ per run. **Run the complete script; the blocks below are a walkthrough of it.** Its start, the imports and arguments, is folded, so the visible code alone does not run.
-
-<details>
-<summary>The start of the script: imports and arguments</summary>
-
-```python
-import argparse
-from pathlib import Path
-
-from wse import Model, compare_models
-
-parser = argparse.ArgumentParser(description="WSE's Model API: load, inspect, generate, edit, compare, and export.")
-parser.add_argument("out", type=Path, help="a new directory for the workspace, the comparison, and the exports")
-parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="a Hugging Face repository ID or a local snapshot")
-parser.add_argument("--repo", help="a local snapshot's source repository")
-parser.add_argument("--revision", help="the revision to download (default main), or a local snapshot's commit")
-parser.add_argument("--data", type=Path, default=Path("examples/data/math_dev.jsonl"), help="math problems")
-parser.add_argument("--problems", type=int, default=8, help="how many of the problems the comparison uses")
-parser.add_argument("--max-new-tokens", type=int, default=1024, help="the token limit of each answer")
-args = parser.parse_args()
-if args.out.exists():
-    parser.error(f"{args.out} exists; each run needs a new directory")
-```
-
-</details>
+A `Model` is one version of a model in a workspace: load it, inspect it, generate, edit its weights, and compare the edit with the original. The blocks below are one script, [examples/model_quickstart.py](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/model_quickstart.py), run in the directory that holds `math_dev.jsonl` from step 1 above. On an M4 Pro it takes about two and a half minutes after a download of 1.5 GB, and it writes 2.7 GB to `runs/model-quickstart`, 1.5 GB of it the exported model; delete that directory to run it again. Checkpoint and patch IDs differ per run.
 
 ### Load and inspect
 
-`from_pretrained` resolves the revision to a commit, records it, and imports the weights into a workspace. `tensors` lists names, shapes, and dtypes; `tensor` returns a copy.
+`from_pretrained` resolves the revision to a commit, records it, and imports the weights into a workspace; without `revision`, it takes the latest commit. `tensors` lists names, shapes, and dtypes; `tensor` returns a copy.
 
 ```python
+from wse import Model, compare_models
+
 # 1. Load: the snapshot at a resolved commit, imported into a workspace.
 original = Model.from_pretrained(
-    args.model,
-    repo=args.repo,
-    revision=args.revision,
-    workspace=args.out / "workspace",
+    "Qwen/Qwen3-0.6B",
+    revision="c1899de289a04d12100db370d81485cdf75e47ca",
+    workspace="runs/model-quickstart/workspace",
 )
 print(original.inspect())
 
@@ -293,12 +239,12 @@ The registered operators scale, set, or fill a slice, remove a direction's proje
 comparison = compare_models(
     base=original,
     candidate=edited,
-    data=args.data,
+    data="math_dev.jsonl",
     evaluator="math",
     metrics=["accuracy", "limit_hit_rate", "mean_generated_tokens"],
-    max_new_tokens=args.max_new_tokens,
-    problems=args.problems,
-    out_dir=args.out / "comparison",
+    max_new_tokens=1024,
+    problems=8,
+    out_dir="runs/model-quickstart/comparison",
 )
 print(comparison.table())
 ```
@@ -317,8 +263,8 @@ On 8 of the 16 problems in [examples/data/math_dev.jsonl](https://github.com/xug
 
 ```python
 # 6. Export: the exact patch with its provenance, and the edited model as a Hugging Face directory.
-print(f"patch: {edit.export(args.out / 'patch')}")
-print(f"model: {edited.export(args.out / 'edited-model')}")
+print(f"patch: {edit.export('runs/model-quickstart/patch')}")
+print(f"model: {edited.export('runs/model-quickstart/edited-model')}")
 ```
 
 ```text
@@ -330,42 +276,11 @@ The model directory holds `config.json`, the tokenizer, `model.safetensors`, and
 
 The same calls run the full-size case on Qwen3.5-0.8B, which reconstructs a published edit and measures it on 32 problems ([Results](https://github.com/xuguang-ai/weight-space-engineering#results)).
 
-## Use an agent
+## How the agent works
 
 `Experiment` hands one model to an agent under a fixed evaluation. The agent is the [Codex CLI](https://github.com/openai/codex). WSE starts it in the experiment's working directory and connects it to the run's WSE tools over MCP; the agent can also write and run Python there, under Codex's sandbox, which WSE configures so that the agent can read the model's weights but not the test data, WSE's database, or your keys. WSE records each candidate the agent submits as an exact patch and evaluates the ones the agent asks it to; when the agent stops, WSE selects among the evaluated candidates by the rule and freezes the choice before any test. Because the agent's own code can compute anything from the weights it reads, WSE meters only its own calls and labels these runs `unverified`.
 
-**1. Install the Codex CLI.** WSE runs the binary that `WSE_CODEX_PATH` names, else the `codex` on your `PATH`, else the newest one bundled with OpenAI's VS Code extension; on macOS it first checks that the binary's code signature names OpenAI. Check that `codex --version` runs; WSE has been tested with codex-cli 0.167.0-alpha.4.1.
-
-**2. Add your key.** Copy the template, [.env.example](https://github.com/xuguang-ai/weight-space-engineering/blob/main/.env.example), and fill in your key and endpoint; git ignores `.env`:
-
-```bash
-cp .env.example .env
-```
-
-```text
-OPENAI_API_KEY=your-api-key
-OPENAI_BASE_URL=https://api.openai.com/v1
-```
-
-For Azure OpenAI, set `OPENAI_BASE_URL` to your resource's endpoint, `https://YOUR-RESOURCE.services.ai.azure.com/openai/v1`, and put your deployment's name after `codex:`. Codex reaches the provider through a local proxy that WSE runs and that adds the key, so neither Codex nor the agent's code holds it ([credentials](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/experiment-api.md#agent-credentials)).
-
-**3. Run an experiment.** The small script below has run twice with a live agent ([Results](https://github.com/xuguang-ai/weight-space-engineering#an-agent-edits-a-small-language-model)); the Qwen3.5-0.8B one has not been run. With your model's name, or your deployment's name, in place of `YOUR_AGENT_MODEL`, the small one runs Qwen3-0.6B on the 16 development problems at 1,024 tokens, with up to 10 evaluations (about a minute and a half each, by the model quickstart's timing), and then tests on 16 GSM8K test problems:
-
-```bash
-uv run --extra models-hf --env-file .env \
-  python examples/experiment_quickstart.py \
-  --agent codex:YOUR_AGENT_MODEL
-```
-
-The full-size one gives the agent Qwen3.5-0.8B's reasoning loops: 32 GSM8K training problems on which the original answered 2 correctly and ran 30 to the limit, at 8,192 tokens with the article's sampling profile, `qwen35think@1`. One evaluation took 37 to 40 minutes in the recorded runs, so 10 take 6.2 to 6.6 hours; `caffeinate -is` keeps the Mac awake:
-
-```bash
-caffeinate -is uv run --extra models-hf --env-file .env \
-  python examples/experiment_qwen_loops.py \
-  --agent codex:YOUR_AGENT_MODEL
-```
-
-`--extra models-hf` installs the model support on first use, and `--env-file .env` loads the key for this command only. Both scripts take `--model`, `--dev`, `--test`, `--workspace`, and `--export` ([examples](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/experiment_quickstart.py)).
+WSE runs the Codex binary that `WSE_CODEX_PATH` names, else the `codex` on your `PATH` (for an npm install, the native binary that its launcher starts), else the newest one bundled with OpenAI's VS Code extension. On macOS it first checks that the binary's code signature names OpenAI, and it skips releases older than 0.167 ([details](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/experiment-api.md#install)).
 
 [Experiment API](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/experiment-api.md): the selection rule, test isolation, what is verified, and current limits · [Other MCP clients](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/experiments.md#serving-a-run-to-an-mcp-client) · [Policies and budgets](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/experiments.md#budgets)
 
@@ -446,14 +361,15 @@ Local language-model evaluation is slow: a 32-problem generation pass at 8,192 t
 
 ## Contributing
 
-From the repository checkout, install every extra and run the offline test suite. It uses tiny models built from configuration classes:
+Clone the repository and run the offline test suite, which uses tiny models built from configuration classes. With [uv](https://docs.astral.sh/uv/), `uv run --all-extras` installs WSE, every optional extra, and the test tools the first time:
 
 ```bash
-uv sync --all-extras
-uv run --no-sync pytest -q
+git clone https://github.com/xuguang-ai/weight-space-engineering.git
+cd weight-space-engineering
+uv run --all-extras pytest -q
 ```
 
-Keep `--all-extras` when syncing: a plain `uv sync` removes the optional extras. Bug reports should include the command, model revision, platform, and relevant error output. [Open an issue](https://github.com/xuguang-ai/weight-space-engineering/issues)
+Bug reports should include the command, model revision, platform, and relevant error output. [Open an issue](https://github.com/xuguang-ai/weight-space-engineering/issues)
 
 ## License
 
