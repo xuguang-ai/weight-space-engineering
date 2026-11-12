@@ -51,7 +51,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import NamedTuple
+from typing import IO, NamedTuple
 
 import numpy as np
 import torch
@@ -83,6 +83,8 @@ PATCHES_DIR = "patches"
 BLOBS_DIR = "blobs"
 # Content-addressed model files other than weights (tokenizer, chat template, generation configuration), by SHA-256.
 MODEL_FILES_DIR = "model_files"
+TENSORS_DIR = "tensors"  # tensor files that sandbox calls saved, by SHA-256 (wse://tensors/<sha256>)
+TENSOR_URI_PREFIX = "wse://tensors/"
 ANALYSIS_URI_PREFIX = "wse://analyses/"
 TMP_DIR = "tmp"
 DEFAULT_RECOVERY_GRACE_SECONDS = 600.0
@@ -93,7 +95,7 @@ WEIGHTS_INDEX_FORMAT = "wse-weights-index-v1"
 _RELPATH_PATTERN = re.compile(
     r"^(?:weights/[0-9a-f]{64}\.(?:safetensors|json)|manifests/[0-9a-f]{64}\.json"
     r"|analyses/[0-9a-f]{64}\.json|patches/[0-9a-f]{64}\.(?:json|wsepatch)|blobs/[0-9a-f]{64}"
-    r"|model_files/[0-9a-f]{64})$"
+    r"|model_files/[0-9a-f]{64}|tensors/[0-9a-f]{64}\.safetensors)$"
 )
 # Integer dtypes whose bit patterns carry a stored dtype of the same width.
 _BIT_DTYPES: dict[int, tuple[type, torch.dtype]] = {
@@ -198,6 +200,7 @@ class ArtifactStore:
             self.artifacts_dir / PATCHES_DIR,
             self.artifacts_dir / BLOBS_DIR,
             self.artifacts_dir / MODEL_FILES_DIR,
+            self.artifacts_dir / TENSORS_DIR,
         ):
             directory.mkdir(parents=True, exist_ok=True)
         self.db = Database(self.workspace / "metadata.sqlite")
@@ -576,6 +579,38 @@ class ArtifactStore:
             self._publish(f"{MODEL_FILES_DIR}/{digest}", lambda target: target.write_bytes(data),
                           expected_sha256=digest)
         return digest
+
+    def publish_tensor_file(self, source: IO[bytes], digest: str) -> str:
+        """Publish a sandbox call's tensor file by its SHA-256 hex ``digest``; return its ``wse://tensors/`` URI.
+
+        ``source`` is a readable binary file object positioned at the start;
+        the copy is published only if it has ``digest``. Files are
+        content-addressed and immutable, so an identical file is stored once.
+        """
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, "a tensor file digest is 64 hexadecimal digits")
+        relpath = f"{TENSORS_DIR}/{digest}.safetensors"
+        path = self._artifact_path(relpath)
+        if not (path.is_file() and _file_sha256(path) == digest):
+            def write(target: Path) -> None:
+                with target.open("wb") as handle:
+                    shutil.copyfileobj(source, handle, 1 << 22)
+
+            self._publish(relpath, write, expected_sha256=digest)
+        return TENSOR_URI_PREFIX + digest
+
+    def tensor_file_path(self, uri: str) -> Path:
+        """The stored file behind a ``wse://tensors/<sha256>`` URI, after a hash check."""
+        digest = uri.removeprefix(TENSOR_URI_PREFIX) if isinstance(uri, str) else ""
+        if not (isinstance(uri, str) and uri.startswith(TENSOR_URI_PREFIX) and re.fullmatch(r"[0-9a-f]{64}", digest)):
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, f"{uri!r} is not a tensor file URI ({TENSOR_URI_PREFIX}<sha256>)")
+        path = self._artifact_path(f"{TENSORS_DIR}/{digest}.safetensors")
+        if not path.is_file():
+            raise WSEError(ErrorCode.NOT_FOUND, f"tensor file {uri} is not stored", details={"uri": uri})
+        if _file_sha256(path) != digest:
+            raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"stored tensor file {uri} does not match its hash",
+                           details={"uri": uri})
+        return path
 
     def read_model_file(self, digest: str) -> bytes | None:
         """The bytes of a published model file after a hash check; ``None`` if it is missing or altered."""

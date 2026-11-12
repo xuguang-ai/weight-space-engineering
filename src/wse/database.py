@@ -492,6 +492,25 @@ MIGRATIONS: list[tuple[int, list[str]]] = [
             """,
         ],
     ),
+    (
+        13,
+        [
+            # Stored tensor files of sandbox calls (wse://tensors/<sha256>): candidate submissions name them.
+            """
+            CREATE TABLE IF NOT EXISTS tensor_files (
+                uri            TEXT NOT NULL,
+                experiment_id  TEXT NOT NULL REFERENCES experiments (experiment_id),
+                call           INTEGER NOT NULL,
+                path           TEXT NOT NULL,
+                sha256         TEXT NOT NULL,
+                size_bytes     INTEGER NOT NULL,
+                tensors_json   TEXT NOT NULL,
+                created_at     TEXT NOT NULL,
+                PRIMARY KEY (uri, experiment_id)
+            )
+            """,
+        ],
+    ),
 ]
 
 LATEST_SCHEMA_VERSION = MIGRATIONS[-1][0]

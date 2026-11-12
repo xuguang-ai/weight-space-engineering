@@ -49,6 +49,7 @@ STRATEGY_TOOLS: tuple[str, ...] = (
     "wse_analyze",
     "wse_probe",
     "wse_run_python",
+    "wse_submit_candidate",
     "wse_preview_patch",
     "wse_apply_patch",
     "wse_submit_evaluation",

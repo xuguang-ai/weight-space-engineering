@@ -52,6 +52,13 @@ stored results and refuses references. Replay never reads a reference, since
 a step records its after-values. ``summarize_vector_parameters`` gives the
 agent-facing form of recorded parameters, whose inline vectors it echoes as
 ``{length, sha256}``.
+
+Tensor references (``wse.operators.submitted``): parameters that an operator
+declares in ``tensor_parameters`` name a tensor of a stored tensor file of
+the run, ``wse://tensors/<sha256>#<name>``. A managed preview resolves them
+with ``resolve_tensor_references`` before any weights are read: the file
+must belong to the run's experiment, and the tensor must have the target's
+stored dtype and the selection's shape, with finite values.
 """
 
 from __future__ import annotations
@@ -92,6 +99,7 @@ from wse.schemas import (
 from wse.tensors import (
     WEIGHTS_HASH_BLOBS,
     bits_to_values,
+    dtype_name,
     hash_weights,
     resolve_selection,
     tensor_bits,
@@ -326,10 +334,109 @@ def resolve_references(
     return resolved
 
 
+def resolve_tensor_references(
+    operations: Sequence[Mapping[str, Any]],
+    tensor_file: Any,
+    manifest: Any,
+    *,
+    registry: Registry | None = None,
+    policy: OperationPolicy | None = None,
+) -> dict[str, np.ndarray]:
+    """Resolve the tensor references of a patch's operations; return each tensor's float32 values by reference.
+
+    ``tensor_file(uri)`` returns the path of a stored tensor file that the
+    caller may read (a run reads only its own experiment's files, after a
+    hash check) and fails with ``NOT_FOUND`` for any other. ``manifest`` is
+    the base checkpoint's: each tensor must have its target's stored dtype
+    and the shape of the operation's selection, and every value must be
+    finite. Operations that are malformed, whose operator does not resolve,
+    or whose target or selection is invalid are left for
+    ``materialize_patch`` to report in order.
+    """
+    import re
+
+    from safetensors import safe_open
+
+    from wse.operators.submitted import TENSOR_REFERENCE_PATTERN
+    from wse.registry import builtin_registry
+
+    registry = registry or builtin_registry()
+    policy = policy or default_operation_policy()
+    resolved: dict[str, np.ndarray] = {}
+    if (isinstance(operations, (str, bytes, Mapping)) or not isinstance(operations, Sequence)
+            or len(operations) > policy.limits.max_patch_operations):
+        return resolved
+    infos = {info.name: info for info in manifest.tensors}
+    for index, operation in enumerate(operations):
+        if not isinstance(operation, Mapping) or "op" not in operation:
+            continue
+        try:
+            _, _, operator = _resolve_operator(operation["op"], registry, policy, managed=True)
+        except WSEError:
+            continue
+        for name in _declared(operator, "tensor_parameters"):
+            reference = operation.get(name)
+            if reference in resolved:
+                continue
+            try:
+                if not isinstance(reference, str) or not re.fullmatch(TENSOR_REFERENCE_PATTERN, reference):
+                    raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                                   f"{name} must name a stored tensor of this run, wse://tensors/<sha256>#<tensor name>",
+                                   details={"parameter": name})
+                info = infos.get(operation.get("tensor"))
+                if info is None:
+                    continue
+                try:
+                    shape = [s.stop - s.start for s in resolve_selection(operation.get("selection"), info.shape,
+                                                                         tensor=info.name)]
+                except WSEError:
+                    continue
+                uri, _, tensor_name = reference.partition("#")
+                path = tensor_file(uri)
+                with safe_open(str(path), framework="pt") as handle:
+                    names = list(handle.keys())
+                    if tensor_name not in names:
+                        raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                                       f"{uri} holds no tensor {tensor_name!r}; it holds {sorted(names)[:16]}",
+                                       details={"parameter": name, "tensor_file": uri, "tensors": sorted(names)[:64]})
+                    tensor = handle.get_tensor(tensor_name)
+                if dtype_name(tensor) != info.dtype:
+                    raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                                   f"source tensor {tensor_name!r} has dtype {dtype_name(tensor)}; {info.name!r} is "
+                                   f"stored as {info.dtype}: save the values in the stored dtype",
+                                   details={"parameter": name, "source_dtype": dtype_name(tensor),
+                                            "stored_dtype": info.dtype})
+                if list(tensor.shape) != shape:
+                    raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                                   f"source tensor {tensor_name!r} has shape {list(tensor.shape)}; the selection of "
+                                   f"{info.name!r} has shape {shape}",
+                                   details={"parameter": name, "source_shape": list(tensor.shape),
+                                            "selection_shape": shape})
+                values = tensor.to(torch.float32).numpy()
+                bad = int(np.count_nonzero(~np.isfinite(values)))
+                if bad:
+                    raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                                   f"source tensor {tensor_name!r} holds {bad} nonfinite value(s); every weight must "
+                                   "be finite", details={"parameter": name, "nonfinite_count": bad})
+            except WSEError as exc:
+                raise _wrap_step_error(index, operation["op"], exc) from exc
+            values.flags.writeable = False
+            resolved[reference] = values
+    return resolved
+
+
 def _reference_inputs(operator: Any, raw: Mapping[str, Any],
                       references: Mapping[str, np.ndarray] | None) -> dict[str, np.ndarray]:
-    """The resolved vectors of the references among the operator's reference parameters, by parameter key."""
+    """The resolved vectors (and stored tensors) of the operator's reference parameters, by parameter key."""
     inputs: dict[str, np.ndarray] = {}
+    for name in _declared(operator, "tensor_parameters"):
+        reference = raw.get(name)
+        values = None if references is None or not isinstance(reference, str) else references.get(reference)
+        if values is None:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                           f"{name} names a stored tensor file of a run, which only that run's managed previews "
+                           "resolve", details={"parameter": name})
+        inputs[name] = values
     for name in _declared(operator, "reference_parameters"):
         for key, reference in reference_entries(name, raw.get(name)):
             if references is None:

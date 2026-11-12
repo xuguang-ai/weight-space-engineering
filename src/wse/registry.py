@@ -245,6 +245,7 @@ def builtin_registry() -> Registry:
     from wse.evaluators.graders import BUILTIN_GRADERS
     from wse.evaluators.sampling import BUILTIN_PROFILES
     from wse.operators.directions import BUILTIN_DIRECTION_EDITS
+    from wse.operators.submitted import BUILTIN_SUBMITTED_EDITS
     from wse.operators.linalg import BUILTIN_LINALG_ANALYSES
     from wse.operators.tensor import BUILTIN_ANALYSES, BUILTIN_EDITS
     from wse.strategies.direction_search import DirectionSearchStrategy
@@ -260,7 +261,7 @@ def builtin_registry() -> Registry:
     for descriptor in BUILTIN_FAMILIES:
         registry.register("family", descriptor.family_id, descriptor.version, descriptor)
     for operator in [*BUILTIN_ANALYSES.values(), *BUILTIN_LINALG_ANALYSES.values(), *BUILTIN_EDITS.values(),
-                     *BUILTIN_DIRECTION_EDITS.values()]:
+                     *BUILTIN_DIRECTION_EDITS.values(), *BUILTIN_SUBMITTED_EDITS.values()]:
         registry.register("operator", operator.spec.operator_id, operator.spec.version, operator)
     for evaluator in (ForwardBatchEvaluator(), ClassificationEvaluator(), GenerationEvaluator()):
         registry.register("evaluator", evaluator.evaluator_id, evaluator.version, evaluator)

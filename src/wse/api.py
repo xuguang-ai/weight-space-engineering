@@ -30,6 +30,7 @@ from wse.adapters.base import Architecture, ModelAdapter
 from wse.registry import Registry, builtin_registry
 from wse.schemas import (
     BundleManifest,
+    CandidateSubmission,
     SandboxRun,
     ClusterSummary,
     ErrorCode,
@@ -1427,6 +1428,18 @@ class Engine:
         that grants this is unverified: WSE meters only its own calls.
         """
         return self.experiments.run_python(experiment_id, code, key, restart)
+
+    def submit_candidate(self, experiment_id: str, parent_checkpoint_id: str, tensor_file: str, hypothesis: str,
+                         key: str, tensors: list[str] | None = None) -> CandidateSubmission:
+        """Build a candidate from a ``.safetensors`` file the run's sandbox saved (``ExperimentService.submit_candidate``).
+
+        Each named tensor of the stored tensor file (default: all of them)
+        replaces the tensor of the same name in ``parent_checkpoint_id``,
+        after the checks of every edit; the candidate is an exact patch whose
+        record names the file and the sandbox call that saved it.
+        """
+        return self.experiments.submit_candidate(experiment_id, parent_checkpoint_id, tensor_file, hypothesis, key,
+                                                 tensors)
 
     def experiment_policy(self, experiment_id: str) -> ExperimentPolicy:
         """The immutable policy of an experiment this engine may see."""

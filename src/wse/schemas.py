@@ -628,6 +628,14 @@ class Usage(_Frozen):
     unavailable: dict[str, str] = Field(default_factory=dict)
 
 
+class SandboxTensor(_Frozen):
+    """One tensor of a stored tensor file: its name in the file, shape, and dtype."""
+
+    name: str
+    shape: list[int]
+    dtype: str
+
+
 class SandboxOutput(_Frozen):
     """A file that code in the sandbox left in ``outputs/``, with its size and SHA-256.
 
@@ -635,7 +643,11 @@ class SandboxOutput(_Frozen):
     array of one or two dimensions gives a ``pointer``,
     ``wse://analyses/<sha256>#/values`` (a row of a matrix is
     ``#/values/<row>``), which edits and analyses accept wherever they take a
-    stored vector.
+    stored vector. A ``.safetensors`` file of floating-point tensors is
+    stored as a tensor file, ``tensor_file`` (``wse://tensors/<sha256>``),
+    which ``wse_submit_candidate`` turns into a candidate; ``tensors`` lists
+    its first ``MAX_LISTED_TENSORS`` tensors and ``tensor_count`` counts them
+    all. ``note`` says why a file was not stored, when it was not.
     """
 
     path: str
@@ -644,6 +656,10 @@ class SandboxOutput(_Frozen):
     shape: list[int] | None = None
     dtype: str | None = None
     pointer: str | None = None
+    tensor_file: str | None = _optional()
+    tensors: list[SandboxTensor] | None = _optional()
+    tensor_count: int | None = _optional(ge=0)
+    note: str | None = _optional()
 
 
 SandboxEnding = Literal["completed", "error", "timed_out", "memory_limit", "cpu_limit", "file_size_limit", "crashed"]
@@ -694,6 +710,38 @@ class SandboxRun(_Frozen):
     restarted: bool
     state_kept: bool
     outputs_not_listed: int | None = _optional(ge=1)
+
+
+class SubmittedTensor(_Frozen):
+    """One tensor of a candidate submission: what it changed relative to the parent checkpoint."""
+
+    tensor: str
+    changed_elements: int = Field(ge=0)
+    l2_delta: float
+    relative_l2_delta: float | None
+
+
+class CandidateSubmission(_Frozen):
+    """A candidate built from a stored tensor file of the run (``Engine.submit_candidate``, ``wse_submit_candidate``).
+
+    The candidate is the parent checkpoint with each named tensor replaced by
+    the file's tensor of the same name (``replace_tensor@1``), recorded as an
+    exact patch (``patch_id``) after the checks of every edit. ``source``
+    records where the values came from: the tensor file, the sandbox call
+    that saved it, its path in ``outputs/``, its SHA-256, and that call's code
+    hash. ``usage`` is one preview and one commit.
+    """
+
+    schema_version: Literal["1"] = SCHEMA_VERSION
+    patch_id: str
+    checkpoint_id: str
+    parent_checkpoint_id: str
+    hypothesis: str
+    source: dict[str, Any]
+    tensors: list[SubmittedTensor]
+    changed_elements: int = Field(ge=0)
+    changed_fraction: float
+    usage: Usage
 
 
 class TensorDiff(_Frozen):

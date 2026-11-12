@@ -76,6 +76,7 @@ from wse.probes import DEFAULT_SUMMARY_TOP, MAX_PROBE_SITES, MAX_SITE_CHARACTERS
 from wse.store import ANALYSIS_URI_PREFIX
 from wse.schemas import (
     MAX_ECHO_CHARACTERS,
+    CandidateSubmission,
     SandboxRun,
     MAX_PROBE_STRING_CHARACTERS,
     AnalysisResult,
@@ -118,6 +119,7 @@ READ_COUNTERS = ("tensor_read_calls", "compute_seconds")
 PROBE_COUNTERS = ("probe_calls", "teacher_forced_tokens", "compute_seconds")
 PREVIEW_COUNTERS = ("patch_previews", "compute_seconds")
 SANDBOX_COUNTERS = ("sandbox_calls", "sandbox_seconds")
+SUBMISSION_COUNTERS = ("patch_previews", "candidate_commits", "compute_seconds")
 APPLY_COUNTERS = ("candidate_commits", "compute_seconds")
 INSPECTION_COUNTERS = ("compute_seconds",)
 
@@ -205,6 +207,12 @@ EvalConfigArg = Annotated[Any, WithJsonSchema({**EVAL_CONFIG_SCHEMA, "descriptio
 CodeArg = Annotated[str, Field(description="Python to run in this run's sandbox (NumPy, PyTorch on the CPU, "
                                            "safetensors): it reads inputs/ and writes work/ and outputs/; no network, "
                                            "no other files, no new processes.")]
+TensorFileArg = Annotated[str, Field(description="The tensor_file that a wse_run_python call returned for a "
+                                                 ".safetensors file it saved to outputs/ (wse://tensors/<sha256>).")]
+TensorNamesArg = Annotated[list[str] | None, Field(description="The tensors of the file to submit, by their full "
+                                                            "checkpoint names; omit to submit all of them.")]
+HypothesisArg = Annotated[str, Field(description="One or two sentences stating the observable evidence for this "
+                                                 "candidate.")]
 RestartArg = Annotated[bool, Field(description="True ends the kernel first, so the code runs in a new one with "
                                                "no earlier variables.")]
 WaitArg = Annotated[float, Field(json_schema_extra={"minimum": 0, "maximum": MAX_WAIT_SECONDS},
@@ -403,6 +411,7 @@ class WSEMCPServer:
             (self.wse_analyze, METERED),
             (self.wse_probe, MUTATION),
             (self.wse_run_python, MUTATION),
+            (self.wse_submit_candidate, MUTATION),
             (self.wse_preview_patch, MUTATION),
             (self.wse_apply_patch, MUTATION),
             (self.wse_submit_evaluation, MUTATION),
@@ -582,6 +591,29 @@ class WSEMCPServer:
                 summary=f"call {result.call} {result.ending}" + (f" ({result.error})" if result.error else "")
                         + f" in {result.wall_seconds:.1f} s in {kernel}; {len(result.outputs)} output files",
                 uris=pointers, usage=self._usage(eid, result.usage, SANDBOX_COUNTERS), result=result)
+        return _respond(self._call(run))
+
+    def wse_submit_candidate(self, *, experiment_id: ExperimentIdArg = None, parent_checkpoint_id: IdArg,
+                             tensor_file: TensorFileArg, hypothesis: HypothesisArg, idempotency_key: KeyArg,
+                             tensors: TensorNamesArg = None) -> Annotated[CallToolResult, ToolResponse[CandidateSubmission]]:
+        """Create a candidate from tensors your sandbox code computed and saved; one preview and one commit.
+
+        Save the new values with safetensors.torch.save_file to outputs/<name>.safetensors, under the tensors' full
+        checkpoint names, in their stored dtype and full shape; the wse_run_python call returns the file's
+        tensor_file. Each tensor then replaces the tensor of the same name in parent_checkpoint_id (a checkpoint of
+        this experiment). WSE checks the names, shapes, dtypes, finite values, and the protected tensors, records the
+        exact patch with the sandbox call that saved the file, and returns the candidate's checkpoint_id, which
+        wse_submit_evaluation or wse_evaluate can measure.
+        """
+        def run() -> ToolResponse[CandidateSubmission]:
+            eid = self._experiment_id(experiment_id)
+            result = self.engine.submit_candidate(eid, parent_checkpoint_id, tensor_file, hypothesis, idempotency_key,
+                                                  tensors)
+            return ToolResponse[CandidateSubmission](
+                summary=f"candidate {result.checkpoint_id} from {len(result.tensors)} tensors of sandbox call "
+                        f"{result.source.get('call')}: {result.changed_elements} elements changed",
+                uris=[_patch_uri(result.patch_id)], usage=self._usage(eid, result.usage, SUBMISSION_COUNTERS),
+                result=result)
         return _respond(self._call(run))
 
     def wse_preview_patch(self, *, experiment_id: ExperimentIdArg = None, patch_spec: PatchSpecArg,

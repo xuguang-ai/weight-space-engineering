@@ -806,14 +806,15 @@ def test_the_runner_exposes_generation_passes_and_probes_under_qwen_loop_v1():
     from wse.strategies.base import STRATEGY_TOOLS
 
     policies = builtin_experiment_policies()
-    assert "wse_probe" in STRATEGY_TOOLS and "wse_run_python" in STRATEGY_TOOLS
-    m1 = [tool for tool in STRATEGY_TOOLS if tool not in ("wse_probe", "wse_run_python")]
+    sandbox_tools = ("wse_run_python", "wse_submit_candidate")
+    assert "wse_probe" in STRATEGY_TOOLS and set(sandbox_tools) <= set(STRATEGY_TOOLS)
+    m1 = [tool for tool in STRATEGY_TOOLS if tool not in ("wse_probe", *sandbox_tools)]
     assert allowed_tools(policies["small_model_v1"]) == m1
     assert allowed_tools(policies["small_model_weights_only_v1"]) == [tool for tool in m1
                                                                       if tool not in EVALUATION_TOOLS]
     qwen = policies["qwen_loop_v1"]
     tools = allowed_tools(qwen)
-    assert tools == [tool for tool in STRATEGY_TOOLS if tool != "wse_run_python"]  # the sandbox needs its policy
+    assert tools == [tool for tool in STRATEGY_TOOLS if tool not in sandbox_tools]  # the sandbox needs its policy
     task = TaskDefinition.model_validate({
         "task_id": TASK, "title": "Finish answers", "description": "Make the model finish its answers.",
         "objective": {"task_id": TASK, "description": "Fewer outputs at the token limit.",

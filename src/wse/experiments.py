@@ -91,12 +91,14 @@ Rules implemented here (Sections 4.1, 5.1-5.3, and 6.2 of the plan):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import secrets
 import sqlite3
 import time
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
@@ -106,7 +108,13 @@ from wse.budget import BudgetLedger, budget_error
 from wse.database import utc_now
 from wse.operators.base import MAX_REPORTED_PROBLEMS
 from wse.patch_blocks import read_patch_file, write_patch_file
-from wse.patches import materialize_patch, replay_patch, resolve_references, summarize_vector_parameters
+from wse.patches import (
+    materialize_patch,
+    replay_patch,
+    resolve_references,
+    resolve_tensor_references,
+    summarize_vector_parameters,
+)
 from wse.policy import (
     LEDGER_COUNTERS,
     ExperimentPolicy,
@@ -115,6 +123,8 @@ from wse.policy import (
     response_size,
 )
 from wse.schemas import (
+    CandidateSubmission,
+    SubmittedTensor,
     SandboxRun,
     CHECKPOINT_ID_PATTERN,
     IDEMPOTENCY_KEY_PATTERN,
@@ -931,6 +941,126 @@ class ExperimentService:
 
         return run_python(self, experiment_id, code, key, restart)
 
+    def tensor_file_reader(self, experiment_id: str) -> Callable[[Any], Path]:
+        """A reader of the stored tensor files this experiment's sandbox saved: URI -> path, after a hash check.
+
+        A file of another experiment fails exactly like one that does not
+        exist (``NOT_FOUND``).
+        """
+        def read(uri: Any) -> Path:
+            row = self.db.conn.execute("SELECT 1 FROM tensor_files WHERE uri = ? AND experiment_id = ?",
+                                       (uri if isinstance(uri, str) else "", experiment_id)).fetchone()
+            if row is None:
+                raise WSEError(ErrorCode.NOT_FOUND, f"{uri!r} is not a tensor file of this experiment's sandbox",
+                               details={"tensor_file": str(uri)})
+            return self.store.tensor_file_path(uri)
+        return read
+
+    def submit_candidate(self, experiment_id: str, parent_checkpoint_id: Any, tensor_file: Any, hypothesis: Any,
+                         key: Any, tensors: Any = None) -> CandidateSubmission:
+        """Build a candidate from a stored tensor file of the run's sandbox (``CandidateSubmission``).
+
+        Each named tensor (default: every tensor of the file) replaces the
+        tensor of the same name in ``parent_checkpoint_id``, a checkpoint of
+        this experiment, through ``replace_tensor@1``: the preview checks the
+        file's ownership and hash, each tensor's name, shape, stored dtype,
+        and finiteness, and the protections of every edit, and the commit
+        creates the candidate. It charges one preview and one commit. A
+        retry with the same key returns the first result.
+        """
+        _check_key(key)
+        row = self._experiment_row(experiment_id)
+        request = {"parent_checkpoint_id": parent_checkpoint_id, "tensor_file": tensor_file,
+                   "hypothesis": hypothesis, "tensors": tensors}
+        try:
+            request_hash = json_hash({"operation": "submit_candidate", **json.loads(canonical_json(request))})
+        except (TypeError, ValueError) as exc:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, f"the submission must be plain JSON: {exc}") from exc
+        recorded = self._lookup(self.db.conn, experiment_id, key, "submit_candidate", request_hash)
+        if recorded is not None:
+            return CandidateSubmission.model_validate_json(recorded)
+        self._require_open(row)
+        policy = self.experiment_policy(experiment_id)
+        if "replace_tensor" not in policy.operations.edits:
+            raise WSEError(ErrorCode.POLICY_DENIED, f"policy {policy.policy_id} does not permit replace_tensor, so "
+                           "tensors computed in the sandbox cannot be submitted",
+                           details={"policy_id": policy.policy_id})
+        file_row = self.db.conn.execute(
+            "SELECT * FROM tensor_files WHERE uri = ? AND experiment_id = ?",
+            (tensor_file if isinstance(tensor_file, str) else "", experiment_id)).fetchone()
+        if file_row is None:
+            raise WSEError(ErrorCode.NOT_FOUND, f"{tensor_file!r} is not a tensor file of this experiment's sandbox; "
+                           "save a .safetensors file to outputs/ and use the tensor_file its call returned",
+                           details={"tensor_file": str(tensor_file)})
+        listed = [entry["name"] for entry in json.loads(file_row["tensors_json"])]
+        if tensors is None:
+            names = listed
+        elif isinstance(tensors, list) and tensors and all(isinstance(name, str) for name in tensors):
+            missing = [name for name in tensors if name not in listed]
+            if missing or len(set(tensors)) != len(tensors):
+                raise WSEError(ErrorCode.INVALID_ARGUMENT, f"tensors must name distinct tensors of the file; "
+                               f"{missing[:8] or 'some repeat'} do not", details={"available": listed[:64]})
+            names = list(tensors)
+        else:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, "tensors must be a non-empty list of tensor names, or omitted")
+        if not isinstance(hypothesis, str) or not hypothesis.strip():
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, "hypothesis must state, in one or two sentences, the evidence "
+                           "for this candidate")
+        limit = policy.operations.limits.max_patch_operations
+        if len(names) > limit:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, f"a candidate replaces at most {limit} tensors; this file "
+                           f"names {len(names)}: submit fewer with tensors=[...]",
+                           details={"max_tensors": limit, "tensors": len(names)})
+        manifest = self.load_manifest(experiment_id, parent_checkpoint_id)
+        infos = {info.name: info for info in manifest.tensors}
+        unknown = [name for name in names if name not in infos]
+        if unknown:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, f"checkpoint {parent_checkpoint_id} has no tensors {unknown[:8]}; "
+                           "name each tensor in the file by its full checkpoint name",
+                           details={"unknown": unknown[:64]})
+        operations = [{"op": "replace_tensor", "tensor": name,
+                       "selection": [{"start": 0, "stop": size, "step": 1} for size in infos[name].shape],
+                       "source": f"{tensor_file}#{name}"} for name in names]
+        stem = hashlib.sha256(f"{experiment_id}/{key}".encode()).hexdigest()[:24]
+        preview = self.preview_patch(experiment_id, {"base_checkpoint_id": parent_checkpoint_id,
+                                                     "hypothesis": hypothesis, "operations": operations},
+                                     f"submission-{stem}-preview")
+        if preview.changed_elements == 0:
+            raise WSEError(ErrorCode.INVALID_PATCH, "the submitted tensors equal the parent checkpoint's; there is no "
+                           "candidate to commit", details={"patch_id": preview.patch_id})
+        candidate = self.apply_patch(experiment_id, preview.patch_id, f"submission-{stem}-apply")
+        source = {"tensor_file": tensor_file, "call": int(file_row["call"]), "path": file_row["path"],
+                  "sha256": file_row["sha256"], "code_sha256": self._call_code_hash(experiment_id, file_row["call"])}
+        diffs = {diff.tensor: diff for diff in preview.tensors}
+        submission = CandidateSubmission(
+            patch_id=preview.patch_id, checkpoint_id=candidate.checkpoint_id,
+            parent_checkpoint_id=str(parent_checkpoint_id), hypothesis=preview.hypothesis, source=source,
+            tensors=[SubmittedTensor(tensor=name, changed_elements=diffs[name].changed_elements if name in diffs else 0,
+                                     l2_delta=diffs[name].l2_delta if name in diffs else 0.0,
+                                     relative_l2_delta=(diffs[name].l2_delta / diffs[name].before_l2
+                                                        if name in diffs and diffs[name].before_l2 > 0 else None))
+                     for name in names],
+            changed_elements=preview.changed_elements, changed_fraction=preview.changed_fraction,
+            usage=Usage(patch_previews=1, candidate_commits=1, compute_seconds=preview.usage.compute_seconds))
+        with self.db.transaction() as conn:
+            again = self._lookup(conn, experiment_id, key, "submit_candidate", request_hash)
+            if again is not None:
+                return CandidateSubmission.model_validate_json(again)
+            self._remember(conn, experiment_id, key, "submit_candidate", request_hash, submission.model_dump_json())
+            record_event(conn, "candidate.submitted", submission.checkpoint_id,
+                         {"patch_id": submission.patch_id, "parent_checkpoint_id": submission.parent_checkpoint_id,
+                          "source": source, "tensors": names, "changed_elements": submission.changed_elements},
+                         experiment_id=experiment_id)
+        return submission
+
+    def _call_code_hash(self, experiment_id: str, call: int) -> str | None:
+        """The code hash of a sandbox call of this experiment, from its audit event."""
+        for event in self.audit_log(experiment_id):
+            payload = event.get("payload") or {}
+            if event.get("event_type") == "sandbox.ran" and payload.get("call") == call:
+                return payload.get("code_sha256")
+        return None
+
     def experiment_results(self, experiment_id: str) -> Callable[[Any], dict[str, Any]]:
         """A reader of the stored results that ``experiment_id`` produced: its analyses and generation outputs.
 
@@ -1080,6 +1210,10 @@ class ExperimentService:
         # read, whatever engine runs the preview.
         references = resolve_references(operations, self.experiment_results(experiment_id),
                                         registry=self.engine.registry, policy=policy.operations)
+        # Stored tensors of the run's sandbox (replace_tensor), likewise read before any weights.
+        references = {**references, **resolve_tensor_references(
+            operations, self.tensor_file_reader(experiment_id), self.store.load_manifest(parsed.base_checkpoint_id),
+            registry=self.engine.registry, policy=policy.operations)}
         base = self.engine._open_checkpoint(parsed.base_checkpoint_id)
         edit = materialize_patch(
             base,

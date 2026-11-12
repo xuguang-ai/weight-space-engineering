@@ -33,7 +33,13 @@ shortened, from their stored bytes, to the largest common bound that fits,
 and at most ``MAX_LISTED_OUTPUTS`` output files are listed and stored.
 
 Every regular file the code left in ``outputs/`` (emptied before each call)
-is listed with its size and SHA-256. A ``.npy`` file holding a finite numeric array of one or two
+is listed with its size and SHA-256. A ``.safetensors`` file of
+floating-point tensors, of at most ``MAX_TENSOR_FILE_BYTES``, is stored as
+a run-scoped tensor file (``wse://tensors/<sha256>``, table
+``tensor_files``) that ``submit_candidate`` turns into a candidate: WSE
+opens it without following links, checks that it is a regular, singly
+linked file whose header lists only floating-point tensors, and copies it
+from that open descriptor, checking its SHA-256. A ``.npy`` file holding a finite numeric array of one or two
 dimensions, of at most ``MAX_REFERENCE_ELEMENTS`` values, is also stored as a
 run-scoped result (``kind: sandbox_array``) whose pointer ``#/values`` (or
 ``#/values/<row>`` for a row of a matrix) names a stored vector, which edits
@@ -53,6 +59,7 @@ import io
 import json
 import math
 import os
+import stat
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -68,6 +75,7 @@ from wse.schemas import (
     ErrorCode,
     SandboxOutput,
     SandboxRun,
+    SandboxTensor,
     Usage,
     WSEError,
     canonical_json,
@@ -85,6 +93,10 @@ MAX_CODE_BYTES = 256 * 1024
 MAX_REFERENCE_ELEMENTS = 65536
 MAX_ARRAY_FILE_BYTES = 64 * 1024 * 1024
 MAX_LISTED_OUTPUTS = 32  # output files listed and stored per call; calls/<n>/result.json lists every one
+MAX_TENSOR_FILE_BYTES = 8 << 30
+MAX_SAFETENSORS_HEADER_BYTES = 100 << 20
+MAX_LISTED_TENSORS = 16
+SAFETENSORS_FLOAT_DTYPES = {"F16": "float16", "BF16": "bfloat16", "F32": "float32", "F64": "float64"}
 ARRAY_KIND = "sandbox_array"
 MANIFEST = "manifest.json"
 
@@ -231,6 +243,63 @@ def _load_array(layout: SandboxLayout, output: sandbox.OutputFile) -> np.ndarray
         return None
 
 
+def _safetensors_header(handle: Any) -> dict[str, Any]:
+    """The header of a safetensors file open at its start (8-byte little-endian length, then JSON); raise ValueError."""
+    prefix = handle.read(8)
+    if len(prefix) != 8:
+        raise ValueError("the file is shorter than a safetensors header")
+    length = int.from_bytes(prefix, "little")
+    if not 2 <= length <= MAX_SAFETENSORS_HEADER_BYTES:
+        raise ValueError(f"its header length {length} is out of range")
+    header = json.loads(handle.read(length))
+    if not isinstance(header, dict):
+        raise ValueError("its header is not a JSON object")
+    return header
+
+
+def _store_tensor_file(service: ExperimentService, experiment_id: str, layout: SandboxLayout,
+                       output: sandbox.OutputFile, call: int) -> dict[str, Any]:
+    """Store a ``.safetensors`` output as a tensor file (module docstring); return its ``SandboxOutput`` fields."""
+    if output.size > MAX_TENSOR_FILE_BYTES:
+        return {"note": f"not stored: tensor files hold at most {MAX_TENSOR_FILE_BYTES} bytes"}
+    try:
+        descriptor = os.open(layout.outputs / output.path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return {"note": "not stored: the file could not be opened without following a link"}
+    with os.fdopen(descriptor, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            return {"note": "not stored: not a regular file with a single link"}
+        try:
+            header = _safetensors_header(handle)
+            tensors = []
+            for name, entry in sorted(header.items()):
+                if name == "__metadata__":
+                    continue
+                dtype = entry.get("dtype") if isinstance(entry, dict) else None
+                shape = entry.get("shape") if isinstance(entry, dict) else None
+                if dtype not in SAFETENSORS_FLOAT_DTYPES or not isinstance(shape, list):
+                    return {"note": f"not stored: tensor {name!r} has dtype {dtype}; tensor files hold "
+                                    f"floating-point tensors ({sorted(SAFETENSORS_FLOAT_DTYPES.values())})"}
+                tensors.append(SandboxTensor(name=name, shape=[int(size) for size in shape],
+                                             dtype=SAFETENSORS_FLOAT_DTYPES[dtype]))
+        except (ValueError, TypeError) as exc:
+            return {"note": f"not stored: not a safetensors file ({exc})"}
+        if not tensors:
+            return {"note": "not stored: the file holds no tensors"}
+        handle.seek(0)
+        try:
+            uri = service.store.publish_tensor_file(handle, output.sha256.removeprefix("sha256:"))
+        except WSEError as exc:
+            return {"note": f"not stored: {exc.message}"}
+    with service.db.transaction() as conn:
+        conn.execute("INSERT OR IGNORE INTO tensor_files (uri, experiment_id, call, path, sha256, size_bytes, "
+                     "tensors_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                     (uri, experiment_id, call, output.path, output.sha256, output.size,
+                      json.dumps([t.model_dump(mode="json") for t in tensors]), utc_now()))
+    return {"tensor_file": uri, "tensors": tensors[:MAX_LISTED_TENSORS], "tensor_count": len(tensors)}
+
+
 def _referenceable(array: np.ndarray) -> bool:
     return (array.ndim in (1, 2) and 0 < array.size <= MAX_REFERENCE_ELEMENTS
             and np.issubdtype(array.dtype, np.number) and not np.issubdtype(array.dtype, np.complexfloating)
@@ -242,6 +311,10 @@ def _outputs(service: ExperimentService, experiment_id: str, layout: SandboxLayo
     outputs = []
     for output in result.outputs[:MAX_LISTED_OUTPUTS]:
         shape = dtype = pointer = None
+        if output.path.endswith(".safetensors"):
+            outputs.append(SandboxOutput(path=output.path, size=output.size, sha256=output.sha256,
+                                         **_store_tensor_file(service, experiment_id, layout, output, result.call)))
+            continue
         if output.path.endswith(".npy"):
             array = _load_array(layout, output)
             if array is not None:

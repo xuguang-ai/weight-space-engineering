@@ -62,7 +62,8 @@ def test_qwen_loop_sandbox_v1_limits() -> None:
     assert policy.max_job_wait_seconds == 600
     shared = {name: value for name, value in policy.budget.model_dump().items() if not name.startswith("sandbox")}
     assert shared == tools_only.budget.model_dump()
-    assert policy.operations == tools_only.operations
+    # The same operations, and replace_tensor, which writes tensors the sandbox saved (wse_submit_candidate).
+    assert policy.operations == tools_only.operations.with_edit("replace_tensor", "replace_tensor@1")
 
 
 def test_a_sandbox_and_its_counters_come_together() -> None:
@@ -127,22 +128,24 @@ def test_migration_12_backfills_sandbox_counters_and_the_reason_table(workspace,
     with sqlite3.connect(workspace / "metadata.sqlite") as conn:
         conn.execute("DELETE FROM budget_ledger WHERE counter IN ('sandbox_calls', 'sandbox_seconds')")
         conn.execute("DROP TABLE run_constraints")
+        conn.execute("DROP TABLE tensor_files")
         conn.execute("PRAGMA user_version = 11")
     with Engine(workspace) as engine:
-        assert engine.store.db.schema_version() == LATEST_SCHEMA_VERSION == 12
+        assert engine.store.db.schema_version() == LATEST_SCHEMA_VERSION == 13
         budget = engine.get_experiment(eid).budget
         assert (budget["sandbox_calls"].limit, budget["sandbox_seconds"].limit) == (0, 0)
         tables = {row[0] for row in engine.store.db.conn.execute("SELECT name FROM sqlite_master")}
-        assert "run_constraints" in tables
+        assert {"run_constraints", "tensor_files"} <= tables
 
 
 def test_only_a_sandbox_policy_grants_wse_run_python() -> None:
     from wse.runner import allowed_tools
 
     policies = builtin_experiment_policies()
-    assert "wse_run_python" in allowed_tools(policies[QWEN_LOOP_SANDBOX_POLICY_ID])
-    assert [tool for tool in allowed_tools(policies[QWEN_LOOP_SANDBOX_POLICY_ID]) if tool != "wse_run_python"] == \
+    sandbox_tools = ("wse_run_python", "wse_submit_candidate")
+    assert set(sandbox_tools) <= set(allowed_tools(policies[QWEN_LOOP_SANDBOX_POLICY_ID]))
+    assert [tool for tool in allowed_tools(policies[QWEN_LOOP_SANDBOX_POLICY_ID]) if tool not in sandbox_tools] == \
         allowed_tools(policies["qwen_loop_v1"])
     for policy_id in ("qwen_loop_v1", SMALL_MODEL_POLICY_ID, "small_model_weights_only_v1"):
-        assert "wse_run_python" not in allowed_tools(policies[policy_id])
+        assert not set(sandbox_tools) & set(allowed_tools(policies[policy_id]))
     assert len(allowed_tools(policies[SMALL_MODEL_POLICY_ID])) == 13

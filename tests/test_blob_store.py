@@ -316,9 +316,10 @@ def _restore_m1_jobs_table(conn: sqlite3.Connection) -> None:
 
 
 def _downgrade_to_m1(workspace: Path) -> None:
-    """Remove every object of migrations 8-12 so the workspace is exactly what M1 (schema 7) wrote."""
+    """Remove every object of migrations 8-13 so the workspace is exactly what M1 (schema 7) wrote."""
     conn = sqlite3.connect(workspace / "metadata.sqlite")
     try:
+        conn.execute("DROP TABLE tensor_files")  # migration 13
         conn.execute("DROP TABLE run_constraints")  # migration 12
         conn.execute(f"DELETE FROM budget_ledger WHERE counter IN ({', '.join('?' * len(SANDBOX_COUNTERS))})",
                      SANDBOX_COUNTERS)  # migration 12

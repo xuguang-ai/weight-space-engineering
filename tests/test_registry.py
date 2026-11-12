@@ -48,6 +48,7 @@ def test_builtin_registry_contains_mlp_adapter():
         ExtensionRef.parse("direction_projection@1"),
         ExtensionRef.parse("fill_slice@1"),
         ExtensionRef.parse("project_out@1"),
+        ExtensionRef.parse("replace_tensor@1"),
         ExtensionRef.parse("scale_slice@1"),
         ExtensionRef.parse("set_slice@1"),
         ExtensionRef.parse("svd_top_k@1"),

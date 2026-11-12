@@ -592,13 +592,15 @@ def qwen_loop_sandbox_policy() -> ExperimentPolicy:
 
     The sandbox allows 100 calls of at most 300 seconds each and 2 hours in
     all, with 16 KiB of each output stream in a tool result; ``wse_get_job``
-    may wait 600 seconds per call. Everything else is ``qwen_loop_v1``'s.
-    Every run of this policy is unverified.
+    may wait 600 seconds per call, and ``replace_tensor`` writes tensors the
+    sandbox saved (``wse_submit_candidate``). Everything else is
+    ``qwen_loop_v1``'s. Every run of this policy is unverified.
     """
     base = qwen_loop_policy()
     budget = BudgetLimits(**{**base.budget.model_dump(), "sandbox_calls": 100, "sandbox_seconds": 7200.0})
     return ExperimentPolicy(policy_id=QWEN_LOOP_SANDBOX_POLICY_ID, mode="bounded_eval", budget=budget,
-                            operations=base.operations, sandbox=SandboxPolicy(seconds_per_call=300.0),
+                            operations=base.operations.with_edit("replace_tensor", "replace_tensor@1"),
+                            sandbox=SandboxPolicy(seconds_per_call=300.0),
                             max_job_wait_seconds=600.0)
 
 

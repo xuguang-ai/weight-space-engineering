@@ -103,7 +103,9 @@ from wse.strategies.base import STRATEGY_TOOLS, Action, Observation
 __all__ = [
     "EVALUATION_TOOLS",
     "SANDBOX_TOOLS",
+    "SUBMISSION_TOOLS",
     "agent_session_timeout",
+    "submissions_available",
     "JOB_TOOLS",
     "OPERATOR_INTERRUPT",
     "PROBE_TOOLS",
@@ -132,6 +134,7 @@ logger = logging.getLogger("wse.runner")
 EVALUATION_TOOLS = ("wse_submit_evaluation", "wse_get_job", "wse_get_report", "wse_cancel_job", "wse_compare")
 PROBE_TOOLS = ("wse_probe",)
 SANDBOX_TOOLS = ("wse_run_python",)  # code execution: only under a policy that grants the sandbox
+SUBMISSION_TOOLS = ("wse_submit_candidate",)  # tensors from the sandbox: the sandbox and the replace_tensor edit
 JOB_TOOLS = ("wse_get_job", "wse_cancel_job")  # evaluations and probes are both jobs
 NO_IMPROVEMENT_PATIENCE = 3
 IMPROVEMENT_TOLERANCE = 1e-9
@@ -222,6 +225,11 @@ def agent_session_timeout(policy: ExperimentPolicy, configured: float) -> float:
     return max(float(configured), longest)
 
 
+def submissions_available(policy: ExperimentPolicy) -> bool:
+    """Whether runs of ``policy`` may submit tensors computed in the sandbox: the sandbox and ``replace_tensor``."""
+    return sandbox_available(policy) and "replace_tensor" in policy.operations.edits
+
+
 def allowed_tools(policy: ExperimentPolicy) -> list[str]:
     """The WSE tools a controller of this policy may use, in ``STRATEGY_TOOLS`` order.
 
@@ -236,6 +244,8 @@ def allowed_tools(policy: ExperimentPolicy) -> list[str]:
     def permitted(tool: str) -> bool:
         if tool in SANDBOX_TOOLS:
             return sandbox_available(policy)
+        if tool in SUBMISSION_TOOLS:
+            return submissions_available(policy)
         if tool in PROBE_TOOLS:
             return probes
         if tool in JOB_TOOLS:
@@ -337,7 +347,11 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
                      "vectors); it writes work/ (kept between calls) and outputs/ (emptied before each call). Each "
                      "numeric vector or matrix you save to outputs/ with numpy.save comes back with a pointer, "
                      "<result_uri>#/values (a row: #/values/<row>), which wse_preview_patch and wse_analyze accept as "
-                     "a stored vector.")
+                     "a stored vector."
+                     + (" To submit tensors you computed, save them with safetensors.torch.save_file to "
+                        "outputs/<name>.safetensors under their full checkpoint names, in the stored dtype: the call "
+                        "returns a tensor_file, which wse_submit_candidate turns into a candidate (one preview and one "
+                        "commit), recorded with the call that saved it." if submissions_available(policy) else ""))
     steps.append("Propose an edit with wse_preview_patch (base_checkpoint_id, a hypothesis of one or two sentences "
                  "stating the observable evidence, and the operations), then create a candidate with wse_apply_patch "
                  "by patch_id.")
@@ -438,6 +452,9 @@ class ExperimentExecutor:
                                                    groups=groups, top=top),
             "wse_run_python": lambda *, code, idempotency_key, experiment_id=None, restart=False: e.run_python(
                 eid(experiment_id), code, idempotency_key, restart),
+            "wse_submit_candidate": lambda *, parent_checkpoint_id, tensor_file, hypothesis, idempotency_key,
+            experiment_id=None, tensors=None: e.submit_candidate(eid(experiment_id), parent_checkpoint_id,
+                                                                 tensor_file, hypothesis, idempotency_key, tensors),
             "wse_preview_patch": lambda *, patch_spec, idempotency_key, experiment_id=None: e.preview_patch(
                 eid(experiment_id), patch_spec, idempotency_key),
             "wse_apply_patch": lambda *, patch_id, idempotency_key, experiment_id=None: e.apply_patch(

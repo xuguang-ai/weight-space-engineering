@@ -392,7 +392,12 @@ def _export_sandbox(engine: Engine, experiment: Any, root: Path, files: dict[str
         files[relative] = content_hash(data)
         arrays.append({"uri": row["uri"], "call": document["call"], "path": document["path"],
                        "shape": document["shape"], "dtype": document["dtype"], "file": relative})
-    return {"calls": calls, "arrays": arrays,
+    tensor_files = [{"uri": row["uri"], "call": row["call"], "path": row["path"], "sha256": row["sha256"],
+                     "size_bytes": row["size_bytes"], "tensors": json.loads(row["tensors_json"])}
+                    for row in engine.store.db.conn.execute(
+                        "SELECT * FROM tensor_files WHERE experiment_id = ? ORDER BY created_at, rowid",
+                        (experiment.experiment_id,)).fetchall()]
+    return {"calls": calls, "arrays": arrays, "tensor_files": tensor_files,
             "inputs_manifest": _copy_file(inputs, root, f"{SANDBOX_EXPORT_DIR}/inputs_manifest.json", files)
             if inputs.is_file() else None}
 
