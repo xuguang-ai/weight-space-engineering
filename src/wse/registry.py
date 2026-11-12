@@ -248,6 +248,7 @@ def builtin_registry() -> Registry:
     from wse.operators.linalg import BUILTIN_LINALG_ANALYSES
     from wse.operators.tensor import BUILTIN_ANALYSES, BUILTIN_EDITS
     from wse.strategies.direction_search import DirectionSearchStrategy
+    from wse.strategies.sandbox_search import SandboxSearchStrategy
     from wse.strategies.scripted import ScriptedSearchStrategy
 
     registry = Registry()
@@ -267,6 +268,6 @@ def builtin_registry() -> Registry:
         registry.register("profile", profile.profile_id, profile.version, profile)
     for grader in BUILTIN_GRADERS:
         registry.register("grader", grader.grader_id, grader.version, grader)
-    for strategy in (ScriptedSearchStrategy, DirectionSearchStrategy):
+    for strategy in (ScriptedSearchStrategy, DirectionSearchStrategy, SandboxSearchStrategy):
         registry.register("strategy", strategy.strategy_id, strategy.version, strategy)
     return registry
