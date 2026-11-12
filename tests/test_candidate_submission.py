@@ -148,3 +148,50 @@ def test_a_submitted_candidate_exports_and_replays_byte_identically(lm, run, tmp
     assert replayed.all_identical and [c["checkpoint_id"] for c in replayed.candidates] == [submission.checkpoint_id]
     written = json.loads((tmp_path / "export" / "export_manifest.json").read_text(encoding="utf-8"))
     assert written["sandbox"]["tensor_files"][0]["call"] == listed["call"]
+
+
+def test_a_file_the_agents_own_code_wrote_is_submitted_by_path(lm, run) -> None:
+    from safetensors.torch import save_file
+
+    from wse.sandbox_runs import layout_for
+
+    with Engine(lm.workspace) as engine:
+        layout = layout_for(engine.experiments, run[0]).create()
+        new = engine.open_checkpoint(lm.base).tensor(TARGET)
+    new[0] = new[0] * 0.5
+    save_file({TARGET: new}, str(layout.outputs / "mine.safetensors"))  # as a command of the agent's own would
+    with Engine(lm.workspace, run_id=run[0]) as bound:
+        submission = bound.submit_candidate(run[1], lm.base, None, "Halve one row.", "by-path",
+                                            path="outputs/mine.safetensors")
+    assert (submission.source["call"], submission.source["written_by"]) == (0, "the agent's own code")
+    assert submission.source["path"] == "outputs/mine.safetensors" and submission.source["code_sha256"] is None
+    with Engine(lm.workspace) as engine:
+        assert torch.equal(engine.open_checkpoint(submission.checkpoint_id).tensor(TARGET), new)
+
+
+def test_paths_that_leave_the_run_directory_or_pass_through_links_are_refused(lm, run, tmp_path) -> None:
+    import os
+
+    from safetensors.torch import save_file
+
+    from wse.sandbox_runs import layout_for
+
+    with Engine(lm.workspace) as engine:
+        layout = layout_for(engine.experiments, run[0]).create()
+        tensor = engine.open_checkpoint(lm.base).tensor(TARGET)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    save_file({TARGET: tensor * 0}, str(outside / "x.safetensors"))
+    os.symlink(outside, layout.work / "escape")
+    os.symlink(outside / "x.safetensors", layout.outputs / "link.safetensors")
+    cases = [("../outside/x.safetensors", ErrorCode.INVALID_ARGUMENT),
+             ("inputs/weights/base.safetensors", ErrorCode.INVALID_ARGUMENT),
+             (str(outside / "x.safetensors"), ErrorCode.INVALID_ARGUMENT),
+             ("work/escape/x.safetensors", ErrorCode.NOT_FOUND),
+             ("outputs/link.safetensors", ErrorCode.NOT_FOUND),
+             ("outputs/missing.safetensors", ErrorCode.NOT_FOUND)]
+    for index, (path, code) in enumerate(cases):
+        error = _rejected(lm, run, None, key=f"refused-{index}", path=path)
+        assert error.code == code, (path, error.message)
+    with Engine(lm.workspace) as engine:
+        assert [c.role for c in engine.list_experiment_checkpoints(run[1])] == ["base"]

@@ -215,8 +215,13 @@ EvalConfigArg = Annotated[Any, WithJsonSchema({**EVAL_CONFIG_SCHEMA, "descriptio
 CodeArg = Annotated[str, Field(description="Python to run in this run's sandbox (NumPy, PyTorch on the CPU, "
                                            "safetensors): it reads inputs/ and writes work/ and outputs/; no network, "
                                            "no other files, no new processes.")]
-TensorFileArg = Annotated[str, Field(description="The tensor_file that a wse_run_python call returned for a "
-                                                 ".safetensors file it saved to outputs/ (wse://tensors/<sha256>).")]
+TensorFileArg = Annotated[str | None, Field(description="The tensor_file that a wse_run_python call returned for "
+                                                        "a .safetensors file it saved to outputs/ "
+                                                        "(wse://tensors/<sha256>); or give path instead.")]
+TensorPathArg = Annotated[str | None, Field(description="A .safetensors file your own code wrote, relative to the "
+                                                        "run's directory, under outputs/ or work/, for example "
+                                                        "outputs/candidate.safetensors; or give tensor_file "
+                                                        "instead.")]
 TensorNamesArg = Annotated[list[str] | None, Field(description="The tensors of the file to submit, by their full "
                                                             "checkpoint names; omit to submit all of them.")]
 HypothesisArg = Annotated[str, Field(description="One or two sentences stating the observable evidence for this "
@@ -637,14 +642,14 @@ class WSEMCPServer:
         return _respond(self._call(run))
 
     def wse_submit_candidate(self, *, experiment_id: ExperimentIdArg = None, parent_checkpoint_id: IdArg,
-                             tensor_file: TensorFileArg, hypothesis: HypothesisArg, idempotency_key: KeyArg,
-                             tensors: TensorNamesArg = None,
+                             hypothesis: HypothesisArg, idempotency_key: KeyArg, tensor_file: TensorFileArg = None,
+                             path: TensorPathArg = None, tensors: TensorNamesArg = None,
                              ) -> Annotated[CallToolResult, ToolResponse[CandidateSubmission]]:
         """Create a candidate from tensors your sandbox code computed and saved; one preview and one commit.
 
         Save the new values with safetensors.torch.save_file to outputs/<name>.safetensors, under the tensors' full
         checkpoint names, in their stored dtype and full shape; the wse_run_python call returns the file's
-        tensor_file. Each tensor then replaces the tensor of the same name in parent_checkpoint_id (a checkpoint of
+        tensor_file. A file your own code wrote under outputs/ or work/ is named by path instead. Each tensor then replaces the tensor of the same name in parent_checkpoint_id (a checkpoint of
         this experiment). WSE checks the names, shapes, dtypes, finite values, and the protected tensors, records the
         exact patch with the sandbox call that saved the file, and returns the candidate's checkpoint_id, which
         wse_submit_evaluation or wse_evaluate can measure.
@@ -652,10 +657,10 @@ class WSEMCPServer:
         def run() -> ToolResponse[CandidateSubmission]:
             eid = self._experiment_id(experiment_id)
             result = self.engine.submit_candidate(eid, parent_checkpoint_id, tensor_file, hypothesis, idempotency_key,
-                                                  tensors)
+                                                  tensors, path)
             return ToolResponse[CandidateSubmission](
-                summary=f"candidate {result.checkpoint_id} from {len(result.tensors)} tensors of sandbox call "
-                        f"{result.source.get('call')}: {result.changed_elements} elements changed",
+                summary=f"candidate {result.checkpoint_id} from {len(result.tensors)} tensors of "
+                        f"{result.source.get('path')}: {result.changed_elements} elements changed",
                 uris=[_patch_uri(result.patch_id)], usage=self._usage(eid, result.usage, SUBMISSION_COUNTERS),
                 result=result)
         return _respond(self._call(run))
@@ -820,6 +825,10 @@ class WSEMCPServer:
         return _respond(self._call(run))
 
     def _job_response(self, experiment_id: str, job: Job) -> ToolResponse[Job]:
+        if job.state == "succeeded":  # the agent's own code reads the new outputs and vectors from inputs/
+            from wse.sandbox_runs import refresh_inputs
+
+            refresh_inputs(self.engine.experiments, experiment_id)
         summary = f"job {job.job_id} is {job.state}"
         uris = [_report_uri(job.report_id)] if job.report_id else []
         if job.result and "metrics" in job.result:

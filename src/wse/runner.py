@@ -270,8 +270,12 @@ def _gate_text(gate: Any) -> str:
 
 
 def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, experiment_id: str,
-                        tools: Sequence[str]) -> str:
-    """Agent instructions built only from the task definition, the policy, and the run's IDs and tools."""
+                        tools: Sequence[str], baseline: Mapping[str, Any] | None = None) -> str:
+    """Agent instructions built only from the task definition, the policy, and the run's IDs and tools.
+
+    ``baseline`` (report ID and metrics), when given, is the base checkpoint's
+    full development evaluation, made before the controller started.
+    """
     budget, operations = policy.budget, policy.operations
     bounded = policy.mode == "bounded_eval"
     batches = bounded and budget.evaluation_batches > 0
@@ -298,6 +302,16 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
         lines.append(f"Model output: {task.output_description}")
     lines.append(f"Objective: {task.objective.description}")
     lines.append("Acceptance: " + "; ".join(_gate_text(gate) for gate in task.objective.gates) + ".")
+    if task.objective.selection is not None:
+        from wse.selection import describe_rule
+
+        lines.append("Selection when the run ends: " + describe_rule(task.objective.selection) + " Evaluate each "
+                     "candidate on the full development set so the rule can consider it.")
+    if baseline is not None:
+        metrics = ", ".join(f"{name} {value:.4g}" for name, value in sorted(baseline["metrics"].items()))
+        lines.append(f"Baseline: the original model's full development evaluation is report "
+                     f"{baseline['report_id']} ({metrics}); it counts as one of the evaluations, and evaluating the "
+                     "original model again repeats it.")
     if task.target_accuracy is not None:
         lines.append(f"The target is met only by a successful evaluation of development suite "
                      f"{task.development_suite_id} covering all {task.development_examples} examples with accuracy "
@@ -464,9 +478,9 @@ class ExperimentExecutor:
                                                    groups=groups, top=top),
             "wse_run_python": lambda *, code, idempotency_key, experiment_id=None, restart=False: e.run_python(
                 eid(experiment_id), code, idempotency_key, restart),
-            "wse_submit_candidate": lambda *, parent_checkpoint_id, tensor_file, hypothesis, idempotency_key,
-            experiment_id=None, tensors=None: e.submit_candidate(eid(experiment_id), parent_checkpoint_id,
-                                                                 tensor_file, hypothesis, idempotency_key, tensors),
+            "wse_submit_candidate": lambda *, parent_checkpoint_id, hypothesis, idempotency_key, tensor_file=None,
+            path=None, experiment_id=None, tensors=None: e.submit_candidate(
+                eid(experiment_id), parent_checkpoint_id, tensor_file, hypothesis, idempotency_key, tensors, path),
             "wse_preview_patch": lambda *, patch_spec, idempotency_key, experiment_id=None: e.preview_patch(
                 eid(experiment_id), patch_spec, idempotency_key),
             "wse_apply_patch": lambda *, patch_id, idempotency_key, experiment_id=None: e.apply_patch(
@@ -550,6 +564,8 @@ class StopMonitor:
         reports = self._full_development_reports()
         if any(r.checkpoint_id == experiment.selected_checkpoint_id and r.target_met for r in reports):
             return "target_met: a full development evaluation of the selected checkpoint meets the target"
+        if self.task is not None and self.task.objective.selection is not None:
+            return None  # the agent decides when to stop; the budget bounds it, and the rule chooses at the end
         streak = self.no_improvement_streak(reports, experiment.base_checkpoint_id)
         if streak >= NO_IMPROVEMENT_PATIENCE:
             return f"no_improvement: {streak} consecutive evaluated candidates showed no improvement"
@@ -763,13 +779,18 @@ class ReferenceRunner:
     ``worker_args`` are extra worker options; ``serve_env`` adds variables
     to the allow-listed server environment (never credentials);
     ``adapter_factory(config, experiment_id)`` overrides adapter creation
-    (for example to supply an SDK test double).
+    (for example to supply an SDK test double). With ``baseline``, the base
+    checkpoint is evaluated on the task's full development suite before the
+    controller starts (``Engine.ensure_baseline`` reuses an identical earlier
+    evaluation when the engine provides it), and the instructions name that
+    report.
     """
 
     def __init__(self, workspace: str | Path, *, registry: Registry | None = None, setup: Sequence[str] = (),
                  worker_args: Sequence[str] = (), serve_env: Mapping[str, str] | None = None,
                  adapter_factory: Callable[[AgentConfig, str], AgentAdapter] | None = None,
-                 settle_timeout_seconds: float = 120.0, log_dir: str | Path | None = None) -> None:
+                 settle_timeout_seconds: float = 120.0, log_dir: str | Path | None = None,
+                 baseline: bool = False) -> None:
         from wse.worker import _load_setup
 
         self.workspace = Path(workspace).resolve()
@@ -785,6 +806,7 @@ class ReferenceRunner:
         self.log_dir = Path(log_dir) if log_dir is not None else self.workspace / "logs"
         self.last_result: dict[str, Any] | None = None
         self.last_experiment_id: str | None = None
+        self.baseline = bool(baseline)
 
     # -- entry point ---------------------------------------------------------------------
 
@@ -812,6 +834,13 @@ class ReferenceRunner:
             self.last_experiment_id = eid
             policy = bound.experiment_policy(eid)
             task = bound.get_task(task_id)
+        if self.baseline and policy.evaluation_available:
+            self._evaluate_baseline(eid, task)
+        if sandbox_available(policy):  # the agent's own code reads them too (wse.sandbox_runs.refresh_inputs)
+            from wse.sandbox_runs import refresh_inputs
+
+            with Engine(self.workspace, registry=self.registry) as operator:
+                refresh_inputs(operator.experiments, eid)
         with _OperatorInterrupt() as interrupt:
             if isinstance(config, StrategyConfig):
                 self._run_strategy(eid, task, policy, config, interrupt)
@@ -852,6 +881,27 @@ class ReferenceRunner:
 
     # -- finalization ----------------------------------------------------------------------
 
+    def _rule_selection(self, engine: Engine, eid: str) -> Any:
+        """The task's selection rule applied to the experiment's full development reports (``wse.selection``)."""
+        from wse.selection import select_by_rule
+
+        experiment = engine.get_experiment(eid)
+        try:
+            task = engine.get_task(experiment.task_id)
+        except WSEError:
+            return None
+        if task.objective.selection is None:
+            return None
+        reports = [r for r in StopMonitor(engine, eid, task)._full_development_reports() if not r.errors]
+        checkpoints = engine.list_experiment_checkpoints(eid)
+        changed = {}
+        for checkpoint in checkpoints:
+            if checkpoint.role == "candidate" and checkpoint.patch_id is not None:
+                changed[checkpoint.checkpoint_id] = engine.get_patch(eid, checkpoint.patch_id).changed_elements
+        return select_by_rule(task.objective.selection, base_checkpoint_id=experiment.base_checkpoint_id,
+                              reports=reports, changed_elements=changed,
+                              order=[c.checkpoint_id for c in checkpoints if c.role == "candidate"])
+
     def _finalize(self, engine: Engine, eid: str) -> dict[str, Any]:
         """Cancel and settle every outstanding job, then freeze the selected checkpoint."""
         cancelled: list[str] = []
@@ -873,14 +923,21 @@ class ReferenceRunner:
                                    "the experiment stays open", details={"jobs": [j.job_id for j in active]})
                 engine.get_job(eid, active[0].job_id, min(2.0, left))
             selected = engine.get_experiment(eid).selected_checkpoint_id
+            decision = self._rule_selection(engine, eid)
+            if decision is not None and decision.selected_checkpoint_id != selected:
+                engine.select_checkpoint(eid, decision.selected_checkpoint_id, selected, f"runner-rule-{eid}")
+                selected = decision.selected_checkpoint_id
             try:
                 frozen = engine.freeze(eid, selected)
             except WSEError as exc:
                 if exc.code != ErrorCode.VERSION_CONFLICT:
                     raise
                 continue
-            return {"cancelled_jobs": cancelled, "state": frozen.state,
-                    "frozen_checkpoint_id": frozen.selected_checkpoint_id}
+            finalization = {"cancelled_jobs": cancelled, "state": frozen.state,
+                            "frozen_checkpoint_id": frozen.selected_checkpoint_id}
+            if decision is not None:
+                finalization["selection"] = decision.model_dump(mode="json")
+            return finalization
         raise WSEError(ErrorCode.VERSION_CONFLICT, f"experiment {eid} could not be frozen after three attempts")
 
     # -- stepwise strategies -----------------------------------------------------------------
@@ -1022,8 +1079,14 @@ class ReferenceRunner:
 
     def connection(self, run_id: str, eid: str, task: TaskDefinition, policy: ExperimentPolicy,
                    constraint_status: str) -> RunConnection:
-        """The MCP connection for a run: ``wse serve`` bound to the grant, allow-listed tools and environment."""
+        """The MCP connection for a run: ``wse serve`` bound to the grant, allow-listed tools and environment.
+
+        Under a task with a selection rule the runner chooses the checkpoint
+        to freeze, so ``wse_select_checkpoint`` is not offered.
+        """
         tools = allowed_tools(policy)
+        if task.objective.selection is not None:
+            tools = [tool for tool in tools if tool != "wse_select_checkpoint"]
         self.log_dir.mkdir(parents=True, exist_ok=True)
         command = [sys.executable, "-m", "wse.cli", "--workspace", str(self.workspace), "serve", "--run-id", run_id,
                    "--constraint-status", constraint_status, "--log-file", self.serve_log(run_id)]
@@ -1035,8 +1098,51 @@ class ReferenceRunner:
             workspace=str(self.workspace), run_id=run_id, experiment_id=eid, task_id=task.task_id,
             policy_id=policy.policy_id, serve_command=command, serve_env=serve_environment(self.serve_env),
             cwd=str(self.workspace), allowed_tools=tools,
-            instructions=render_instructions(task, policy, experiment_id=eid, tools=tools),
+            instructions=render_instructions(task, policy, experiment_id=eid, tools=tools,
+                                             baseline=self._baseline_summary(eid, task)),
             initial_message=initial_message(eid), constraint_status=constraint_status)
+
+    def _evaluate_baseline(self, eid: str, task: TaskDefinition) -> None:
+        """Evaluate the base checkpoint on the full development suite (``baseline``); freeze the experiment if it fails.
+
+        One evaluation of the policy's budget: one generation pass or batch.
+        """
+        from wse.worker import WorkerSupervisor
+
+        if self._baseline_summary(eid, task) is not None:
+            return
+        worker_args = [arg for spec in self.setup for arg in ("--setup", spec)] + list(self.worker_args)
+        supervisor = WorkerSupervisor(self.workspace, extra_args=worker_args).start()
+        try:
+            with Engine(self.workspace, registry=self.registry) as operator:
+                try:
+                    ensure = getattr(operator, "ensure_baseline", None)
+                    if ensure is not None:
+                        ensure(eid)
+                        return
+                    suite = operator.get_suite(task.development_suite_id)
+                    config = {"sample_count": max(suite.sample_counts), "seed": suite.seeds[0]}
+                    base = operator.get_experiment(eid).base_checkpoint_id
+                    job = operator.submit_evaluation(eid, base, suite.suite_id, config, f"runner-baseline-{eid}")
+                    while not job.terminal:
+                        job = operator.get_job(eid, job.job_id, 10)
+                    if job.state != "succeeded":
+                        raise WSEError(ErrorCode.WORKER_FAILED, f"the baseline evaluation ended {job.state}",
+                                       details={"job_id": job.job_id})
+                except BaseException:
+                    self._finalize(operator, eid)  # an interrupted or failed baseline still settles and freezes
+                    raise
+        finally:
+            supervisor.stop(stop_timeout=5.0)
+
+    def _baseline_summary(self, eid: str, task: TaskDefinition) -> dict[str, Any] | None:
+        """The base checkpoint's first full development report of the experiment, if there is one."""
+        with Engine(self.workspace, registry=self.registry) as operator:
+            base = operator.get_experiment(eid).base_checkpoint_id
+            for report in StopMonitor(operator, eid, task)._full_development_reports():
+                if report.checkpoint_id == base and not report.errors:
+                    return {"report_id": report.report_id, "metrics": dict(report.metrics)}
+        return None
 
     def _run_agent(self, run_id: str, eid: str, task: TaskDefinition, policy: ExperimentPolicy,
                    config: AgentConfig, interrupt: _OperatorInterrupt) -> None:

@@ -957,8 +957,13 @@ class ExperimentService:
         return read
 
     def submit_candidate(self, experiment_id: str, parent_checkpoint_id: Any, tensor_file: Any, hypothesis: Any,
-                         key: Any, tensors: Any = None) -> CandidateSubmission:
+                         key: Any, tensors: Any = None, path: Any = None) -> CandidateSubmission:
         """Build a candidate from a stored tensor file of the run's sandbox (``CandidateSubmission``).
+
+        ``tensor_file`` names a file a sandbox call saved (``wse://tensors/...``);
+        ``path`` instead names a ``.safetensors`` file that the agent's own
+        code wrote under ``outputs/`` or ``work/`` of the run's directory,
+        which is stored first (``wse.sandbox_runs.store_agent_tensor_file``).
 
         Each named tensor (default: every tensor of the file) replaces the
         tensor of the same name in ``parent_checkpoint_id``, a checkpoint of
@@ -970,8 +975,11 @@ class ExperimentService:
         """
         _check_key(key)
         row = self._experiment_row(experiment_id)
+        if (tensor_file is None) == (path is None):
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, "name the tensors to submit by tensor_file (a file a sandbox "
+                           "call returned) or by path (a file under outputs/ or work/ of the run's directory)")
         request = {"parent_checkpoint_id": parent_checkpoint_id, "tensor_file": tensor_file,
-                   "hypothesis": hypothesis, "tensors": tensors}
+                   "hypothesis": hypothesis, "tensors": tensors, "path": path}
         try:
             request_hash = json_hash({"operation": "submit_candidate", **json.loads(canonical_json(request))})
         except (TypeError, ValueError) as exc:
@@ -985,6 +993,10 @@ class ExperimentService:
             raise WSEError(ErrorCode.POLICY_DENIED, f"policy {policy.policy_id} does not permit replace_tensor, so "
                            "tensors computed in the sandbox cannot be submitted",
                            details={"policy_id": policy.policy_id})
+        if path is not None:
+            from wse.sandbox_runs import store_agent_tensor_file
+
+            tensor_file = store_agent_tensor_file(self, experiment_id, path)
         file_row = self.db.conn.execute(
             "SELECT * FROM tensor_files WHERE uri = ? AND experiment_id = ?",
             (tensor_file if isinstance(tensor_file, str) else "", experiment_id)).fetchone()
@@ -1030,8 +1042,10 @@ class ExperimentService:
             raise WSEError(ErrorCode.INVALID_PATCH, "the submitted tensors equal the parent checkpoint's; there is no "
                            "candidate to commit", details={"patch_id": preview.patch_id})
         candidate = self.apply_patch(experiment_id, preview.patch_id, f"submission-{stem}-apply")
-        source = {"tensor_file": tensor_file, "call": int(file_row["call"]), "path": file_row["path"],
-                  "sha256": file_row["sha256"], "code_sha256": self._call_code_hash(experiment_id, file_row["call"])}
+        call = int(file_row["call"])
+        source = {"tensor_file": tensor_file, "call": call, "path": file_row["path"], "sha256": file_row["sha256"],
+                  "code_sha256": self._call_code_hash(experiment_id, call) if call else None,
+                  "written_by": "a sandbox call" if call else "the agent's own code"}
         diffs = {diff.tensor: diff for diff in preview.tensors}
         submission = CandidateSubmission(
             patch_id=preview.patch_id, checkpoint_id=candidate.checkpoint_id,

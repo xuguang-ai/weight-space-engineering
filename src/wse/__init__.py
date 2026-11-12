@@ -20,6 +20,7 @@ from wse.api import (
     load_model,
     read_bundle,
 )
+from wse.experiment import Experiment, ExperimentResult, TestReport
 from wse.highlevel import (
     Comparison,
     Edit,
@@ -77,6 +78,9 @@ __all__ = [
     "EditResult",
     "Engine",
     "Evaluation",
+    "TestReport",
+    "ExperimentResult",
+    "Experiment",
     "ErrorCode",
     "EvalConfig",
     "EvaluationReport",
