@@ -565,13 +565,50 @@ class MetricGate(_Frozen):
         return "regression" if self.max_drop is not None else "acceptance"
 
 
+# Which way is better for each metric a selection rule may name (``wse.selection``).
+METRIC_DIRECTIONS = {"accuracy": "higher", "limit_hit_rate": "lower", "mean_generated_tokens": "lower"}
+
+
+class SelectionRule(_Frozen):
+    """How the checkpoint an experiment keeps is chosen when its run ends (``wse.selection``).
+
+    Exactly one of ``minimize`` and ``maximize`` names the metric to
+    optimize; ``preserve`` lists metrics that must not be worse than the
+    baseline's point estimate. Every named metric must be one of
+    ``METRIC_DIRECTIONS``.
+    """
+
+    minimize: str | None = _optional()
+    maximize: str | None = _optional()
+    preserve: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _one_target(self) -> SelectionRule:
+        if (self.minimize is None) == (self.maximize is None):
+            raise ValueError("set exactly one of minimize or maximize")
+        target = self.minimize or self.maximize
+        names = [target, *self.preserve]
+        unknown = [name for name in names if name not in METRIC_DIRECTIONS]
+        if unknown:
+            raise ValueError(f"unknown metrics {unknown}; a selection rule names {sorted(METRIC_DIRECTIONS)}")
+        if target in self.preserve or len(set(self.preserve)) != len(self.preserve):
+            raise ValueError("preserve lists distinct metrics other than the optimized one")
+        return self
+
+
 class ObjectiveSpec(_Frozen):
-    """Binds a natural-language goal to task-defined metrics and thresholds."""
+    """Binds a natural-language goal to task-defined metrics and thresholds.
+
+    ``selection``, when set, is the rule by which the runner chooses the
+    checkpoint to freeze (``wse.selection``); without it the runner freezes
+    the controller's own selection.
+    """
 
     schema_version: Literal["1"] = SCHEMA_VERSION
     task_id: str = Field(pattern=r"^[A-Za-z0-9_.\-]{1,128}$")
     description: str = Field(min_length=1, max_length=4096)
     gates: list[MetricGate] = Field(min_length=1)
+    selection: SelectionRule | None = _optional()
 
     @model_validator(mode="after")
     def _check_gates(self) -> ObjectiveSpec:
