@@ -335,8 +335,9 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
     if task.output_description:
         lines.append(f"Model output: {task.output_description}")
     lines.append(f"Objective: {task.objective.description}")
-    lines.append("Acceptance: " + "; ".join(_gate_text(gate) for gate in task.objective.gates) + ".")
-    if task.objective.selection is not None:
+    if task.objective.selection is None:
+        lines.append("Acceptance: " + "; ".join(_gate_text(gate) for gate in task.objective.gates) + ".")
+    else:
         from wse.selection import describe_rule
 
         lines.append("Selection when the run ends: " + describe_rule(task.objective.selection) + " Evaluate each "
@@ -431,12 +432,22 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
     else:
         steps.append("Development evaluation is not available: the policy grants no evaluation batches or "
                      "generation passes.")
-    steps += ["Select a checkpoint with wse_select_checkpoint, passing the currently selected ID as "
-              "expected_selected_id; selecting an earlier checkpoint rolls back.",
-              "When you are done, reply with a short final message and no tool call. The selected checkpoint is "
-              "then frozen for a separate final evaluation that you cannot see."]
+    ruled = task.objective.selection is not None
+    if ruled:
+        steps.append("When you are done, stop. WSE then applies the selection rule above to the candidates evaluated "
+                     "on the full development set and freezes its choice for a separate final evaluation that you "
+                     "cannot see; you do not select a checkpoint yourself.")
+    else:
+        steps += ["Select a checkpoint with wse_select_checkpoint, passing the currently selected ID as "
+                  "expected_selected_id; selecting an earlier checkpoint rolls back.",
+                  "When you are done, reply with a short final message and no tool call. The selected checkpoint is "
+                  "then frozen for a separate final evaluation that you cannot see."]
     lines += [f"{number}. {step}" for number, step in enumerate(steps, start=1)] + [""]
-    if evaluation:
+    if evaluation and ruled:
+        lines.append("The run also ends automatically when no development evaluation remains (a candidate made after "
+                     "the last evaluation cannot be chosen) or when the budget cannot cover the next operation "
+                     "(BUDGET_EXCEEDED).")
+    elif evaluation:
         # M1 policies keep their M1 sentence; with generation passes, a lower limit-hit rate also counts.
         improvement = (" (a higher accuracy than the best checkpoint before them, or a lower limit-hit rate at no lower "
                        "accuracy)" if passes else "")
@@ -599,11 +610,21 @@ class StopMonitor:
         if any(r.checkpoint_id == experiment.selected_checkpoint_id and r.target_met for r in reports):
             return "target_met: a full development evaluation of the selected checkpoint meets the target"
         if self.task is not None and self.task.objective.selection is not None:
-            return None  # the agent decides when to stop; the budget bounds it, and the rule chooses at the end
+            # The agent decides when to stop and the rule chooses at the end; a candidate made after the last
+            # evaluation cannot be chosen, so the run ends once no evaluation remains or runs.
+            if not self._evaluations_remain(budget) and not self._evaluation_active():
+                return ("no_evaluations: no development evaluation remains, and the selection rule considers only "
+                        "evaluated candidates")
+            return None
         streak = self.no_improvement_streak(reports, experiment.base_checkpoint_id)
         if streak >= NO_IMPROVEMENT_PATIENCE:
             return f"no_improvement: {streak} consecutive evaluated candidates showed no improvement"
         return None
+
+    def _evaluation_active(self) -> bool:
+        """Whether an evaluation job of the experiment is queued or running."""
+        return any(job.kind == "evaluation" and job.state in ("queued", "running")
+                   for job in self.engine.list_jobs(self.experiment_id))
 
     @staticmethod
     def _evaluations_remain(budget: Mapping[str, BudgetEntry]) -> bool:
@@ -871,19 +892,32 @@ class ReferenceRunner:
             task = bound.get_task(task_id)
         if self.baseline and policy.evaluation_available:
             self._evaluate_baseline(eid, task)
-        if sandbox_available(policy):  # the agent's own code reads them too (wse.sandbox_runs.refresh_inputs)
-            from wse.sandbox_runs import refresh_inputs
+        try:
+            if sandbox_available(policy):  # the agent's own code reads them too (wse.sandbox_runs.refresh_inputs)
+                from wse.sandbox_runs import refresh_inputs
 
-            with Engine(self.workspace, registry=self.registry) as operator:
-                refresh_inputs(operator.experiments, eid)
-        with _OperatorInterrupt() as interrupt:
-            if isinstance(config, StrategyConfig):
-                self._run_strategy(eid, task, policy, config, interrupt)
-            else:
-                self._run_agent(run_id, eid, task, policy, config, interrupt)
+                with Engine(self.workspace, registry=self.registry) as operator:
+                    refresh_inputs(operator.experiments, eid)
+            with _OperatorInterrupt() as interrupt:
+                if isinstance(config, StrategyConfig):
+                    self._run_strategy(eid, task, policy, config, interrupt)
+                else:
+                    self._run_agent(run_id, eid, task, policy, config, interrupt)
+        except BaseException:
+            self._freeze_if_open(eid)  # a failure before the controller's own finalization still freezes
+            raise
         if interrupt.requested:
             raise KeyboardInterrupt(f"experiment {eid} was interrupted by the operator; it is settled and frozen")
         return eid
+
+    def _freeze_if_open(self, eid: str) -> None:
+        """Settle and freeze an experiment that is still open after a failure; never mask the failure."""
+        try:
+            with Engine(self.workspace, registry=self.registry) as operator:
+                if operator.get_experiment(eid).state == "OPEN":
+                    self._finalize(operator, eid)
+        except Exception:  # noqa: BLE001 - the original failure is re-raised by the caller
+            logger.exception("freezing experiment %s after a failure failed", eid)
 
     # -- records -----------------------------------------------------------------------------
 

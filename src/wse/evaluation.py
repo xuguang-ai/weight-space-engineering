@@ -416,21 +416,22 @@ class EvaluationService:
             raise WSEError(ErrorCode.ARTIFACT_CORRUPT, f"the final report of {experiment_id} does not match its hash")
         return report
 
-    def final_evaluate(self, experiment_id: str, checkpoint_id: str | None = None) -> FinalEvaluationReport:
+    def final_evaluate(self, experiment_id: str, checkpoint_id: str | None = None, *,
+                       device: str | None = None) -> FinalEvaluationReport:
         """Evaluate the frozen candidate and the base-checkpoint control, pair them, and close the experiment.
 
         A generation task's final suite is generated directly, in this
-        process, on the host's engine device (``mps`` when available, else
-        ``cpu``), which its reports record; they keep aggregates only, and
-        the outputs are stored nowhere.
+        process, on ``device``, by default the host's engine device (``mps``
+        when available, else ``cpu``), which its reports record; they keep
+        aggregates only, and the outputs are stored nowhere.
         """
         self.experiments._require_operator("final evaluation")
         row = self.experiments._experiment_row(experiment_id)
         request_hash = json_hash({"operation": "final_evaluate", "checkpoint_id": str(checkpoint_id)})
         return self.experiments._guarded("final_evaluation", experiment_id, request_hash, None,
-                                         lambda: self._final(row, checkpoint_id))
+                                         lambda: self._final(row, checkpoint_id, device))
 
-    def _final(self, row: sqlite3.Row, checkpoint_id: Any) -> FinalEvaluationReport:
+    def _final(self, row: sqlite3.Row, checkpoint_id: Any, device: str | None = None) -> FinalEvaluationReport:
         experiment_id = row["experiment_id"]
         frozen, base = row["selected_checkpoint_id"], row["base_checkpoint_id"]
         if checkpoint_id is not None and checkpoint_id != frozen:
@@ -451,7 +452,7 @@ class EvaluationService:
                          {"candidate_checkpoint_id": frozen, "control_checkpoint_id": base},
                          experiment_id=experiment_id)
         try:
-            return self._run_final(row)
+            return self._run_final(row, device)
         except WSEError:
             raise
         except Exception as exc:  # noqa: BLE001 - any evaluation failure leaves the experiment frozen
@@ -459,7 +460,7 @@ class EvaluationService:
                            f"the final evaluation raised {type(exc).__name__}: {exc}; the experiment stays frozen, "
                            "so it can be retried on the same candidate", retryable=True) from exc
 
-    def _run_final(self, row: sqlite3.Row) -> FinalEvaluationReport:
+    def _run_final(self, row: sqlite3.Row, device: str | None = None) -> FinalEvaluationReport:
         experiment_id = row["experiment_id"]
         frozen, base = row["selected_checkpoint_id"], row["base_checkpoint_id"]
         suite = self.final_suite(row["task_id"])
@@ -467,7 +468,7 @@ class EvaluationService:
         config = EvalConfig(sample_count=suite.example_count, seed=suite.seeds[0])
         results = {}
         for checkpoint in dict.fromkeys((frozen, base)):
-            results[checkpoint] = self._final_result(checkpoint, resolved, config)
+            results[checkpoint] = self._final_result(checkpoint, resolved, config, device=device)
         candidate_result, control_result = results[frozen], results[base]
         if candidate_result.scores is None:
             raise WSEError(ErrorCode.WORKER_FAILED,
@@ -493,7 +494,8 @@ class EvaluationService:
                 final = self._seal(conn, row, suite, reports, comparison)
         return self.get_final_report(experiment_id) if sealed_concurrently else final
 
-    def _final_result(self, checkpoint_id: str, suite: EvaluationSuite, config: EvalConfig) -> EvaluationResult:
+    def _final_result(self, checkpoint_id: str, suite: EvaluationSuite, config: EvalConfig, *,
+                      device: str | None = None) -> EvaluationResult:
         """One checkpoint's evaluation on the resolved final suite: a forward-batch evaluation, or a generation."""
         from wse.api import evaluate_candidate
         from wse.evaluators.generation import DEFAULT_BATCH_SIZE, generates_text, run_generation
@@ -501,7 +503,7 @@ class EvaluationService:
         handle = self.engine.open_checkpoint(checkpoint_id)
         if generates_text(self.engine.registry.resolve_ref("evaluator", suite.evaluator)):
             return run_generation(handle, suite, config, files=self.engine.model_files(checkpoint_id),
-                                  registry=self.engine.registry, batch_size=DEFAULT_BATCH_SIZE).result
+                                  registry=self.engine.registry, batch_size=DEFAULT_BATCH_SIZE, device=device).result
         return evaluate_candidate(handle, suite, config, registry=self.engine.registry, batch_size=FINAL_BATCH_SIZE)
 
     def _seal(self, conn: sqlite3.Connection, row: sqlite3.Row, suite: EvaluationSuite,

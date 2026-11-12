@@ -154,6 +154,9 @@ def _cache_labels(path: Path) -> tuple[str, str] | None:
     return None
 
 
+_COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
+
+
 def _local_labels(path: Path, repo: str | None, revision: str | None) -> tuple[str, str]:
     inferred = _cache_labels(path)
     if inferred is not None:
@@ -167,6 +170,10 @@ def _local_labels(path: Path, repo: str | None, revision: str | None) -> tuple[s
             f"the local snapshot {path} needs repo= and revision= (the repository ID and the commit SHA it was "
             "downloaded from), which WSE records as its provenance; a Hugging Face cache snapshot "
             "(models--ORG--NAME/snapshots/SHA) names both itself", snapshot=str(path))
+    if not _COMMIT_SHA.fullmatch(revision):
+        raise _invalid(f"revision={revision!r} is not a commit SHA: a local snapshot needs the 40-character commit it "
+                       "was downloaded from, which WSE records as its provenance (a branch or tag name can move)",
+                       revision=revision)
     return repo, revision
 
 
@@ -673,7 +680,7 @@ class Model:
             exported = json.loads((path / EXPORT_PROVENANCE).read_text(encoding="utf-8"))
             repo = f"wse-export/{exported.get('checkpoint_id') or 'in-memory'}"
             revision = "weights-" + str(exported.get("weights_hash", "")).removeprefix("sha256:")[:40]
-        if path.is_dir():
+        elif path.is_dir():
             repo, revision = _local_labels(path, repo, revision)
         else:
             name = str(source)
@@ -712,6 +719,14 @@ class Model:
 
     def _child(self, handle: ModelHandle, checkpoint_id: str | None) -> Model:
         return Model(self._engine, handle, self.files, checkpoint_id=checkpoint_id, owner=self._owner or self)
+
+    def _sibling(self, checkpoint_id: str) -> Model:
+        """Another stored checkpoint of this workspace, sharing this model's workspace: closing it closes nothing."""
+        engine = self.engine
+        manifest = engine.load_manifest(checkpoint_id)
+        files = engine.model_files(checkpoint_id) if manifest.source is not None else {}
+        return Model(engine, engine.open_checkpoint(checkpoint_id), files, checkpoint_id=checkpoint_id,
+                     owner=self._owner or self)
 
     def close(self) -> None:
         """Free this model's device copies and, if this object opened the workspace, close it.

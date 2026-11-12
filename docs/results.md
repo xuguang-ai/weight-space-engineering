@@ -381,13 +381,13 @@ One run of [examples/experiment_quickstart.py](../examples/experiment_quickstart
 **What the agent did,** in 13 minutes 22 seconds:
 
 - It read WSE's skill, the original's 16 answers in `inputs/passes/`, and the tensor names, and probed residual-stream activations once. It reported the largest difference between finished and cut-off answers in the last layer's residual stream.
-- It made 8 candidates, each multiplying 32 to 128 entries of the final RMSNorm weight, `model.norm.weight`, by a factor from 0.25 to 0.75 (one also multiplied 64 entries of `model.layers.27.input_layernorm.weight` by 0.8). It computed each with `wse_run_python` (4 calls) and submitted the files with `wse_submit_candidate(..., path="outputs/....safetensors")`; WSE recorded each as an exact `replace_tensor` patch, written by a sandbox call whose code hash it keeps.
+- It made 8 candidates, each multiplying 32 to 128 entries of the final RMSNorm weight, `model.norm.weight`, by a factor from 0.25 to 0.75 (one also multiplied 64 entries of `model.layers.27.input_layernorm.weight` by 0.8). It chose the entries whose probe contrast between finished and cut-off answers, in the last layer's residual stream, was largest in magnitude. It computed each with `wse_run_python` (4 calls) and submitted the files with `wse_submit_candidate(..., path="outputs/....safetensors")`; WSE recorded each as an exact `replace_tensor` patch, written by a sandbox call whose code hash it keeps.
 - It evaluated 7 of them with `wse_evaluate`, one call each, then stopped itself (`WSE-STOP:`) after 8 of its 10 evaluations, the original's included.
 - All of its 30 tool calls succeeded: 6 shell commands and 24 WSE tool calls. It used 1,583,478 tokens: 1,577,323 input (1,501,586 of them cached) and 6,155 output.
 
 **Selection on the development problems.** The original answered 5 of 16 correctly and ran 10 of 16 to the limit. The rule selected the first candidate, which halves 64 entries of `model.norm.weight`: 7 of 16 correct, 7 of 16 at the limit. Five of the 7 evaluated candidates qualified.
 
-**Test on 16 GSM8K test problems,** [examples/data/math_test.jsonl](../examples/data/math_test.jsonl), registered after the freeze:
+**Test on 16 GSM8K test problems,** [examples/data/math_test.jsonl](../examples/data/math_test.jsonl), evaluated after the freeze. The earlier, failed attempt in the same workspace (below) had registered the same file 7 minutes before this run started, so it was on disk during the run, outside the agent's sandbox; none of its problems appears in anything the agent was sent or wrote:
 
 | 16 test problems | Original | Selected | Difference [95% interval] |
 | --- | --- | --- | --- |
@@ -400,9 +400,9 @@ One run of [examples/experiment_quickstart.py](../examples/experiment_quickstart
 **Records and checks.**
 
 - The run is labeled `unverified`: the agent ran its own commands and `wse_run_python`.
-- The original's development evaluation was not repeated: WSE linked it from an earlier experiment in the same workspace, the same model on the same problems with the same settings (`reused_from`). That earlier experiment's agent never started, because Codex could not find its home directory: the runner passed a relative path, and Codex resolved it from the sandbox directory. Commit 82b30d6 fixed this.
+- The original's development evaluation was not repeated: WSE linked it from an earlier experiment in the same workspace, the same model on the same problems with the same settings (`reused_from`). That earlier experiment's agent never started, because Codex could not find its home directory: the runner passed a relative path, and Codex resolved it from the sandbox directory. Commit 82b30d6 fixed this. Its example script then tested the original against itself on the same 16 test problems; `Experiment.run` now checks the agent's prerequisites before the baseline, and `result.test` refuses a run whose agent never started.
 - Every candidate's exact patch replayed to identical weights in a new workspace (8 of 8).
-- A scan found no API key, endpoint host, or p50c terms in the 703 files (9.07 GB) of the workspace, the exports, and the logs, and none of the 16 test problems in the 60 files of the agent's sandbox directory and Codex's home and logs, which hold everything the model was sent and wrote.
+- A scan found no API key, endpoint host, or p50c terms in 703 files (9.07 GB): the workspace, both exports, the run's logs, the preflight's Codex and proxy logs, and the printed output; it found none of the 16 test problems in the 60 files of the agent's sandbox directory and Codex's home and logs, which hold everything the model was sent and wrote. The 4 `wse_run_python` calls only read `inputs/` and wrote candidate files to `outputs/`, and the 6 shell commands only read.
 
 ## 7. Other models
 

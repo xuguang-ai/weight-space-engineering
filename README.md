@@ -47,7 +47,7 @@ result.export("artifacts/fix-loops")
 <details>
 <summary>What the same calls printed on Qwen3-0.6B (examples/experiment_quickstart.py, 2026-11-12)</summary>
 
-`result.summary()`, as this version prints it for that run (two of the seven candidates shown):
+`result.summary()` for that run, as this version prints it after the test (so the state reads CLOSED; at the end of `run` it reads FROZEN and ends with the path of the run's logs), with two of the seven candidates shown:
 
 ```text
 Experiment exp_0a0f8280e629ba70fdab1083806fcdee (CLOSED): Reduce repetitive reasoning so the model finishes more math answers.
@@ -179,7 +179,7 @@ norm of head 7's input columns in layer 14's o_proj: 8.75
 <summary>What <code>inspect()</code> printed before these lines</summary>
 
 ```text
-model Qwen/Qwen3-0.6B@c1899de289a04d12100db370d81485cdf75e47ca, checkpoint ckpt_79ed598420508d401177a910eb8fcabf, weights 92865a3c8750
+model Qwen/Qwen3-0.6B@c1899de289a04d12100db370d81485cdf75e47ca, checkpoint ckpt_b67e9a97d644396f3cd4c1f151e48338, weights 92865a3c8750
 adapter hf_causal_lm@1, family none (Level 0), model type qwen3, 28 layers
 596,049,920 parameters in 311 tensors (311 bfloat16)
 tensors:
@@ -276,10 +276,10 @@ print(f"saved: patch {edit.patch_id}, checkpoint {edited.checkpoint_id}")
 ```
 
 ```text
-1 tensors changed, 131,072 entries; weights 92865a3c8750 -> 092773d60909
+1 tensor changed, 131,072 entries; weights 92865a3c8750 -> 092773d60909
   model.layers.14.self_attn.o_proj.weight: 131,072 of 2,097,152 entries, relative L2 change 0.2756, 70e83e3c4328 -> ad2d2c42779e
 the patch replays to the edited weights: True
-saved: patch patch_6dd10a15732045e23deda035973d0a14, checkpoint ckpt_62960adbd9f8f4b026eb47be8fb6edd8
+saved: patch patch_bb8fab2e1dbaf10f02bd660b545d19c1, checkpoint ckpt_0da05bb923c740440677d84f26d003b5
 ```
 
 The registered operators scale, set, or fill a slice, remove a direction's projection, or add a low-rank term; `replace_weights` submits whole tensors computed any other way, after checking their names, shapes, dtypes, and values ([the Model API](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/models.md#the-model-api)).
@@ -403,7 +403,7 @@ An LLM agent, `gpt-5.6-luna` through the OpenAI Agents SDK runner that WSE used 
 
 ### An agent edits a small language model
 
-Through `Experiment`, Codex with `gpt-5.6-luna` worked on Qwen3-0.6B's answers to 16 GSM8K training problems at 1,024 new tokens, to cut fewer answers off at the limit without losing accuracy ([examples/experiment_quickstart.py](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/experiment_quickstart.py)). In 13 minutes it probed the residual stream, computed 8 candidates in Python, each scaling down 32 to 128 entries of the final RMSNorm weight, evaluated 7, and stopped itself. WSE's rule chose the one that halves 64 entries: on the development problems 5 → 7 correct and 10 → 7 cut off. On 16 GSM8K test problems registered after the freeze it did not help: 4 → 3 correct and 11 → 12 cut off (accuracy difference −0.062 [−0.188, +0.000]). The run shows the whole path working with a live agent, not an edit that generalizes ([the run](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/results.md#6-a-live-llm-agent-edits-a-language-model-through-experiment)).
+Through `Experiment`, Codex with `gpt-5.6-luna` worked on Qwen3-0.6B's answers to 16 GSM8K training problems at 1,024 new tokens, to cut fewer answers off at the limit without losing accuracy ([examples/experiment_quickstart.py](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/experiment_quickstart.py)). In 13 minutes it probed the residual stream, computed 8 candidates in Python, each scaling down 32 to 128 entries of the final RMSNorm weight (one also scaled layer 27's input norm), evaluated 7, and stopped itself. WSE's rule chose the one that halves 64 entries: on the development problems 5 → 7 correct and 10 → 7 cut off. On 16 GSM8K test problems, none of which appears in anything the agent was sent or wrote, it did not help: 4 → 3 correct and 11 → 12 cut off (accuracy difference −0.062 [−0.188, +0.000]). The run shows the whole path working with a live agent, not an edit that generalizes ([the run](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/results.md#6-a-live-llm-agent-edits-a-language-model-through-experiment)).
 
 ### What has been demonstrated
 
