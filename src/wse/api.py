@@ -1429,8 +1429,8 @@ class Engine:
         """
         return self.experiments.run_python(experiment_id, code, key, restart)
 
-    def submit_candidate(self, experiment_id: str, parent_checkpoint_id: str, tensor_file: str, hypothesis: str,
-                         key: str, tensors: list[str] | None = None) -> CandidateSubmission:
+    def submit_candidate(self, experiment_id: str, parent_checkpoint_id: str, tensor_file: str | None, hypothesis: str,
+                         key: str, tensors: list[str] | None = None, path: str | None = None) -> CandidateSubmission:
         """Build a candidate from a ``.safetensors`` file that the run's sandbox saved (``submit_candidate``).
 
         Each named tensor of the stored tensor file (default: all of them)
@@ -1439,7 +1439,7 @@ class Engine:
         record names the file and the sandbox call that saved it.
         """
         return self.experiments.submit_candidate(experiment_id, parent_checkpoint_id, tensor_file, hypothesis, key,
-                                                 tensors)
+                                                 tensors, path)
 
     def experiment_policy(self, experiment_id: str) -> ExperimentPolicy:
         """The immutable policy of an experiment this engine may see."""

@@ -160,3 +160,22 @@ def test_invalid_experiments_are_refused_before_anything_runs(hf_snapshots, tmp_
             Experiment("unused/model", "goal", dev, **{"minimize": None, **options})
     with pytest.raises(WSEError):
         Experiment("unused/model", " ", dev, minimize="limit_hit_rate")
+
+
+def test_the_agents_inputs_hold_the_baseline_and_never_the_test_data(experiment_setup) -> None:
+    from wse.sandbox_runs import layout_for
+
+    model, experiment, tmp_path = experiment_setup
+    result = experiment.run(agent="strategy:experiment_check@1", sandbox="python", max_evaluations=3, device="cpu")
+    engine = model.engine
+    run_id = engine.get_experiment(result.experiment_id).run_id
+    layout = layout_for(engine.experiments, run_id)
+    baseline = engine.list_reports(result.experiment_id)[0]
+    assert (layout.inputs / "weights" / "base.safetensors").is_file()
+    assert (layout.inputs / "passes" / f"{baseline.report_id}.jsonl").is_file()
+    test_data = tmp_path / "test.jsonl"
+    test_data.write_text("".join(json.dumps(row) + "\n" for row in TEST_ROWS), encoding="utf-8")
+    result.test(test_data)
+    texts = "\n".join(path.read_text(encoding="utf-8", errors="ignore") for path in layout.root.rglob("*")
+                      if path.is_file() and path.suffix in (".json", ".jsonl", ".txt", ".py"))
+    assert not any(row["problem"] in texts for row in TEST_ROWS)

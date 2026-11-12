@@ -60,7 +60,7 @@ import json
 import math
 import os
 import stat
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -86,7 +86,7 @@ if TYPE_CHECKING:
     from wse.experiments import ExperimentService
 
 __all__ = ["MAX_CODE_BYTES", "MAX_LISTED_OUTPUTS", "MAX_REFERENCE_ELEMENTS", "layout_for", "readable_tensors",
-           "run_python", "sync_inputs"]
+           "refresh_inputs", "run_python", "store_agent_tensor_file", "sync_inputs"]
 
 OPERATION = "run_python"
 MAX_CODE_BYTES = 256 * 1024
@@ -232,6 +232,22 @@ def sync_inputs(service: ExperimentService, experiment: Experiment, policy: Expe
     return sorted([*files, MANIFEST])
 
 
+def refresh_inputs(service: ExperimentService, experiment_id: str) -> list[str] | None:
+    """Bring the run's sandbox inputs up to date (``sync_inputs``) when the policy grants the sandbox.
+
+    The agent's own code, which runs outside WSE (for example the Codex
+    CLI's commands), reads the same ``inputs/`` that ``wse_run_python``
+    calls do: the runner exports them before the agent starts, and the MCP
+    server again whenever a job succeeds. ``None`` when the policy grants no
+    sandbox.
+    """
+    policy = service.experiment_policy(experiment_id)
+    if not sandbox_available(policy):
+        return None
+    experiment = service.get_experiment(experiment_id)
+    return sync_inputs(service, experiment, policy, layout_for(service, experiment.run_id).create())
+
+
 def _load_array(layout: SandboxLayout, output: sandbox.OutputFile) -> np.ndarray | None:
     """The array in ``output`` when it is a regular, singly linked ``.npy`` file that still has its listed hash."""
     data = sandbox.read_output(layout, output, MAX_ARRAY_FILE_BYTES)
@@ -257,19 +273,46 @@ def _safetensors_header(handle: Any) -> dict[str, Any]:
     return header
 
 
-def _store_tensor_file(service: ExperimentService, experiment_id: str, layout: SandboxLayout,
-                       output: sandbox.OutputFile, call: int) -> dict[str, Any]:
-    """Store a ``.safetensors`` output as a tensor file (module docstring); return its ``SandboxOutput`` fields."""
-    if output.size > MAX_TENSOR_FILE_BYTES:
-        return {"note": f"not stored: tensor files hold at most {MAX_TENSOR_FILE_BYTES} bytes"}
+def _open_beneath(root: Path, relative: PurePosixPath) -> int:
+    """Open ``root / relative`` for reading without following a link at any level below ``root``."""
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        descriptor = os.open(layout.outputs / output.path, os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError:
-        return {"note": "not stored: the file could not be opened without following a link"}
+        for part in relative.parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        return os.open(relative.parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+    finally:
+        os.close(directory)
+
+
+def _file_sha256(handle: Any) -> str:
+    digest = hashlib.sha256()
+    for block in iter(lambda: handle.read(1 << 22), b""):
+        digest.update(block)
+    handle.seek(0)
+    return "sha256:" + digest.hexdigest()
+
+
+def _store_tensor_file(service: ExperimentService, experiment_id: str, descriptor: int, label: str, call: int,
+                       sha256: str | None = None) -> dict[str, Any]:
+    """Store the ``.safetensors`` file open at ``descriptor`` as a tensor file; return ``SandboxOutput`` fields.
+
+    The file must be regular, singly linked, at most ``MAX_TENSOR_FILE_BYTES``,
+    and hold only floating-point tensors; it is read and copied from this
+    descriptor only. ``label`` is its path in the run's sandbox directory and
+    ``call`` the sandbox call that wrote it (0: the agent's own code).
+    ``sha256``, when given, is the hash it must still have.
+    """
     with os.fdopen(descriptor, "rb") as handle:
         info = os.fstat(handle.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             return {"note": "not stored: not a regular file with a single link"}
+        if info.st_size > MAX_TENSOR_FILE_BYTES:
+            return {"note": f"not stored: tensor files hold at most {MAX_TENSOR_FILE_BYTES} bytes"}
+        digest = _file_sha256(handle)
+        if sha256 is not None and digest != sha256:
+            return {"note": "not stored: the file changed after the call listed it"}
         try:
             header = _safetensors_header(handle)
             tensors = []
@@ -289,15 +332,41 @@ def _store_tensor_file(service: ExperimentService, experiment_id: str, layout: S
             return {"note": "not stored: the file holds no tensors"}
         handle.seek(0)
         try:
-            uri = service.store.publish_tensor_file(handle, output.sha256.removeprefix("sha256:"))
+            uri = service.store.publish_tensor_file(handle, digest.removeprefix("sha256:"))
         except WSEError as exc:
             return {"note": f"not stored: {exc.message}"}
     with service.db.transaction() as conn:
         conn.execute("INSERT OR IGNORE INTO tensor_files (uri, experiment_id, call, path, sha256, size_bytes, "
                      "tensors_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                     (uri, experiment_id, call, output.path, output.sha256, output.size,
+                     (uri, experiment_id, call, label, digest, info.st_size,
                       json.dumps([t.model_dump(mode="json") for t in tensors]), utc_now()))
     return {"tensor_file": uri, "tensors": tensors[:MAX_LISTED_TENSORS], "tensor_count": len(tensors)}
+
+
+def store_agent_tensor_file(service: ExperimentService, experiment_id: str, path: Any) -> str:
+    """Store a ``.safetensors`` file that the agent's own code wrote in ``outputs/`` or ``work/``; return its URI.
+
+    ``path`` is relative to the run's sandbox directory. No level of it may
+    be a link (``_open_beneath``), so a file outside the directory can never
+    be reached through one; the checks of ``_store_tensor_file`` apply.
+    """
+    relative = PurePosixPath(path) if isinstance(path, str) else None
+    if (relative is None or relative.is_absolute() or ".." in relative.parts or len(relative.parts) < 2
+            or relative.parts[0] not in ("outputs", "work") or relative.suffix != ".safetensors"):
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, "path must name a .safetensors file under outputs/ or work/ of "
+                       "the run's directory, for example outputs/candidate.safetensors",
+                       details={"path": str(path)})
+    experiment = service.get_experiment(experiment_id)
+    layout = layout_for(service, experiment.run_id).create()
+    try:
+        descriptor = _open_beneath(layout.root, relative)
+    except OSError as exc:
+        raise WSEError(ErrorCode.NOT_FOUND, f"{relative} cannot be opened as a file of the run's directory without "
+                       f"following a link: {exc.strerror}", details={"path": str(relative)}) from exc
+    fields = _store_tensor_file(service, experiment_id, descriptor, str(relative), 0)
+    if "note" in fields:
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, f"{relative} was {fields['note']}", details={"path": str(relative)})
+    return fields["tensor_file"]
 
 
 def _referenceable(array: np.ndarray) -> bool:
@@ -312,8 +381,14 @@ def _outputs(service: ExperimentService, experiment_id: str, layout: SandboxLayo
     for output in result.outputs[:MAX_LISTED_OUTPUTS]:
         shape = dtype = pointer = None
         if output.path.endswith(".safetensors"):
-            outputs.append(SandboxOutput(path=output.path, size=output.size, sha256=output.sha256,
-                                         **_store_tensor_file(service, experiment_id, layout, output, result.call)))
+            try:
+                descriptor = os.open(layout.outputs / output.path, os.O_RDONLY | os.O_NOFOLLOW)
+            except OSError:
+                fields: dict[str, Any] = {"note": "not stored: the file could not be opened without following a link"}
+            else:
+                fields = _store_tensor_file(service, experiment_id, descriptor, output.path, result.call,
+                                            output.sha256)
+            outputs.append(SandboxOutput(path=output.path, size=output.size, sha256=output.sha256, **fields))
             continue
         if output.path.endswith(".npy"):
             array = _load_array(layout, output)

@@ -467,9 +467,9 @@ class ExperimentExecutor:
                                                    groups=groups, top=top),
             "wse_run_python": lambda *, code, idempotency_key, experiment_id=None, restart=False: e.run_python(
                 eid(experiment_id), code, idempotency_key, restart),
-            "wse_submit_candidate": lambda *, parent_checkpoint_id, tensor_file, hypothesis, idempotency_key,
-            experiment_id=None, tensors=None: e.submit_candidate(eid(experiment_id), parent_checkpoint_id,
-                                                                 tensor_file, hypothesis, idempotency_key, tensors),
+            "wse_submit_candidate": lambda *, parent_checkpoint_id, hypothesis, idempotency_key, tensor_file=None,
+            path=None, experiment_id=None, tensors=None: e.submit_candidate(
+                eid(experiment_id), parent_checkpoint_id, tensor_file, hypothesis, idempotency_key, tensors, path),
             "wse_preview_patch": lambda *, patch_spec, idempotency_key, experiment_id=None: e.preview_patch(
                 eid(experiment_id), patch_spec, idempotency_key),
             "wse_apply_patch": lambda *, patch_id, idempotency_key, experiment_id=None: e.apply_patch(
@@ -823,6 +823,11 @@ class ReferenceRunner:
             task = bound.get_task(task_id)
         if self.baseline and policy.evaluation_available:
             self._evaluate_baseline(eid, task)
+        if sandbox_available(policy):  # the agent's own code reads them too (wse.sandbox_runs.refresh_inputs)
+            from wse.sandbox_runs import refresh_inputs
+
+            with Engine(self.workspace, registry=self.registry) as operator:
+                refresh_inputs(operator.experiments, eid)
         with _OperatorInterrupt() as interrupt:
             if isinstance(config, StrategyConfig):
                 self._run_strategy(eid, task, policy, config, interrupt)
