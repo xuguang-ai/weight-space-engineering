@@ -344,7 +344,9 @@ SIGKILL), so no orphaned worker claims a later trial's jobs.
 
 A policy with a `sandbox` section grants one more tool, `wse_run_python`,
 which runs the agent's own Python (NumPy, PyTorch on the CPU, safetensors)
-in a fresh process per call. Analysis is open; evaluation and edits are not:
+in one persistent process per run, the kernel: variables, imports, and
+loaded tensors persist between calls, as in a notebook (`restart=true`
+starts a new one). Analysis is open; evaluation and edits are not:
 generation passes and probes stay WSE jobs, and every edit is still a
 validated exact patch of a registered operator.
 
@@ -365,7 +367,10 @@ sandbox, `<workspace>/sandboxes/<run_id>/`:
   exported, and candidates are not: they differ from the base only by the
   run's own patches.
 - `work/`, read and write, kept between calls; `outputs/`, read and write,
-  emptied before each call; `tmp/`, the process's `TMPDIR`.
+  emptied before each call; `tmp/`, the process's `TMPDIR`. The code can
+  change what is inside them, but not the directories `inputs`, `work`,
+  `outputs`, and `tmp` themselves (remove, rename, replace, or change their
+  mode or times).
 
 **Isolation.** On macOS the process runs under `sandbox-exec` with a
 profile that denies everything, imports Apple's `system.sb` (the system
@@ -379,13 +384,19 @@ package stay unreadable); the sandbox directories above; and the metadata
 of their parent directories. The rest of the workspace (evaluator storage
 among it), the repository, the user's files, other executables, new
 processes, and the network are denied, and the environment is an
-allow-list, so no credential reaches the process. A call
-is killed at its wall-clock limit (the policy's `seconds_per_call`, or the
-time left); CPU time is limited to that many seconds per core, and files to
-1 GiB each. Peak memory is recorded but not limited: macOS enforces no
-address-space limit. Before its first use WSE checks that an allowed read
-works and a read outside the allow-list fails; elsewhere, and on other
-platforms, the tool fails closed with `UNSUPPORTED_CAPABILITY`.
+allow-list, so no credential reaches the process. WSE's own side never
+follows a link in the sandbox directory: it opens every directory and file
+there by descriptor, replaces any of the directories above that has become a
+link or a file (the call's `repairs` say so), and lists `outputs/` only as
+regular files with a single link. A call that outlives its wall-clock limit
+(the policy's `seconds_per_call`, or the time left) is interrupted and keeps
+the kernel; one that ignores the interrupt is killed, and the next call
+starts a new kernel. While a call runs, WSE kills the kernel above its
+memory limit (`max_memory_bytes`, 16 GiB by default); the kernel's CPU time
+over its whole life and each file it writes (4 GiB) are limited too. Before
+its first use WSE checks that an allowed read works and a read outside the
+allow-list fails; elsewhere, and on other platforms, the tool fails closed
+with `UNSUPPORTED_CAPABILITY`.
 
 **From code to an edit.** Each finite numeric array of one or two
 dimensions, of at most 65,536 values, that the code saves to `outputs/` with
