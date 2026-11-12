@@ -1431,7 +1431,7 @@ class Engine:
 
     def submit_candidate(self, experiment_id: str, parent_checkpoint_id: str, tensor_file: str, hypothesis: str,
                          key: str, tensors: list[str] | None = None) -> CandidateSubmission:
-        """Build a candidate from a ``.safetensors`` file the run's sandbox saved (``ExperimentService.submit_candidate``).
+        """Build a candidate from a ``.safetensors`` file that the run's sandbox saved (``submit_candidate``).
 
         Each named tensor of the stored tensor file (default: all of them)
         replaces the tensor of the same name in ``parent_checkpoint_id``,

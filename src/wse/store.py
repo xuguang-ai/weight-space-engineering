@@ -603,7 +603,8 @@ class ArtifactStore:
         """The stored file behind a ``wse://tensors/<sha256>`` URI, after a hash check."""
         digest = uri.removeprefix(TENSOR_URI_PREFIX) if isinstance(uri, str) else ""
         if not (isinstance(uri, str) and uri.startswith(TENSOR_URI_PREFIX) and re.fullmatch(r"[0-9a-f]{64}", digest)):
-            raise WSEError(ErrorCode.INVALID_ARGUMENT, f"{uri!r} is not a tensor file URI ({TENSOR_URI_PREFIX}<sha256>)")
+            raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                           f"{uri!r} is not a tensor file URI ({TENSOR_URI_PREFIX}<sha256>)")
         path = self._artifact_path(f"{TENSORS_DIR}/{digest}.safetensors")
         if not path.is_file():
             raise WSEError(ErrorCode.NOT_FOUND, f"tensor file {uri} is not stored", details={"uri": uri})

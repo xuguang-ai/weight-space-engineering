@@ -141,7 +141,8 @@ def test_cpu_limit_ends_the_kernel(layout: SandboxLayout) -> None:
 
 @needs_sandbox
 def test_memory_limit_ends_the_kernel(layout: SandboxLayout) -> None:
-    code = "import numpy as np\nblock = np.ones(1 << 27)\nprint(block.sum())\n"  # 1 GiB
+    # 1 GiB, held for longer than the watchdog's poll interval: a burst shorter than one interval can pass unseen.
+    code = "import time\nimport numpy as np\nblock = np.ones(1 << 27)\ntime.sleep(30)\nprint(block.sum())\n"
     result = run_python(layout, code, wall_seconds=60.0, cpu_seconds=60, max_output_bytes=1024,
                         max_memory_bytes=256 << 20)
     assert (result.ending, result.state_kept, result.signal) == ("memory_limit", False, "SIGKILL")

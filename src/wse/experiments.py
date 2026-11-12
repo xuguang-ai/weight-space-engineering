@@ -1015,7 +1015,8 @@ class ExperimentService:
         infos = {info.name: info for info in manifest.tensors}
         unknown = [name for name in names if name not in infos]
         if unknown:
-            raise WSEError(ErrorCode.INVALID_ARGUMENT, f"checkpoint {parent_checkpoint_id} has no tensors {unknown[:8]}; "
+            raise WSEError(ErrorCode.INVALID_ARGUMENT,
+                           f"checkpoint {parent_checkpoint_id} has no tensors {unknown[:8]}; "
                            "name each tensor in the file by its full checkpoint name",
                            details={"unknown": unknown[:64]})
         operations = [{"op": "replace_tensor", "tensor": name,

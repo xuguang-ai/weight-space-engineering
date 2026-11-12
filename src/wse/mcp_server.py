@@ -571,7 +571,8 @@ class WSEMCPServer:
 
         Variables, imports, and loaded tensors stay between calls, as in a notebook; restart=true starts a new
         kernel. A call past its time limit is interrupted (KeyboardInterrupt) and keeps the kernel; one that does not
-        stop, or exceeds the memory limit, ends the kernel (state_kept is false). The working directory holds inputs/ (read only: weights/base.safetensors with the base checkpoint's
+        stop, or exceeds the memory limit, ends the kernel (state_kept is false). The working directory holds
+        inputs/ (read only: weights/base.safetensors with the base checkpoint's
         permitted tensors in their stored dtype, which safetensors.torch.load_file reads; passes/<report_id>.jsonl
         with every output of your development generation passes; probes/<job_id>.npz and .json with your probe
         results; manifest.json), work/ (your files, kept between calls), and outputs/ (emptied before each call).
@@ -595,7 +596,8 @@ class WSEMCPServer:
 
     def wse_submit_candidate(self, *, experiment_id: ExperimentIdArg = None, parent_checkpoint_id: IdArg,
                              tensor_file: TensorFileArg, hypothesis: HypothesisArg, idempotency_key: KeyArg,
-                             tensors: TensorNamesArg = None) -> Annotated[CallToolResult, ToolResponse[CandidateSubmission]]:
+                             tensors: TensorNamesArg = None,
+                             ) -> Annotated[CallToolResult, ToolResponse[CandidateSubmission]]:
         """Create a candidate from tensors your sandbox code computed and saved; one preview and one commit.
 
         Save the new values with safetensors.torch.save_file to outputs/<name>.safetensors, under the tensors' full

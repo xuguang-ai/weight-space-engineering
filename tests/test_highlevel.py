@@ -1,6 +1,6 @@
-"""The high-level entry point ``wse.WSE`` (``wse.highlevel``).
+"""The high-level entry point ``wse.Model`` (``wse.highlevel``).
 
-``WSE`` wraps the operator ``Engine`` and the direct-use functions for the
+``Model`` wraps the operator ``Engine`` and the direct-use functions for the
 four steps of a weight-space experiment: diagnose (generation and
 evaluation), investigate (tensors and probes), intervene (edits and
 published patches), and evaluate (paired comparisons). Models are the tiny
@@ -46,9 +46,9 @@ def root(tmp_path_factory) -> Path:
 
 @pytest.fixture(scope="module")
 def llama(hf_snapshots, root):
-    from wse import WSE
+    from wse import Model
 
-    model = WSE.from_pretrained(hf_snapshots["llama_untied"], repo=REPO, revision=REVISION,
+    model = Model.from_pretrained(hf_snapshots["llama_untied"], repo=REPO, revision=REVISION,
                                 workspace=root / "workspace")
     yield model
     model.close()
@@ -64,19 +64,19 @@ def dataset(root) -> Path:
 # -- loading -------------------------------------------------------------------
 
 
-def test_wse_is_exported_from_the_package():
+def test_model_is_exported_from_the_package():
     import wse
-    from wse.highlevel import WSE
+    from wse.highlevel import Model
 
-    assert wse.WSE is WSE and "WSE" in wse.__all__
+    assert wse.Model is Model and "Model" in wse.__all__ and not hasattr(wse, "WSE")
 
 
 def test_from_pretrained_imports_a_local_snapshot_once(hf_snapshots, root, llama):
-    from wse import WSE
+    from wse import Model
     from wse.api import Engine
 
     assert llama.checkpoint_id is not None and llama.weights_hash.startswith("sha256:")
-    with WSE.from_pretrained(hf_snapshots["llama_untied"], repo=REPO, revision=REVISION,
+    with Model.from_pretrained(hf_snapshots["llama_untied"], repo=REPO, revision=REVISION,
                              workspace=root / "workspace") as again:
         assert again.checkpoint_id == llama.checkpoint_id
     with Engine(root / "workspace") as engine:
@@ -85,9 +85,9 @@ def test_from_pretrained_imports_a_local_snapshot_once(hf_snapshots, root, llama
 
 
 def test_a_local_snapshot_needs_its_source_labels(hf_snapshots, tmp_path):
-    from wse import WSE
+    from wse import Model
 
-    error = _expect(ErrorCode.INVALID_ARGUMENT, WSE.from_pretrained, hf_snapshots["llama_untied"],
+    error = _expect(ErrorCode.INVALID_ARGUMENT, Model.from_pretrained, hf_snapshots["llama_untied"],
                     workspace=tmp_path / "ws")
     assert "repo" in str(error) and "revision" in str(error)
 
@@ -95,12 +95,12 @@ def test_a_local_snapshot_needs_its_source_labels(hf_snapshots, tmp_path):
 def test_a_hub_cache_snapshot_names_its_repository_and_commit(hf_snapshots, tmp_path):
     import shutil
 
-    from wse import WSE
+    from wse import Model
 
     sha = "fedcba9876543210fedcba9876543210fedcba98"
     snapshot = tmp_path / "hub" / "models--example-org--Tiny-Llama" / "snapshots" / sha
     shutil.copytree(hf_snapshots["llama_untied"], snapshot)
-    with WSE.from_pretrained(snapshot, workspace=tmp_path / "ws") as model:
+    with Model.from_pretrained(snapshot, workspace=tmp_path / "ws") as model:
         assert (model.source.repository, model.source.revision) == ("example-org/Tiny-Llama", sha)
 
 
@@ -111,7 +111,7 @@ def test_hub_ids_download_only_allow_listed_root_files_at_the_resolved_commit(hf
 
     import huggingface_hub
 
-    from wse import WSE
+    from wse import Model
 
     sha = "00112233445566778899aabbccddeeff00112233"
     cache = tmp_path / "hub" / "models--example-org--Tiny-Llama" / "snapshots" / sha
@@ -138,7 +138,7 @@ def test_hub_ids_download_only_allow_listed_root_files_at_the_resolved_commit(hf
 
     monkeypatch.setattr(huggingface_hub, "HfApi", FakeApi)
     monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_download)
-    with WSE.from_pretrained("example-org/Tiny-Llama", revision="main", workspace=tmp_path / "ws") as model:
+    with Model.from_pretrained("example-org/Tiny-Llama", revision="main", workspace=tmp_path / "ws") as model:
         assert (model.source.repository, model.source.revision) == ("example-org/Tiny-Llama", sha)
     assert calls["model_info"] == ("example-org/Tiny-Llama", "main")
     assert calls["list_repo_files"] == ("example-org/Tiny-Llama", sha)
@@ -150,11 +150,11 @@ def test_hub_ids_download_only_allow_listed_root_files_at_the_resolved_commit(hf
 
 
 def test_open_reopens_a_stored_checkpoint(llama, root):
-    from wse import WSE
+    from wse import Model
 
-    with WSE.open(llama.checkpoint_id, workspace=root / "workspace") as model:
+    with Model.open(llama.checkpoint_id, workspace=root / "workspace") as model:
         assert model.weights_hash == llama.weights_hash
-    _expect(ErrorCode.NOT_FOUND, WSE.open, "ckpt_" + "0" * 32, workspace=root / "workspace")
+    _expect(ErrorCode.NOT_FOUND, Model.open, "ckpt_" + "0" * 32, workspace=root / "workspace")
 
 
 def test_the_default_workspace_is_shared_with_the_cli(monkeypatch, tmp_path):
@@ -304,14 +304,14 @@ def published(llama, root) -> tuple[Path, np.ndarray]:
 
 
 def test_apply_patch_imports_a_published_edit_and_stores_its_candidate(llama, root, published):
-    from wse import WSE
+    from wse import Model
 
     directory, edited = published
     edit = llama.apply_patch(directory, repo="example-org/edits", revision="abc123")
     assert edit.patch_id is not None and edit.model.checkpoint_id not in (None, llama.checkpoint_id)
     assert np.array_equal(_bits(edit.model.tensor(DOWN0)), edited)
     assert edit.verify() is True and edit.changed_elements == int((edited != _bits(llama.tensor(DOWN0))).sum())
-    with WSE.open(edit.model.checkpoint_id, workspace=root / "workspace") as stored:
+    with Model.open(edit.model.checkpoint_id, workspace=root / "workspace") as stored:
         assert stored.weights_hash == edit.model.weights_hash
     again = llama.apply_patch(directory, repo="example-org/edits", revision="abc123")
     assert (again.patch_id, again.model.checkpoint_id) == (edit.patch_id, edit.model.checkpoint_id)
@@ -437,7 +437,7 @@ def test_probe_matches_the_core_and_resolves_short_names(llama):
 def test_probe_encodes_strings_as_the_tokenizer_does(llama, monkeypatch):
     from types import SimpleNamespace
 
-    from wse.highlevel import WSE
+    from wse.highlevel import Model
 
     real = llama._text_model("cpu")
 
@@ -445,7 +445,7 @@ def test_probe_encodes_strings_as_the_tokenizer_does(llama, monkeypatch):
         ids = real.tokenizer(text, add_special_tokens=False)["input_ids"]
         return {"input_ids": ([1] if add_special_tokens else []) + list(ids)}
 
-    monkeypatch.setattr(WSE, "_text_model", lambda self, device: SimpleNamespace(runtime=real.runtime,
+    monkeypatch.setattr(Model, "_text_model", lambda self, device: SimpleNamespace(runtime=real.runtime,
                                                                                tokenizer=tokenizer))
     ids = tokenizer("abc 12")["input_ids"]
     assert ids[0] == 1
@@ -468,7 +468,7 @@ def test_probe_reads_an_evaluation_and_its_groups(llama, dataset):
 
 
 def test_an_edit_can_be_saved_reopened_and_compared_on_record(llama, dataset, root, tmp_path):
-    from wse import WSE
+    from wse import Model
 
     edit = llama.edit("layers.0.mlp.down_proj[:, :8]", "scale_slice", factor=-2.0)
     saved = edit.save(label="demo")
@@ -476,7 +476,7 @@ def test_an_edit_can_be_saved_reopened_and_compared_on_record(llama, dataset, ro
     assert saved.model.weights_hash == edit.model.weights_hash and saved.verify() is True
     again = edit.save(label="demo")
     assert (again.patch_id, again.model.checkpoint_id) == (saved.patch_id, saved.model.checkpoint_id)
-    with WSE.open(saved.model.checkpoint_id, workspace=root / "workspace") as stored:
+    with Model.open(saved.model.checkpoint_id, workspace=root / "workspace") as stored:
         assert stored.weights_hash == edit.model.weights_hash
     patch, blocks = llama.engine.read_imported_patch(saved.patch_id)
     assert patch == edit.patch and dict(blocks) == dict(edit.blocks)
@@ -532,13 +532,13 @@ def test_probe_texts_leave_the_stop_token_out_and_can_bound_the_context():
 def test_a_missing_local_path_is_not_looked_up_on_the_hub(tmp_path, monkeypatch):
     import huggingface_hub
 
-    from wse import WSE
+    from wse import Model
 
     calls = []
     monkeypatch.setattr(huggingface_hub, "HfApi", lambda *args, **kwargs: calls.append(args))
     monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda *args, **kwargs: calls.append(args))
     for source in (Path("missing-org/missing-model"), tmp_path / "nowhere", "./missing/model", "~/missing/model"):
-        error = _expect(ErrorCode.NOT_FOUND, WSE.from_pretrained, source, workspace=tmp_path / "ws")
+        error = _expect(ErrorCode.NOT_FOUND, Model.from_pretrained, source, workspace=tmp_path / "ws")
         assert "no such directory" in str(error) or "not a snapshot directory" in str(error), str(error)
     assert calls == []
 
@@ -546,23 +546,23 @@ def test_a_missing_local_path_is_not_looked_up_on_the_hub(tmp_path, monkeypatch)
 def test_a_single_name_hub_cache_snapshot_is_recognized(hf_snapshots, tmp_path):
     import shutil
 
-    from wse import WSE
+    from wse import Model
 
     sha = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
     snapshot = tmp_path / "hub" / "models--tinyllama" / "snapshots" / sha
     shutil.copytree(hf_snapshots["llama_untied"], snapshot)
-    with WSE.from_pretrained(snapshot, workspace=tmp_path / "ws") as model:
+    with Model.from_pretrained(snapshot, workspace=tmp_path / "ws") as model:
         assert (model.source.repository, model.source.revision) == ("tinyllama", sha)
 
 
 def test_compare_resolves_one_profile_before_generating(hf_snapshots, root, dataset, monkeypatch):
     import wse.evaluators.generation as generation
-    from wse import WSE
+    from wse import Model
 
     calls = []
     original = generation.run_generation
     monkeypatch.setattr(generation, "run_generation", lambda *a, **k: calls.append(1) or original(*a, **k))
-    with WSE.from_pretrained(hf_snapshots["llama_untied"], repo="example-org/Other-Model", revision=REVISION,
+    with Model.from_pretrained(hf_snapshots["llama_untied"], repo="example-org/Other-Model", revision=REVISION,
                              workspace=root / "workspace") as other:
         options = {key: value for key, value in EVAL.items() if key != "profile"}
         # Each import carries its own default profile; the base's does not exist for the other model.
@@ -612,9 +612,9 @@ def test_evaluate_defaults_the_grader_by_format(llama, root):
 
 
 def test_closing_frees_the_runtimes_and_refuses_store_use(hf_snapshots, tmp_path):
-    from wse import WSE
+    from wse import Model
 
-    model = WSE.from_pretrained(hf_snapshots["llama_untied"], repo=REPO, revision=REVISION, workspace=tmp_path / "ws")
+    model = Model.from_pretrained(hf_snapshots["llama_untied"], repo=REPO, revision=REVISION, workspace=tmp_path / "ws")
     edit = model.edit("layers.0.mlp.down_proj[:, :8]", "scale_slice", factor=0.5)
     model.generate("1+1?", max_new_tokens=2, device="cpu")
     assert model.handle._runtimes
@@ -628,7 +628,7 @@ def test_closing_frees_the_runtimes_and_refuses_store_use(hf_snapshots, tmp_path
 def test_the_new_result_classes_are_exported():
     import wse
 
-    assert {"Evaluation", "Probe", "Comparison", "Edit", "WSE"} <= set(wse.__all__)
+    assert {"Evaluation", "Probe", "Comparison", "Edit", "Model", "compare_models"} <= set(wse.__all__)
 
 
 def test_an_output_of_only_the_stop_token_keeps_it_as_its_window():

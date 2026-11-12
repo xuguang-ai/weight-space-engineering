@@ -38,15 +38,18 @@ It never unpickles a file or runs repository code, and it refuses a `config.json
 From Python:
 
 ```python
-from wse import WSE
+from wse import Model
 
 # A Hugging Face repository: the revision is resolved to its commit, and only the allow-listed files are downloaded.
-model = WSE.from_pretrained("Qwen/Qwen3-0.6B")
+model = Model.from_pretrained("Qwen/Qwen3-0.6B")
+print(model.source.revision)  # the commit "main" resolved to
 
 # A local snapshot names its source for the provenance record.
-model = WSE.from_pretrained("~/models/Qwen3-0.6B", repo="Qwen/Qwen3-0.6B",
-                            revision="c1899de289a04d12100db370d81485cdf75e47ca")
+model = Model.from_pretrained("~/models/Qwen3-0.6B", repo="Qwen/Qwen3-0.6B",
+                              revision="c1899de289a04d12100db370d81485cdf75e47ca")
 ```
+
+`model.export(path)` writes the model back as a Hugging Face directory (`config.json`, the tokenizer and generation files, and `model.safetensors` under the checkpoint's tensor names, with `wse_provenance.json`): `Model.from_pretrained(path)` imports it again with the same weights hash, and `transformers` loads it when WSE imported the whole snapshot. A snapshot of which WSE left parts out, such as Qwen3.5's vision encoder (`model.inspect().dropped_tensors`), exports its language model only.
 
 A snapshot in the Hugging Face cache (`models--ORG--NAME/snapshots/SHA`) names its repository and commit by its path. From the command line:
 

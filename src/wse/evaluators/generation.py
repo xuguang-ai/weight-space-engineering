@@ -204,6 +204,16 @@ class SampleOutput:
     text: str
     prompt_sha256: str
 
+    @property
+    def generated_tokens(self) -> int:
+        """How many tokens were generated, the stop token included."""
+        return len(self.tokens)
+
+    @property
+    def finish_reason(self) -> str:
+        """``stop`` when the output ended with a stop token, ``length`` when it reached the token limit."""
+        return "stop" if self.finished else "length"
+
 
 def token_hash(tokens: Sequence[int]) -> str:
     """``sha256:`` of token IDs as little-endian int64: the identity of a prompt or an output."""

@@ -98,7 +98,7 @@ each one out, in steps 1 to 4 of
 
 1. **The target checkpoint.** `Engine.import_model` stores tensors given in
    memory with a registered adapter (`mlp@1` for the signed-sum
-   classifier). `Engine.import_hf_snapshot`, or `WSE.from_pretrained`,
+   classifier). `Engine.import_hf_snapshot`, or `Model.from_pretrained`,
    imports a Hugging Face snapshot at a fixed revision
    ([models.md](models.md)).
 2. **The task,** a `TaskDefinition` registered with `Engine.register_task`.

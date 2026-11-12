@@ -29,11 +29,11 @@ from pathlib import Path
 
 import numpy as np
 
-from wse import WSE
+from wse import Model
 
 data = Path(sys.argv[1] if len(sys.argv) > 1 else "~/wse-data").expanduser()
 gsm8k = data / "gsm8k/train.jsonl"
-base = WSE.from_pretrained(
+base = Model.from_pretrained(
     "Qwen/Qwen3.5-0.8B",
     revision="2fc06364715b967f1860aea9cf38778875588b17",
     workspace=data / "workspace",

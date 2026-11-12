@@ -117,6 +117,33 @@ def read_jsonl(path: str | Path, *, format: str, id_prefix: str | None = None
     return suite_data, manifest
 
 
+def detect_format(path: str | Path) -> str:
+    """The format of a math JSON Lines file, read from its first row (the built-in ``math`` evaluator).
+
+    ``problem`` with ``answer`` or ``solution`` is ``math``; ``question`` with
+    an ``answer`` that ends in ``#### <number>`` is ``gsm8k``.
+    """
+    try:
+        with open(Path(path).expanduser(), encoding="utf-8") as handle:
+            line = next((line for line in handle if line.strip()), None)
+    except OSError as exc:
+        raise WSEError(ErrorCode.NOT_FOUND, f"cannot read {path}: {exc}", details={"path": str(path)}) from exc
+    if line is None:
+        raise _invalid(f"{path} holds no rows", path=str(path))
+    try:
+        row = json.loads(line)
+    except ValueError as exc:
+        raise _invalid(f"{path}: the first row is not JSON: {exc}", path=str(path)) from exc
+    if isinstance(row, dict) and isinstance(row.get("problem"), str):
+        return "math"
+    if isinstance(row, dict) and isinstance(row.get("question"), str) and "####" in str(row.get("answer", "")):
+        return "gsm8k"
+    keys = sorted(row) if isinstance(row, dict) else type(row).__name__
+    raise _invalid(f"{path}: a math row holds 'problem' with 'answer' (or 'solution' with a final \\boxed{{}}), or "
+                   f"GSM8K's 'question' with an 'answer' ending in '#### <number>'; the first row holds {keys}",
+                   path=str(path))
+
+
 def overlapping_items(data: TextSuiteData, other: TextSuiteData) -> list[str]:
     """IDs of the items of ``data`` whose normalized problem also occurs in ``other``, in order."""
     problems = {normalize_problem(item.problem) for item in other.items}

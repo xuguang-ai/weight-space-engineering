@@ -340,7 +340,8 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
     if sandbox:
         steps.append("Run your own Python with wse_run_python (NumPy, PyTorch on the CPU, safetensors) in a "
                      "persistent kernel: variables, imports, and loaded tensors stay between calls, each call has a "
-                     "time limit, and restart=true starts a new kernel. It reads inputs/weights/base.safetensors (the base "
+                     "time limit, and restart=true starts a new kernel. It reads inputs/weights/base.safetensors "
+                     "(the base "
                      "checkpoint's permitted tensors in their stored dtype; load them with "
                      "safetensors.torch.load_file), inputs/passes/<report_id>.jsonl (every output of your generation "
                      "passes, with its grade and text), and inputs/probes/<job_id>.npz and .json (your probe "

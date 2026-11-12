@@ -1,51 +1,74 @@
-"""``WSE``: one object per model for the four steps of a weight-space experiment.
+"""``Model``: one model version to inspect, analyze, edit, and evaluate; ``Edit``: a change that makes another.
 
-    from wse import WSE
+    from wse import Model, compare_models
 
-    base = WSE.from_pretrained("Qwen/Qwen3.5-0.8B")
-    p50c = base.apply_patch("lm_understand-logs/exp8_math/runs/p50c/edit",
-                            repo="RikiyaT/lm_understand-logs", revision="4d09ba6d6a7e891dd8063974dfe81b3d78e3494f")
-    print(p50c.table())
-    print(base.compare(p50c, "MATH-500/test.jsonl", problems=2, profile="qwen35think@1").table())
+    original = Model.from_pretrained("Qwen/Qwen3.5-0.8B", workspace="runs/qwen")
+    print(original.inspect())
+    edit = original.edit("layers.15.self_attn.o_proj[:, 1792:2048]", "fill_slice", value=0.0)
+    assert edit.verify()
+    edited = edit.save().model
+    print(compare_models(base=original, candidate=edited, data="data/math_dev.jsonl", evaluator="math",
+                         max_new_tokens=8192).table())
 
-The steps, and the methods that serve them:
+A ``Model`` is one checkpoint: ``checkpoint_id`` (``None`` for an edit kept
+in memory), ``weights_hash``, and ``source`` (the snapshot's repository and
+the commit its revision resolved to). Its methods serve the steps of an
+experiment:
 
-* **Diagnose:** ``generate`` and ``evaluate`` (``generation@1``): accuracy,
-  limit-hit rate, and generated tokens, with intervals.
-* **Investigate:** ``tensor_names``, ``tensor``, and ``probe`` (activation
-  means at named sites, and contrasts between groups of texts).
-* **Intervene:** ``edit`` applies a registered edit operator in memory, and
-  ``Edit.save`` stores its candidate with the exact patch; ``apply_patch``
-  imports a published edit as an exact patch and stores its candidate.
-* **Evaluate:** ``compare`` gives paired differences on the same problems,
-  prompts, and seeds. With ``out_dir``, it runs the resumable runner, which
-  records every problem; that needs stored models.
+* **Inspect:** ``inspect`` (identity, architecture, parameters, tensor
+  groups, and protected tensors), ``tensors`` (names, shapes, dtypes),
+  ``tensor`` (a copy: changing it changes nothing in the model), ``roles``.
+* **Diagnose:** ``generate`` (text, generated tokens, and finish reason) and
+  ``evaluate`` (``evaluator="math"``: accuracy, limit-hit rate, and mean
+  generated tokens, with intervals and every sample's output).
+* **Investigate:** ``probe`` (activation means at named sites; a probe of an
+  evaluation keeps each text's sample: item, grade, limit hit, and text).
+* **Intervene:** ``edit`` applies a registered edit operator, and
+  ``replace_weights`` submits tensors computed any other way, after checking
+  their names, shapes, dtypes, finiteness, and the protected tensors; both
+  return an ``Edit`` whose ``model`` is the new version, kept in memory until
+  ``Edit.save`` stores it with its exact patch. ``apply_patch`` imports a
+  published or exported edit. The original model never changes.
+* **Evaluate:** ``compare_models`` (or ``Model.compare``) gives paired
+  differences on the same problems, prompts, sampling settings, and seeds.
+* **Deliver:** ``Model.export`` writes a Hugging Face model directory, which
+  ``Model.from_pretrained`` imports again with the same weights hash, and
+  ``Edit.export`` writes the exact patch with its provenance.
 
-Underneath is the low-level API. ``WSE.engine`` is the operator ``Engine`` of
-the workspace and ``WSE.handle`` the ``ModelHandle``. Every edit is an exact
-patch with before and after hashes, which ``Edit.verify`` replays. Short
-tensor names and NumPy-style indices are resolved here, so patches always
-record full names and explicit ranges.
+The ``limit_hit_rate`` metric is the fraction of outputs that reached the
+token limit without finishing. It is not a repetition rate: an output can
+repeat itself and still finish, or reach the limit without repeating.
+
+Underneath is the low-level API. ``Model.engine`` is the operator ``Engine``
+of the workspace and ``Model.handle`` the ``ModelHandle``. Every edit is an
+exact patch with before and after hashes, which ``Edit.verify`` replays.
+Short tensor names and NumPy-style indices are resolved here, so patches
+always record full names and explicit ranges. Replaying weights exactly does
+not make generated text identical on other hardware.
 
 Version-less operator names resolve to the versions pinned in ``OPERATORS``,
 never to the latest registered version.
 
-A ``WSE`` object is for direct use by the operator. Its work is unmanaged: it
-belongs to no experiment and no budget. Imports (``from_pretrained``,
-``apply_patch``) and saved edits (``Edit.save``) are recorded in the
-workspace's audit log; an edit kept in memory is not. Agents work through the
-managed experiments of the MCP server (``wse serve``).
+A ``Model`` is for direct use. Its work is unmanaged: it belongs to no
+experiment and no budget. Imports (``from_pretrained``, ``apply_patch``) and
+saved edits (``Edit.save``) are recorded in the workspace's audit log; an
+edit kept in memory is not. Agents work through managed experiments
+(``wse.Experiment``, or the MCP server, ``wse serve``).
 
 **Downloads.** ``from_pretrained`` with a Hub repository ID resolves the
-revision to a commit and lists the repository's files. It then downloads
-only the allow-listed files at the snapshot root (``wse.hf_snapshot``) into
-the Hugging Face cache. Gated repositories use the user's own Hugging Face
-login; WSE never reads or stores a token.
+revision (default ``main``) to a commit, which ``source.revision`` records,
+and lists the repository's files. It then downloads only the allow-listed
+files at the snapshot root (``wse.hf_snapshot``) into the Hugging Face
+cache. Gated repositories use the user's own Hugging Face login; WSE never
+reads or stores a token.
 """
 
 from __future__ import annotations
 
 import difflib
+import fnmatch
+import hashlib
+import json
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -69,7 +92,8 @@ from wse.schemas import (
     WSEError,
 )
 
-__all__ = ["GRADERS", "OPERATORS", "WORKSPACE_ENV", "Comparison", "Edit", "Evaluation", "Probe", "WSE",
+__all__ = ["EVALUATORS", "GRADERS", "METRICS", "OPERATORS", "WORKSPACE_ENV", "Comparison", "Edit", "Evaluation",
+           "Inspection", "Model", "Probe", "ProbeSample", "TensorEntry", "compare_models",
            "default_workspace"]
 
 WORKSPACE_ENV = "WSE_WORKSPACE"
@@ -85,6 +109,11 @@ OPERATORS = MappingProxyType({
 _HUB_CACHE_DIR = re.compile(r"^models--(?:(?P<org>[A-Za-z0-9][A-Za-z0-9._-]*)--)?(?P<name>[A-Za-z0-9][A-Za-z0-9._-]*)$")
 # The default grader of each dataset format.
 GRADERS = MappingProxyType({"math500": "math_boxed@1", "math": "math_boxed@1", "gsm8k": "gsm8k_numeric@1"})
+# Evaluators by name: the built-in math protocol reads GSM8K or MATH rows (wse.evaluators.text_suites.detect_format).
+EVALUATORS = ("math",)
+# The metrics a generation evaluation reports.
+METRICS = ("accuracy", "limit_hit_rate", "mean_generated_tokens")
+EXPORT_PROVENANCE = "wse_provenance.json"
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _REPO_ID = re.compile(r"^(?:[A-Za-z0-9][A-Za-z0-9._-]{0,95}/)?[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _TARGET = re.compile(r"^\s*(?P<name>[^\[\]\s]+)\s*(?:\[(?P<index>[^\[\]]*)\])?\s*$")
@@ -227,17 +256,116 @@ def _short_hash(value: str) -> str:
     return value.removeprefix("sha256:")[:12]
 
 
-@dataclass(frozen=True, eq=False)
+def _wse_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("wse")
+    except PackageNotFoundError:  # pragma: no cover - a source tree that is not installed
+        return "unknown"
+
+
+def _new_directory(path: str | Path) -> Path:
+    """``path`` as a new or empty directory, created; an existing non-empty directory is refused."""
+    directory = Path(path).expanduser()
+    if directory.exists() and (not directory.is_dir() or any(directory.iterdir())):
+        raise _invalid(f"{directory} exists and is not an empty directory; choose a new one", path=str(directory))
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _evaluation_format(data: str | Path, evaluator: str, format: str | None) -> str:
+    """The data format of an evaluation: ``format`` as given, or the one ``evaluator`` reads from ``data``."""
+    from wse.evaluators.text_suites import FORMATS, detect_format
+
+    if evaluator not in EVALUATORS:
+        raise _invalid(f"unknown evaluator {evaluator!r}; the built-in evaluators are {list(EVALUATORS)}",
+                       evaluator=str(evaluator))
+    if format is not None:
+        if format not in FORMATS:
+            raise _invalid(f"unknown data format {format!r}; formats are {list(FORMATS)}", format=str(format))
+        return format
+    return detect_format(data)
+
+
+def _metric_names(metrics: Sequence[str] | None) -> tuple[str, ...]:
+    if metrics is None:
+        return METRICS
+    if isinstance(metrics, str) or not metrics or any(name not in METRICS for name in metrics):
+        raise _invalid(f"metrics must be a non-empty list of {list(METRICS)}", metrics=str(metrics))
+    return tuple(dict.fromkeys(metrics))
+
+
+@dataclass(frozen=True)
+class TensorEntry:
+    """One tensor of a model: its canonical name, shape, dtype, and whether every edit of it is refused."""
+
+    name: str
+    shape: tuple[int, ...]
+    dtype: str
+    protected: bool
+
+    def __str__(self) -> str:
+        return f"{self.name} {list(self.shape)} {self.dtype}" + (" (protected)" if self.protected else "")
+
+
+@dataclass(frozen=True)
+class Inspection:
+    """What ``Model.inspect`` reports; ``str()`` gives a readable summary.
+
+    ``groups`` collapses layer indices (``layers.{i}``) into one line per
+    tensor of a layer: the pattern, how many tensors match it, its shape and
+    dtype, and its parameters in all. ``protected`` lists the tensors every
+    edit refuses (the family's protected roles), and ``aliases`` the groups of
+    names that share one parameter.
+    """
+
+    checkpoint_id: str | None
+    weights_hash: str
+    source: str | None
+    adapter: str
+    family: str | None
+    model_type: str | None
+    layers: int | None
+    parameter_count: int
+    tensor_count: int
+    dtypes: Mapping[str, int]
+    groups: tuple[tuple[str, int, tuple[int, ...], str, int], ...]
+    protected: tuple[str, ...]
+    aliases: tuple[tuple[str, ...], ...]
+    dropped_tensors: int
+
+    def __str__(self) -> str:
+        where = f"checkpoint {self.checkpoint_id}" if self.checkpoint_id else "in memory"
+        lines = [f"model {self.source or self.adapter}, {where}, weights {_short_hash(self.weights_hash)}",
+                 f"adapter {self.adapter}, family {self.family or 'none (Level 0)'}, model type {self.model_type}, "
+                 f"{self.layers if self.layers is not None else '?'} layers",
+                 f"{self.parameter_count:,} parameters in {self.tensor_count} tensors ("
+                 + ", ".join(f"{count} {dtype}" for dtype, count in sorted(self.dtypes.items())) + ")"]
+        if self.dropped_tensors:
+            lines.append(f"{self.dropped_tensors} tensors of the snapshot were not imported (outside the language "
+                         "model)")
+        lines.append("tensors:")
+        for pattern, count, shape, dtype, parameters in self.groups:
+            lines.append(f"  {pattern}  x{count}  {list(shape)} {dtype}  {parameters:,} parameters")
+        lines.append("protected (every edit is refused): " + (", ".join(self.protected) or "none"))
+        if self.aliases:
+            lines.append("shared parameters: " + "; ".join(" = ".join(group) for group in self.aliases))
+        return "\n".join(lines)
+
+
+@dataclass(eq=False)
 class Edit:
     """An edit of ``base`` into ``model``: the exact patch, its per-tensor diff, and its binary blocks.
 
-    ``patch_id`` names the stored patch in the workspace (``apply_patch``, or
-    ``save``); an edit kept in memory has none, and its ``model`` has no
-    checkpoint.
+    ``model`` is the new version, usable before it is saved (``generate``,
+    ``evaluate``, ``probe``). ``patch_id`` names the stored patch in the
+    workspace (``apply_patch``, or ``save``, which fills it in together with
+    ``model.checkpoint_id``); an edit kept in memory has neither.
     """
 
-    base: WSE
-    model: WSE
+    base: Model
+    model: Model
     patch: MaterializedPatch
     diff: tuple[TensorDiff, ...]
     blocks: Mapping[str, bytes] = field(default_factory=dict, repr=False)
@@ -263,29 +391,65 @@ class Edit:
         return replay_patch(self.base.handle, self.patch, blocks=self.blocks).weights_hash == self.model.weights_hash
 
     def save(self, label: str = "direct") -> Edit:
-        """Store the edited model in the workspace with its exact patch; return the stored edit.
+        """Store the edited model in the workspace with its exact patch; return this edit, now stored.
 
         ``Engine.store_patch`` replays the patch on the stored base, which
         checks every hash, then commits the candidate with its patch file and
-        an audit event. A stored model can be reopened (``WSE.open``) and
+        an audit event. A stored model can be reopened (``Model.open``) and
         compared on record (``compare(..., out_dir=...)``). The base must be
         stored: for an edit of an edit, save the earlier edit first. Saving
-        the same edit again returns the stored one; ``label`` names it in the
-        record.
+        fills in ``patch_id`` and ``model.checkpoint_id``, so
+        ``edit.save().model`` is the stored version; saving the same edit again
+        changes nothing, and ``label`` names it in the record.
         """
         if self.patch_id is not None and self.model.checkpoint_id is not None:
             return self
         if self.patch.result_weights_hash != self.model.weights_hash:
             raise _invalid("this edit's model is not its patch's result, so it is not stored; make edits with "
-                           "WSE.edit or WSE.apply_patch")
+                           "Model.edit, Model.replace_weights, or Model.apply_patch")
         base_id = self.base.checkpoint_id or self.base._stored_checkpoint_id()
         if base_id is None:
             raise _invalid("this edit's base is an edit kept in memory, so it is not stored; save the edit that "
                            "made the base first")
         record = self.base.engine.store_patch(self.patch, self.blocks, base_checkpoint_id=base_id, label=label)
-        model = self.base._child(self.model.handle, record.checkpoint_id)
-        return Edit(base=self.base, model=model, patch=self.patch, diff=self.diff, blocks=self.blocks,
-                    patch_id=record.patch_id)
+        self.model.checkpoint_id = record.checkpoint_id
+        self.patch_id = record.patch_id
+        return self
+
+    def export(self, path: str | Path) -> Path:
+        """Write the exact patch and its provenance into the directory ``path`` (new or empty); return it.
+
+        ``patch.wsepatch`` is the binary patch file: the materialized steps and
+        the blocks of their after-values. ``patch.json`` is its provenance:
+        the base (checkpoint, weights hash, snapshot source), the result's
+        weights hash, each step's operator, tensor, selection, and changed
+        elements, the stored IDs when the edit was saved, and the patch file's
+        SHA-256. ``Model.apply_patch(path, format="wse-patch-v1")`` replays it
+        exactly onto the same base, in this or another workspace.
+        """
+        from wse.patch_blocks import write_patch_file
+
+        directory = _new_directory(path)
+        data = write_patch_file(self.patch.model_dump(mode="json"), dict(self.blocks))
+        (directory / "patch.wsepatch").write_bytes(data)
+        source = self.base.source
+        provenance = {
+            "format": "wse-patch-v1",
+            "base": {"checkpoint_id": self.base.checkpoint_id, "weights_hash": self.base.weights_hash,
+                     "source": None if source is None else {"repository": source.repository,
+                                                            "revision": source.revision}},
+            "result_weights_hash": self.model.weights_hash,
+            "patch_id": self.patch_id, "checkpoint_id": self.model.checkpoint_id,
+            "steps": [{"operator": str(step.operator), "tensor": step.tensor,
+                       "selection": [entry.model_dump(mode="json") for entry in step.selection],
+                       "changed_elements": step.changed_elements} for step in self.patch.steps],
+            "changed_elements": self.changed_elements,
+            "patch_sha256": "sha256:" + hashlib.sha256(data).hexdigest(),
+            "wse_version": _wse_version(),
+        }
+        (directory / "patch.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n",
+                                              encoding="utf-8")
+        return directory
 
     def table(self) -> str:
         """One line per changed tensor: changed entries, relative L2 change, and the before and after hashes."""
@@ -315,13 +479,14 @@ class Comparison:
     candidate: Mapping[str, Any]
     out_dir: Path | None = None
     evaluations: tuple[Evaluation, Evaluation] | None = None
+    metrics: tuple[str, ...] = METRICS
 
     def table(self) -> str:
-        """Base, candidate, and difference (with its 95% interval) for each metric."""
+        """Base, candidate, and difference (with its 95% paired interval) for each requested metric."""
         r = self.result
         lines = [f"{r.problems} problems, {r.samples} samples per model",
                  f"{'metric':<24}{'base':>10}{'candidate':>12}   difference [95% interval]"]
-        for name in ("accuracy", "limit_hit_rate", "mean_generated_tokens"):
+        for name in self.metrics:
             d = r.differences[name]
             digits = 1 if name == "mean_generated_tokens" else 3
             lines.append(f"{name:<24}{r.base[name]:>10.{digits}f}{r.candidate[name]:>12.{digits}f}   "
@@ -343,6 +508,7 @@ class Evaluation:
     outputs: tuple[Any, ...]
     prompts: Mapping[int, tuple[int, ...]]
     max_new_tokens: int
+    metric_names: tuple[str, ...] = METRICS
 
     @property
     def metrics(self) -> Mapping[str, float]:
@@ -387,10 +553,25 @@ class Evaluation:
             texts.append(ProbeText(tokens, start=start, stop=len(tokens)))
         return texts
 
+    def samples(self) -> list[dict[str, Any]]:
+        """One row per output, in ``outputs`` order: problem, item, sample, grade, answer, finish, tokens, text."""
+        grades = {(problem.index, sample.sample): sample for problem in self.result.problems or []
+                  for sample in problem.samples}
+        rows = []
+        for output in self.outputs:
+            graded = grades.get((output.index, output.sample))
+            rows.append({"problem": output.index, "item_id": output.item_id, "sample": output.sample,
+                         "correct": None if graded is None else graded.correct,
+                         "answer": None if graded is None else graded.answer,
+                         "finished": output.finished,
+                         "limit_hit": not output.finished and len(output.tokens) >= self.max_new_tokens,
+                         "generated_tokens": len(output.tokens), "text": output.text})
+        return rows
+
     def table(self) -> str:
-        """Each metric with its 95% interval."""
+        """Each requested metric with its 95% interval."""
         lines = [f"{self.result.sample_count} problems, {len(self.outputs)} samples"]
-        for name in ("accuracy", "limit_hit_rate", "mean_generated_tokens"):
+        for name in self.metric_names:
             interval = self.result.intervals.get(name)
             digits = 1 if name == "mean_generated_tokens" else 3
             bounds = f" [{interval.lower:.{digits}f}, {interval.upper:.{digits}f}]" if interval is not None else ""
@@ -398,16 +579,34 @@ class Evaluation:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class ProbeSample:
+    """The sample behind one text of a probe of an evaluation: its problem, item, grade, finish, and text."""
+
+    index: int
+    problem: int
+    item_id: str
+    sample: int
+    correct: bool | None
+    finished: bool
+    limit_hit: bool
+    generated_tokens: int
+    text: str
+
+
 @dataclass(frozen=True, eq=False)
 class Probe:
     """A probe's result (``wse.probes.ProbeResult``) that also answers to the site names it was asked with.
 
     ``names`` maps each requested site name to its canonical site; the result
-    records canonical sites only.
+    records canonical sites only. A probe of an evaluation keeps its texts'
+    ``samples``: row ``i`` of ``means(site)`` is ``samples[i]``, so
+    activations line up with generated texts, grades, and limit hits.
     """
 
     result: Any
     names: Mapping[str, str]
+    samples: tuple[ProbeSample, ...] = ()
 
     def _canonical(self, site: str) -> str:
         return self.names.get(site, site)
@@ -433,7 +632,7 @@ class Probe:
 # ---------------------------------------------------------------------------
 
 
-class WSE:
+class Model:
     """A model in a workspace, for direct use: diagnose, investigate, intervene, evaluate (see the module docstring).
 
     Create it with ``from_pretrained`` or ``open``; edits create more. The
@@ -442,7 +641,7 @@ class WSE:
     """
 
     def __init__(self, engine: Engine, handle: ModelHandle, files: Mapping[str, bytes], *,
-                 checkpoint_id: str | None, owner: WSE | None = None) -> None:
+                 checkpoint_id: str | None, owner: Model | None = None) -> None:
         self._engine = engine
         self._owner = owner
         self.handle = handle
@@ -456,7 +655,7 @@ class WSE:
     @classmethod
     def from_pretrained(cls, source: str | Path, *, revision: str | None = None, repo: str | None = None,
                         workspace: str | Path | None = None, family: str | None = None,
-                        license: str = "unspecified") -> WSE:
+                        license: str = "unspecified") -> Model:
         """Import a causal LM snapshot into the workspace (once) and open it.
 
         ``source`` is a local snapshot directory or a Hugging Face repository
@@ -468,6 +667,11 @@ class WSE:
         importing the same snapshot again opens the stored checkpoint.
         """
         path = Path(source).expanduser()
+        if path.is_dir() and (path / EXPORT_PROVENANCE).is_file() and repo is None and revision is None:
+            # A directory that Model.export wrote: its labels name the export, not the snapshot it derives from.
+            exported = json.loads((path / EXPORT_PROVENANCE).read_text(encoding="utf-8"))
+            repo = f"wse-export/{exported.get('checkpoint_id') or 'in-memory'}"
+            revision = "weights-" + str(exported.get("weights_hash", "")).removeprefix("sha256:")[:40]
         if path.is_dir():
             repo, revision = _local_labels(path, repo, revision)
         else:
@@ -490,7 +694,7 @@ class WSE:
             raise
 
     @classmethod
-    def open(cls, checkpoint_id: str, *, workspace: str | Path | None = None) -> WSE:
+    def open(cls, checkpoint_id: str, *, workspace: str | Path | None = None) -> Model:
         """Open a stored checkpoint of the workspace (an import, or a candidate that ``apply_patch`` stored)."""
         engine = Engine(default_workspace() if workspace is None else workspace)
         try:
@@ -500,13 +704,13 @@ class WSE:
             raise
 
     @classmethod
-    def _open(cls, engine: Engine, checkpoint_id: str) -> WSE:
+    def _open(cls, engine: Engine, checkpoint_id: str) -> Model:
         manifest = engine.load_manifest(checkpoint_id)
         files = engine.model_files(checkpoint_id) if manifest.source is not None else {}
         return cls(engine, engine.open_checkpoint(checkpoint_id), files, checkpoint_id=checkpoint_id)
 
-    def _child(self, handle: ModelHandle, checkpoint_id: str | None) -> WSE:
-        return WSE(self._engine, handle, self.files, checkpoint_id=checkpoint_id, owner=self._owner or self)
+    def _child(self, handle: ModelHandle, checkpoint_id: str | None) -> Model:
+        return Model(self._engine, handle, self.files, checkpoint_id=checkpoint_id, owner=self._owner or self)
 
     def close(self) -> None:
         """Free this model's device copies and, if this object opened the workspace, close it.
@@ -521,7 +725,7 @@ class WSE:
             self._closed = True
             self._engine.close()
 
-    def __enter__(self) -> WSE:
+    def __enter__(self) -> Model:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -531,7 +735,7 @@ class WSE:
         source = self.source
         label = f"{source.repository}@{source.revision[:12]}" if source is not None else str(self.handle.adapter_ref)
         where = self.checkpoint_id or "in memory"
-        return f"WSE({label}, {where}, weights {_short_hash(self.weights_hash)})"
+        return f"Model({label}, {where}, weights {_short_hash(self.weights_hash)})"
 
     # -- identity ---------------------------------------------------------------
 
@@ -539,7 +743,7 @@ class WSE:
     def engine(self) -> Engine:
         """The operator ``Engine`` of the workspace."""
         if (self._owner or self)._closed:
-            raise _invalid("this model's workspace is closed; open it again with WSE.open or WSE.from_pretrained")
+            raise _invalid("this model's workspace is closed; open it again with Model.open or Model.from_pretrained")
         return self._engine
 
     def _stored_checkpoint_id(self) -> str | None:
@@ -599,8 +803,167 @@ class WSE:
                        + (f"; close names: {close}" if close else ""), details={"name": short, "candidates": close})
 
     def tensor(self, name: str) -> torch.Tensor:
-        """A copy of the tensor named ``name`` (short names allowed, see ``name``)."""
+        """A copy of the tensor named ``name`` (short names allowed, see ``name``): changing it changes nothing here."""
         return self.handle.tensor(self.name(name))
+
+    def _protected(self) -> set[str]:
+        from wse.adapters.families import model_family
+
+        family = model_family(self.handle)
+        names = set(self.handle.tensor_names())
+        protected = {name for name in names if family is not None and family.protected_role(name) is not None}
+        for group in self.handle.architecture.alias_groups:
+            protected |= set(group)
+        return protected
+
+    def tensors(self, pattern: str | None = None) -> list[TensorEntry]:
+        """The tensors whose names match ``pattern``: name, shape, dtype, and whether edits of it are refused.
+
+        ``pattern`` is a glob (``"layers.15.*"``) when it holds ``*``, ``?`` or
+        ``[``, matched against the whole name or any dotted suffix of it, and
+        otherwise a substring; ``None`` lists every tensor.
+        """
+        protected = self._protected()
+        entries = []
+        for name in self.handle.tensor_names():
+            if pattern is not None:
+                if any(char in pattern for char in "*?["):
+                    if not (fnmatch.fnmatchcase(name, pattern) or fnmatch.fnmatchcase(name, "*." + pattern)):
+                        continue
+                elif pattern not in name:
+                    continue
+            tensor = self.handle._tensors[name]
+            entries.append(TensorEntry(name=name, shape=tuple(tensor.shape),
+                                       dtype=str(tensor.dtype).removeprefix("torch."), protected=name in protected))
+        return entries
+
+    def inspect(self) -> Inspection:
+        """Identity, architecture, parameters, tensors by layer pattern, and protected tensors (``Inspection``)."""
+        from wse.adapters.families import model_family
+
+        stored = self.handle.config
+        config = stored.get("model_config", stored) if isinstance(stored.get("model_config"), dict) else stored
+        text = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
+        family = model_family(self.handle)
+        groups: dict[str, list[str]] = {}
+        for name in self.handle.tensor_names():
+            groups.setdefault(re.sub(r"(?<=layers\.)\d+(?=\.)", "{i}", name), []).append(name)
+        rows = []
+        for pattern, names in groups.items():
+            first = self.handle._tensors[names[0]]
+            rows.append((pattern, len(names), tuple(first.shape), str(first.dtype).removeprefix("torch."),
+                         sum(self.handle._tensors[n].numel() for n in names)))
+        dtypes: dict[str, int] = {}
+        for name in self.handle.tensor_names():
+            key = str(self.handle._tensors[name].dtype).removeprefix("torch.")
+            dtypes[key] = dtypes.get(key, 0) + 1
+        source = self.source
+        layers = text.get("num_hidden_layers") if isinstance(text, dict) else None
+        return Inspection(
+            checkpoint_id=self.checkpoint_id, weights_hash=self.weights_hash,
+            source=None if source is None else f"{source.repository}@{source.revision}",
+            adapter=str(self.handle.adapter_ref), family=None if family is None else str(family.ref),
+            model_type=config.get("model_type"), layers=layers if isinstance(layers, int) else None,
+            parameter_count=self.handle.parameter_count, tensor_count=len(self.handle.tensor_names()),
+            dtypes=MappingProxyType(dtypes), groups=tuple(rows), protected=tuple(sorted(self._protected() - {
+                name for group in self.handle.architecture.alias_groups for name in group})),
+            aliases=tuple(tuple(sorted(group)) for group in self.handle.architecture.alias_groups),
+            dropped_tensors=0 if source is None else source.dropped_tensor_count)
+
+    def replace_weights(self, weights: Mapping[str, Any]) -> Edit:
+        """An edit that replaces whole tensors with values computed any other way; this model is unchanged.
+
+        ``weights`` maps tensor names (short names allowed, see ``name``) to
+        their new values: tensors (or arrays) of the stored shape and dtype
+        (a bfloat16 tensor stays bfloat16: convert with ``.to(torch.bfloat16)``),
+        every value finite. Protected tensors and shared parameters are
+        refused, as for every edit. The edit is an exact patch of
+        ``replace_tensor@1`` steps, whose records name the submitted values by
+        their content hash; ``Edit.save`` stores it.
+        """
+        from safetensors.torch import save as safetensors_bytes
+
+        from wse.patches import materialize_patch
+        from wse.tensors import dtype_name
+
+        if not isinstance(weights, Mapping) or not weights:
+            raise _invalid("weights must map tensor names to their new values")
+        tensors: dict[str, torch.Tensor] = {}
+        for name, value in weights.items():
+            canonical = self.name(name)
+            if canonical in tensors:
+                raise _invalid(f"{name!r} and another key both name {canonical!r}", tensor=canonical)
+            tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(np.asarray(value))
+            tensors[canonical] = tensor.detach().to("cpu").contiguous()
+        for name, tensor in tensors.items():
+            stored = self.handle._tensors[name]
+            if dtype_name(tensor) != dtype_name(stored):
+                raise _invalid(f"{name!r} is stored as {dtype_name(stored)}; the new values are "
+                               f"{dtype_name(tensor)}: convert them with .to(torch.{dtype_name(stored)})",
+                               tensor=name, dtype=dtype_name(tensor), stored_dtype=dtype_name(stored))
+            if tuple(tensor.shape) != tuple(stored.shape):
+                raise _invalid(f"{name!r} has shape {list(stored.shape)}; the new values have shape "
+                               f"{list(tensor.shape)}", tensor=name)
+        digest = hashlib.sha256(safetensors_bytes(dict(sorted(tensors.items())))).hexdigest()
+        references: dict[str, np.ndarray] = {}
+        operations = []
+        for name, tensor in tensors.items():
+            values = tensor.to(torch.float32).numpy()
+            bad = int(np.count_nonzero(~np.isfinite(values)))
+            if bad:
+                raise _invalid(f"the new values of {name!r} hold {bad} nonfinite value(s); every weight must be "
+                               "finite", tensor=name, nonfinite_count=bad)
+            values.flags.writeable = False
+            reference = f"wse://tensors/{digest}#{name}"
+            references[reference] = values
+            operations.append({"op": "replace_tensor", "tensor": name,
+                               "selection": [{"start": 0, "stop": size, "step": 1} for size in tensor.shape],
+                               "source": reference})
+        result = materialize_patch(self.handle, operations, registry=self.engine.registry,
+                                   policy=_policy().with_edit("replace_tensor", "replace_tensor@1"),
+                                   references=references)
+        return Edit(base=self, model=self._child(result.candidate, None), patch=result.patch, diff=result.diff,
+                    blocks=result.blocks)
+
+    def export(self, path: str | Path) -> Path:
+        """Write this model as a Hugging Face model directory into ``path`` (new or empty); return it.
+
+        The directory holds ``config.json``, the model's tokenizer, chat
+        template, and generation configuration files as imported, and
+        ``model.safetensors`` with every tensor under its checkpoint name
+        (each name of a shared parameter as its own copy), so
+        ``Model.from_pretrained(path)`` imports it again with this weights
+        hash, and ``transformers`` loads it when the snapshot held nothing
+        that WSE left out (``inspect().dropped_tensors``, for example a vision
+        encoder). ``wse_provenance.json`` records the checkpoint, its weights
+        hash, and the snapshot and patch it derives from.
+        """
+        from safetensors.torch import save_file
+
+        if self.source is None or not self.files:
+            raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY, "only imported open-weight models export as a Hugging "
+                           "Face directory")
+        directory = _new_directory(path)
+        tensors = {name: self.handle._tensors[name].clone().contiguous() for name in sorted(self.handle.tensor_names())}
+        save_file(tensors, str(directory / "model.safetensors"), metadata={"format": "pt"})
+        stored = self.handle.config
+        config = stored["model_config"] if isinstance(stored.get("model_config"), dict) else stored
+        (directory / "config.json").write_text(json.dumps(config, indent=2, sort_keys=True) + "\n",
+                                               encoding="utf-8")
+        for name, data in sorted(self.files.items()):
+            (directory / name).write_bytes(data)
+        manifest = None if self.checkpoint_id is None else self.engine.load_manifest(self.checkpoint_id)
+        provenance = {
+            "format": "wse-model-v1", "checkpoint_id": self.checkpoint_id, "weights_hash": self.weights_hash,
+            "source": {"repository": self.source.repository, "revision": self.source.revision,
+                       "dropped_tensors": self.source.dropped_tensor_count},
+            "parent_checkpoint_id": None if manifest is None else manifest.provenance.parent_checkpoint_id,
+            "patch_id": None if manifest is None or manifest.provenance.kind != "patch" else manifest.provenance.source,
+            "wse_version": _wse_version(),
+        }
+        (directory / EXPORT_PROVENANCE).write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n",
+                                                   encoding="utf-8")
+        return directory
 
     def roles(self) -> tuple[Any, ...]:
         """The semantic roles of this model's tensors (``wse.adapters.families.model_roles``); none at Level 0."""
@@ -742,7 +1105,13 @@ class WSE:
             max_tokens = min(max(lengths, default=1), MAX_PROBE_TOKENS)
         result = probe(self.handle, items, sites=list(names.values()), device=text_model.runtime.device.type,
                        max_tokens=max_tokens)
-        return Probe(result=result, names=MappingProxyType(names))
+        samples: tuple[ProbeSample, ...] = ()
+        if isinstance(texts, Evaluation):
+            samples = tuple(ProbeSample(index=i, problem=row["problem"], item_id=row["item_id"], sample=row["sample"],
+                                        correct=row["correct"], finished=row["finished"], limit_hit=row["limit_hit"],
+                                        generated_tokens=row["generated_tokens"], text=row["text"])
+                            for i, row in enumerate(texts.samples()))
+        return Probe(result=result, names=MappingProxyType(names), samples=samples)
 
     # -- intervene --------------------------------------------------------------
 
@@ -774,19 +1143,36 @@ class WSE:
         return Edit(base=self, model=self._child(result.candidate, None), patch=result.patch, diff=result.diff,
                     blocks=result.blocks)
 
-    def apply_patch(self, path: str | Path, *, repo: str, revision: str, format: str = "lm-understand-v1") -> Edit:
-        """Import a published edit as an exact patch onto this stored model, store its candidate, and return it.
+    def apply_patch(self, path: str | Path, *, repo: str | None = None, revision: str | None = None,
+                    format: str = "lm-understand-v1") -> Edit:
+        """Import a published or exported edit as an exact patch onto this stored model, store it, and return it.
 
-        Every base hash is verified before anything is rebuilt and every
-        rebuilt tensor against its published hash (``Engine.import_patch``).
-        ``repo`` and ``revision`` name the edit's source for its provenance.
-        Importing the same edit again returns the stored record.
+        ``format="lm-understand-v1"`` (the article's published edits): every
+        base hash is verified before anything is rebuilt and every rebuilt
+        tensor against its published hash (``Engine.import_patch``); ``repo``
+        and ``revision`` name the edit's source for its provenance.
+        ``format="wse-patch-v1"``: a directory that ``Edit.export`` wrote,
+        replayed exactly on this base (``Engine.store_patch`` checks every
+        step's hashes). Importing the same edit again returns the stored
+        record.
         """
         from wse.patches import tensor_diffs
 
         if self.checkpoint_id is None:
             raise _invalid("apply_patch needs a stored base model; this model is an in-memory edit, so apply the "
                            "published edit to the model loaded with from_pretrained or open")
+        if format == "wse-patch-v1":
+            from wse.patch_blocks import read_patch_file
+
+            document, blocks = read_patch_file((Path(path).expanduser() / "patch.wsepatch").read_bytes())
+            patch = MaterializedPatch.model_validate(document)
+            record = self.engine.store_patch(patch, blocks, base_checkpoint_id=self.checkpoint_id,
+                                             label="import of an exported patch")
+            model = self._child(self.engine.open_checkpoint(record.checkpoint_id), record.checkpoint_id)
+            return Edit(base=self, model=model, patch=patch, diff=tensor_diffs(self.handle, model.handle),
+                        blocks=blocks, patch_id=record.patch_id)
+        if repo is None or revision is None:
+            raise _invalid("a published edit needs repo= and revision=, the source WSE records as its provenance")
         record = self.engine.import_patch(path, base_checkpoint_id=self.checkpoint_id, format=format, repo=repo,
                                           revision=revision)
         patch, blocks = self.engine.read_imported_patch(record.patch_id)
@@ -794,7 +1180,7 @@ class WSE:
         return Edit(base=self, model=model, patch=patch, diff=tensor_diffs(self.handle, model.handle), blocks=blocks,
                     patch_id=record.patch_id)
 
-    def diff_from(self, other: WSE) -> tuple[TensorDiff, ...]:
+    def diff_from(self, other: Model) -> tuple[TensorDiff, ...]:
         """Per-tensor differences from ``other`` (a model of the same architecture) to this model."""
         from wse.patches import tensor_diffs
 
@@ -858,22 +1244,31 @@ class WSE:
         suite, _ = subset_suite(data, count=count, seed=subset_seed, parameters=parameters, eval_seed=eval_seed)
         return suite, parameters, count
 
-    def evaluate(self, dataset: str | Path, *, format: str = "math500", problems: int | None = None,
-                 subset_seed: int = 0, profile: str | None = None, grader: str | None = None, samples: int = 1,
-                 max_new_tokens: int | None = None, eval_seed: int = 0, batch_size: int = 8,
-                 device: str | None = None, id_prefix: str | None = None, log: Any = None) -> Evaluation:
-        """Evaluate generation on ``problems`` problems of a JSON Lines dataset, keeping every output.
+    def evaluate(self, data: str | Path, *, evaluator: str = "math", metrics: Sequence[str] | None = None,
+                 max_new_tokens: int | None = None, problems: int | None = None, subset_seed: int = 0,
+                 profile: str | None = None, samples: int = 1, eval_seed: int = 0, batch_size: int = 8,
+                 device: str | None = None, format: str | None = None, grader: str | None = None,
+                 id_prefix: str | None = None, log: Any = None) -> Evaluation:
+        """Evaluate generation on the problems of a JSON Lines file, keeping every output (``Evaluation``).
 
-        The problems are chosen by ``subset_seed`` (all of them when
-        ``problems`` is ``None``); ``format`` is ``math500``, ``gsm8k``, or
-        ``math``, and ``grader`` defaults to the format's (``GRADERS``). The
-        result's metrics are accuracy, limit-hit rate, and mean generated
-        tokens, with intervals; ``Evaluation.outputs`` holds every sample's
-        tokens and text, for probing. ``log`` receives one line per graded
-        problem.
+        ``evaluator="math"`` reads GSM8K rows (``question``, ``answer`` ending
+        in ``#### <number>``) or MATH rows (``problem`` and ``answer``, or
+        ``solution`` with a final ``\\boxed{}``), renders each problem with the
+        boxed-answer instruction through ``profile`` (default: the model's
+        own), and grades the final boxed answer; ``format`` and ``grader``
+        override the detected format and its grader (``GRADERS``).
+        ``problems`` problems are chosen by ``subset_seed`` (all of them when
+        ``None``). The result's metrics are accuracy, limit-hit rate, and mean
+        generated tokens, with intervals, ``metrics`` naming the ones the
+        table shows; ``Evaluation.samples()`` lists every output with its
+        grade and text, and ``Evaluation.outputs`` holds its tokens, for
+        probing. ``log`` receives one line per graded problem.
         """
         from wse.evaluators.generation import encode_prompts, run_generation
 
+        dataset = data
+        names = _metric_names(metrics)
+        format = _evaluation_format(dataset, evaluator, format)
         suite, _, count = self._suite(dataset, format=format, problems=problems, subset_seed=subset_seed,
                                       profile=profile, grader=grader, samples=samples, max_new_tokens=max_new_tokens,
                                       eval_seed=eval_seed, id_prefix=id_prefix)
@@ -890,18 +1285,20 @@ class WSE:
         prompts = encode_prompts(text_model, run.plan.profile, run.plan.items, range(len(run.plan.items)))
         return Evaluation(result=run.result, outputs=run.outputs,
                           prompts=MappingProxyType({index: tuple(ids) for index, ids in prompts.items()}),
-                          max_new_tokens=run.plan.profile.max_new_tokens)
+                          max_new_tokens=run.plan.profile.max_new_tokens, metric_names=names)
 
     # -- evaluate ---------------------------------------------------------------
 
-    def compare(self, candidate: WSE | Edit, dataset: str | Path, *, out_dir: str | Path | None = None,
-                format: str = "math500", problems: int | None = None, subset_seed: int = 0,
-                profile: str | None = None, grader: str | None = None, samples: int = 1,
-                max_new_tokens: int | None = None, eval_seed: int = 0, batch_size: int = 8,
-                device: str | None = None, id_prefix: str | None = None, log: Any = None) -> Comparison:
+    def compare(self, candidate: Model | Edit, data: str | Path, *, evaluator: str = "math",
+                metrics: Sequence[str] | None = None, out_dir: str | Path | None = None, format: str | None = None,
+                problems: int | None = None, subset_seed: int = 0, profile: str | None = None,
+                grader: str | None = None, samples: int = 1, max_new_tokens: int | None = None, eval_seed: int = 0,
+                batch_size: int = 8, device: str | None = None, id_prefix: str | None = None,
+                log: Any = None) -> Comparison:
         """Evaluate this model (the base) and ``candidate`` on the same problems; return the paired comparison.
 
-        The arguments are those of ``evaluate``. Both models use one profile,
+        The arguments are those of ``evaluate`` (``compare_models`` is the same
+        with both models named). Both models use one profile,
         the base's default unless ``profile`` names one, resolved for both
         before anything is generated. Without ``out_dir`` both evaluations
         run in memory, and the comparison keeps them. With ``out_dir`` the
@@ -916,19 +1313,23 @@ class WSE:
         from wse.evaluators.sampling import resolve_profile
 
         other = candidate.model if isinstance(candidate, Edit) else candidate
+        dataset = data
+        names = _metric_names(metrics)
+        format = _evaluation_format(dataset, evaluator, format)
         profile = self._profile_ref(profile)
         for model in (self, other):  # fail before generating if either model cannot use the profile
             resolve_profile(self.engine.registry, profile, model.source)
         if out_dir is None:
-            options = dict(format=format, problems=problems, subset_seed=subset_seed, profile=profile, grader=grader,
-                           samples=samples, max_new_tokens=max_new_tokens, eval_seed=eval_seed,
-                           batch_size=batch_size, device=device, id_prefix=id_prefix)
+            options = dict(evaluator=evaluator, metrics=names, format=format, problems=problems,
+                           subset_seed=subset_seed, profile=profile, grader=grader, samples=samples,
+                           max_new_tokens=max_new_tokens, eval_seed=eval_seed, batch_size=batch_size, device=device,
+                           id_prefix=id_prefix)
             base = self.evaluate(dataset, **options, log=None if log is None else lambda line: log(f"base {line}"))
             other_evaluation = other.evaluate(dataset, **options,
                                               log=None if log is None else lambda line: log(f"candidate {line}"))
             return Comparison(result=compare_generation(base.result, other_evaluation.result),
                               base=result_summary(base.result), candidate=result_summary(other_evaluation.result),
-                              evaluations=(base, other_evaluation))
+                              evaluations=(base, other_evaluation), metrics=names)
         if self.checkpoint_id is None or other.checkpoint_id is None:
             raise _invalid("a recorded comparison (out_dir) needs both models stored as checkpoints; save an "
                            "in-memory edit first (edit.save()), or compare it without out_dir")
@@ -942,4 +1343,24 @@ class WSE:
                                  batch_size=batch_size, id_prefix=id_prefix, log=log)
         return Comparison(result=GenerationComparison.model_validate(summary["comparison"]),
                           base=summary["results"]["base"], candidate=summary["results"]["candidate"],
-                          out_dir=Path(out_dir))
+                          out_dir=Path(out_dir), metrics=names)
+
+
+def compare_models(*, base: Model, candidate: Model | Edit, data: str | Path, evaluator: str = "math",
+                   metrics: Sequence[str] | None = None, max_new_tokens: int | None = None,
+                   out_dir: str | Path | None = None, **options: Any) -> Comparison:
+    """Evaluate ``base`` and ``candidate`` on the same data, prompts, sampling settings, and seeds; pair them.
+
+    ``evaluator`` defines how the data is read, prompted, and graded
+    (``"math"``: see ``Model.evaluate``); ``metrics`` names what the table
+    reports (default: accuracy, limit-hit rate, and mean generated tokens);
+    the result gives each metric's raw values, their difference, and a 95%
+    paired interval. With ``out_dir``, the resumable runner records every
+    problem there (both models must be stored). Other options are those of
+    ``Model.compare``: ``problems``, ``subset_seed``, ``profile``,
+    ``samples``, ``eval_seed``, ``batch_size``, ``device``, ``log``.
+    """
+    if not isinstance(base, Model):
+        raise _invalid("base must be a Model")
+    return base.compare(candidate, data, evaluator=evaluator, metrics=metrics, max_new_tokens=max_new_tokens,
+                        out_dir=out_dir, **options)

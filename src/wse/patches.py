@@ -381,7 +381,8 @@ def resolve_tensor_references(
             try:
                 if not isinstance(reference, str) or not re.fullmatch(TENSOR_REFERENCE_PATTERN, reference):
                     raise WSEError(ErrorCode.INVALID_ARGUMENT,
-                                   f"{name} must name a stored tensor of this run, wse://tensors/<sha256>#<tensor name>",
+                                   f"{name} must name a stored tensor of this run, "
+                                   "wse://tensors/<sha256>#<tensor name>",
                                    details={"parameter": name})
                 info = infos.get(operation.get("tensor"))
                 if info is None:
