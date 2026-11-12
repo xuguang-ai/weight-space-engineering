@@ -18,7 +18,7 @@ from wse import Model, compare_models
 
 | Step | Call | What it gives |
 | --- | --- | --- |
-| Load | `Model.from_pretrained(source, revision=..., workspace=...)` | Imports a Hugging Face snapshot once and opens it. A repository ID is downloaded at `revision` (default `main`), resolved to its commit; a local directory also needs `repo=` and `revision=` ([Importing a model](#importing-a-model)). |
+| Load | `Model.from_pretrained(source, revision=..., workspace=...)` | Imports a Hugging Face snapshot once and opens it. A repository ID is downloaded at `revision` (default `main`), resolved to its commit; a local directory also needs `repo=` and `revision=`, the 40-character commit it was downloaded from ([Importing a model](#importing-a-model)). |
 | | `Model.open(checkpoint_id, workspace=...)` | A stored checkpoint: an import or a saved edit. |
 | Inspect | `model.inspect()` | Identity, architecture, parameters, tensors grouped by layer, protected tensors, shared parameters, and how many tensors of the snapshot the import left out. |
 | | `model.tensors("layers.14.self_attn.*")` | The name, shape, dtype, and protection of each matching tensor (a glob, or else a substring). |

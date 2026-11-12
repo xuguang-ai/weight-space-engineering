@@ -168,3 +168,11 @@ def test_a_probe_of_an_evaluation_keeps_each_texts_sample(llama, dataset) -> Non
     assert len(probe.samples) == 3 == probe.means("layers.1.mlp.down_proj:output").shape[0]
     assert [(s.item_id, s.correct, s.limit_hit, s.text) for s in probe.samples] == [
         (row["item_id"], row["correct"], row["limit_hit"], row["text"]) for row in evaluation.samples()]
+
+
+def test_a_local_snapshot_needs_the_commit_it_was_downloaded_from(hf_snapshots, tmp_path) -> None:
+    from wse import Model
+
+    error = _expect(ErrorCode.INVALID_ARGUMENT, Model.from_pretrained, hf_snapshots["llama_untied"], repo=REPO,
+                    revision="main", workspace=tmp_path / "ws")
+    assert "not a commit SHA" in error.message
