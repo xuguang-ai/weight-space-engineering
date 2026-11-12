@@ -9,6 +9,8 @@ dist/
 # Runtime outputs, weights, datasets and credentials stay outside the repository
 workspace/
 /demo/
+/runs/
+/artifacts/
 *.safetensors
 *.sqlite
 *.sqlite-*
