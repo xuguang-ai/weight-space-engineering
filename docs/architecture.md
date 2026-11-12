@@ -76,6 +76,7 @@ No developer outside the project has added a method or a task yet, so the cost o
 | `analysis.py`, `probes.py` | Bounded tensor reads and analyses, and activation probes |
 | `sandbox.py`, `sandbox_runs.py` | The sandbox process and its profile, and code execution in a run: inputs, metering, records, and stored arrays |
 | `hf_snapshot.py` | Allow-listed reading of Hugging Face snapshots |
+| `model_proxy.py` | A per-run proxy on 127.0.0.1 that adds the operator's API key to an agent's model calls, so the agent's process holds only a run token |
 | `adapters/`, `engines/` | Model adapters and family descriptors, and the PyTorch inference engine for imported causal LMs |
 | `operators/`, `evaluators/`, `strategies/` | Built-in edit operators and analyses, evaluators and graders, and stepwise controllers |
 | `agent_adapters/` | The vendor-neutral agent adapter contract and the OpenAI Agents SDK adapter |
