@@ -14,7 +14,8 @@ The experiment on Qwen3-0.6B by default, at a short token limit so that it runs 
 4. Test: only the frozen choice and the original, on test problems that are registered only now.
 5. Export the experiment's record, the selected model, and the summary.
 
-Status: written against the Experiment API before its first live run with an agent.
+Status: run once with a live agent (codex:gpt-5.6-luna) on Qwen3-0.6B on 2026-11-12; docs/results.md, Section 6,
+gives the result.
 
 Needs the Codex CLI (its path in ``WSE_CODEX_PATH``, else ``codex`` on PATH, else OpenAI's VS Code extension's)
 and your model provider's key and endpoint in ``.env``, copied from ``.env.example`` (git ignores ``.env``). With

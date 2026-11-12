@@ -462,8 +462,12 @@ class ExperimentResult:
             lines.append(f"  evaluations {passes.consumed:g} of {passes.limit:g} (the baseline included)")
         lines.append(f"  constraint status {trial.get('constraint_status')}"
                      + (f" ({trial.get('constraint_reason')})" if trial.get("constraint_reason") else ""))
-        lines.append(f"  WSE-metered computation {trial.get('compute_seconds')} s; agent tokens "
-                     f"{(trial.get('tokens') or {}).get('total_tokens')}")
+        tokens = trial.get("tokens") or {}
+        seconds = trial.get("compute_seconds")
+        counted = (f"{tokens['total_tokens']:,} (input {tokens.get('input_tokens') or 0:,}, output "
+                   f"{tokens.get('output_tokens') or 0:,})" if tokens.get("total_tokens") is not None else "not reported")
+        lines.append(f"  WSE-metered computation {seconds:.1f} s; agent tokens {counted}" if seconds is not None
+                     else f"  WSE-metered computation not reported; agent tokens {counted}")
         if trial.get("sandbox"):
             lines.append(f"  sandbox calls {trial['sandbox']['calls']}, {trial['sandbox']['wall_seconds']:.1f} s of "
                          f"{trial['sandbox']['label']}")
@@ -484,7 +488,12 @@ class ExperimentResult:
             hypothesis = preview.hypothesis
         metrics = ", ".join(f"{name} {candidate['metrics'][name]:.4g}" for name in METRICS
                             if name in candidate["metrics"])
-        verdict = "kept" if candidate["qualifies"] else "not kept: " + "; ".join(candidate["reasons"])
+        if candidate["checkpoint_id"] == self.selected_checkpoint_id:
+            verdict = "selected"
+        elif candidate["qualifies"]:
+            verdict = "qualified; another candidate scored better"
+        else:
+            verdict = "did not qualify: " + "; ".join(candidate["reasons"])
         return (f"  - {candidate['checkpoint_id']}: {metrics}; {where}; {verdict}"
                 + (f"\n    hypothesis: {hypothesis}" if hypothesis else ""))
 

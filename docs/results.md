@@ -9,8 +9,9 @@ The sections:
 3. Reconstructing p50c in four steps, on 32 GSM8K problems.
 4. Through the MCP tools, with scripted controllers.
 5. A live LLM agent on a small model.
-6. Other models.
-7. Reproducibility and speed.
+6. A live LLM agent edits a language model through `Experiment`.
+7. Other models.
+8. Reproducibility and speed.
 
 ## 1. Published edits import exactly
 
@@ -366,7 +367,44 @@ One small fixture says little about agent capability in general.
 
 Record: [M1 agent trials](../dev/m1-agent-trials.md).
 
-## 6. Other models
+## 6. A live LLM agent edits a language model through `Experiment`
+
+One run of [examples/experiment_quickstart.py](../examples/experiment_quickstart.py) on 2026-11-12, at commit 82b30d6, on an M4 Pro (MPS).
+
+**Setup.**
+
+- **Model:** Qwen3-0.6B at revision `c1899de289a0…`, from a local snapshot.
+- **Development problems:** the 16 of [examples/data/math_dev.jsonl](../examples/data/math_dev.jsonl), at up to 1,024 new tokens, with the model's own sampling profile (`qwen3_0_6b_default@1`), one sample per problem, graded by `math_boxed@1`.
+- **Rule:** `minimize="limit_hit_rate"`, `preserve=["accuracy"]`, `max_evaluations=10`, `sandbox="python"`.
+- **Agent:** `codex:gpt-5.6-luna`, codex-cli 0.167.0-alpha.4.1, through WSE's model proxy to an Azure OpenAI deployment; all 31 model requests were served by `gpt-5.6-luna-2026-07-09`.
+
+**What the agent did,** in 13 minutes 22 seconds:
+
+- It read WSE's skill, the original's 16 answers in `inputs/passes/`, and the tensor names, and probed residual-stream activations once. It reported the largest difference between finished and cut-off answers in the last layer's residual stream.
+- It made 8 candidates, each multiplying 32 to 128 entries of the final RMSNorm weight, `model.norm.weight`, by a factor from 0.25 to 0.75 (one also multiplied 64 entries of `model.layers.27.input_layernorm.weight` by 0.8). It computed each with `wse_run_python` (4 calls) and submitted the files with `wse_submit_candidate(..., path="outputs/....safetensors")`; WSE recorded each as an exact `replace_tensor` patch, written by a sandbox call whose code hash it keeps.
+- It evaluated 7 of them with `wse_evaluate`, one call each, then stopped itself (`WSE-STOP:`) after 8 of its 10 evaluations, the original's included.
+- All of its 30 tool calls succeeded: 6 shell commands and 24 WSE tool calls. It used 1,583,478 tokens: 1,577,323 input (1,501,586 of them cached) and 6,155 output.
+
+**Selection on the development problems.** The original answered 5 of 16 correctly and ran 10 of 16 to the limit. The rule selected the first candidate, which halves 64 entries of `model.norm.weight`: 7 of 16 correct, 7 of 16 at the limit. Five of the 7 evaluated candidates qualified.
+
+**Test on 16 GSM8K test problems,** [examples/data/math_test.jsonl](../examples/data/math_test.jsonl), registered after the freeze:
+
+| 16 test problems | Original | Selected | Difference [95% interval] |
+| --- | --- | --- | --- |
+| Accuracy | 4/16 (0.250) | 3/16 (0.188) | −0.062 [−0.188, +0.000], paired |
+| Answers cut off at the limit | 11/16 (0.688) | 12/16 (0.750) | +0.062; each model's own interval: [0.438, 0.875] and [0.562, 0.938] |
+| Mean generated tokens | 922.3 | 945.9 | +23.6 |
+
+**The improvement did not carry over.** On the development problems the choice gained 2 correct answers and lost 3 cut-offs; on the test problems it lost 1 correct answer and gained 1 cut-off. Sixteen problems per set leave wide intervals, and the choice was selected for its development values, so those overstate it. The run shows that the whole path works with a live agent; it does not show an edit that generalizes.
+
+**Records and checks.**
+
+- The run is labeled `unverified`: the agent ran its own commands and `wse_run_python`.
+- The original's development evaluation was not repeated: WSE linked it from an earlier experiment in the same workspace, the same model on the same problems with the same settings (`reused_from`). That earlier experiment's agent never started, because Codex could not find its home directory: the runner passed a relative path, and Codex resolved it from the sandbox directory. Commit 82b30d6 fixed this.
+- Every candidate's exact patch replayed to identical weights in a new workspace (8 of 8).
+- A scan found no API key, endpoint host, or p50c terms in the 703 files (9.07 GB) of the workspace, the exports, and the logs, and none of the 16 test problems in the 60 files of the agent's sandbox directory and Codex's home and logs, which hold everything the model was sent and wrote.
+
+## 7. Other models
 
 - **Qwen3-0.6B and gemma-3-1b-it** at Level 0, with no new code:
   - import;
@@ -381,7 +419,7 @@ Record: [M1 agent trials](../dev/m1-agent-trials.md).
 
 Records: [M2 Q1 report](../dev/m2-q1-report.md), Section 4, and [M2 Q2 report](../dev/m2-q2-report.md), Section 5.
 
-## 7. Reproducibility and speed
+## 8. Reproducibility and speed
 
 - **Within one machine.** A generation pass with a fixed suite, profile, seed, and batch size is reproducible to the token. Two base passes in separate experiments of Section 4 produced the same 32 outputs, 253,567 generated tokens in all. Section 3's two full runs recorded the same answers, and its permutation rerun reproduced the base answers.
 - **Across devices or library versions.** Bitwise reproducibility is not claimed. Edits are computed on the CPU in a platform-independent way, so a patch should hash the same on every platform; so far this has been checked on macOS only.

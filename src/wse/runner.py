@@ -146,8 +146,7 @@ OPERATOR_INTERRUPT = "operator_interrupt: the operator interrupted the run (SIGI
 # Why a run whose policy grants the sandbox is unverified, whatever its controller (M3 plan Section 2.5).
 SANDBOX_CONSTRAINT_REASON = "sandbox code execution: WSE meters only its own calls"
 # Why a run of an agent that runs its own commands (an adapter with ``runs_own_code``, such as Codex) is unverified.
-OWN_CODE_CONSTRAINT_REASON = ("the agent runs its own commands (Codex's shell), whose computation WSE does not "
-                              "meter: WSE meters only its own calls")
+OWN_CODE_CONSTRAINT_REASON = "the agent runs its own commands (Codex's shell), whose computation WSE does not meter"
 # How reports name the sandbox's usage, apart from the calls WSE meters.
 SANDBOX_TIME_LABEL = "sandbox wall-clock time (not metered computation)"
 SERVE_ENV_ALLOWLIST = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "PYTHONPATH", "VIRTUAL_ENV",

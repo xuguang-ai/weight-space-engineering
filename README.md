@@ -10,7 +10,7 @@ WSE is a Python framework and MCP harness for experiments that edit a model's we
 
 [Experiment](https://github.com/xuguang-ai/weight-space-engineering#an-experiment-in-a-few-lines) · [Install](https://github.com/xuguang-ai/weight-space-engineering#install) · [Python API](https://github.com/xuguang-ai/weight-space-engineering#use-the-python-api) · [Agents](https://github.com/xuguang-ai/weight-space-engineering#use-an-agent) · [Results](https://github.com/xuguang-ai/weight-space-engineering#results) · [Documentation](https://github.com/xuguang-ai/weight-space-engineering#documentation)
 
-> **Current release: alpha.** A live LLM agent has repaired a small neural network through WSE's MCP tools. Language-model edits have run from Python and, with scripted controllers, through MCP. No LLM agent has edited a language model yet, and the `Experiment` API below, which is built for that, has not completed a live run. Development and testing have used macOS on Apple silicon.
+> **Current release: alpha.** A live LLM agent has repaired a small neural network through WSE's MCP tools. Language-model edits have run from Python and, with scripted controllers, through MCP. Through the `Experiment` API below, a live LLM agent has edited a language model once, Qwen3-0.6B: its choice improved the development problems and did not improve the test problems. Development and testing have used macOS on Apple silicon.
 
 ## An experiment in a few lines
 
@@ -42,7 +42,53 @@ print(report.compare())
 result.export("artifacts/fix-loops")
 ```
 
-> **Not yet run.** `Experiment` and its Codex agent runner are new, and this example has not completed a live run. [Results](https://github.com/xuguang-ai/weight-space-engineering#results) lists what has run.
+> **This Qwen3.5-0.8B example has not been run.** The same API has run once with a live agent, on Qwen3-0.6B ([Results](https://github.com/xuguang-ai/weight-space-engineering#an-agent-edits-a-small-language-model)).
+
+<details>
+<summary>What the same calls printed on Qwen3-0.6B (examples/experiment_quickstart.py, 2026-11-12)</summary>
+
+`result.summary()`, as this version prints it for that run (two of the seven candidates shown):
+
+```text
+Experiment exp_0a0f8280e629ba70fdab1083806fcdee (CLOSED): Reduce repetitive reasoning so the model finishes more math answers.
+Rule: WSE keeps the candidate with the lowest limit_hit_rate on the full development set among those that improve on the baseline's limit_hit_rate, with accuracy no worse than the baseline's; when none does, it keeps the original model.
+
+Behavior on the development set (point estimates):
+  metric                    original  selected
+  accuracy                     0.312     0.438
+  limit_hit_rate               0.625     0.438
+  mean_generated_tokens        893.9     844.2
+Choice: ckpt_9a07584b2251d762ac22fbce5c5c1918 was kept: limit_hit_rate 0.625 -> 0.4375, accuracy 0.3125 -> 0.4375; 5 of 7 evaluated candidates qualified
+
+Candidates (7 evaluated):
+  - ckpt_9a07584b2251d762ac22fbce5c5c1918: accuracy 0.4375, limit_hit_rate 0.4375, mean_generated_tokens 844.2; 64 elements in model.norm.weight; selected
+    hypothesis: The final residual probe shows the largest finished-vs-limit contrast at residual:28. Halving only the 64 strongest corresponding model.norm dimensions should reduce late repetitive continuation while preserving most output features.
+  - ckpt_c12a1e8686479788a317b0f08699539d: accuracy 0.3125, limit_hit_rate 0.5625, mean_generated_tokens 904.1; 64 elements in model.norm.weight; qualified; another candidate scored better
+    hypothesis: A stronger version of the successful late-norm intervention tests whether more suppression of the same 64 high-contrast dimensions further lowers looping.
+  ... (5 more candidates)
+Candidates without a full development evaluation (1): ckpt_68d97766330258baf71c35413fa6ec55
+
+The agent's final message: WSE-STOP: Best evaluated candidate is `ckpt_9a07584b2251d762ac22fbce5c5c1918`, improving accuracy to 0.4375 and reducing limit-hit rate to 0.4375 from 0.625.
+
+Audit:
+  controller codex_cli@1 model gpt-5.6-luna, ended completed (the agent stopped: WSE-STOP: Best evaluated candidate is `ckpt_9a07584b2251d762ac22fbce5c5c1918`, improving accuracy to 0.4375 and reducing limit-hit rate to 0.4375 from 0.625.)
+  evaluations 8 of 10 (the baseline included)
+  constraint status unverified (the agent runs its own commands (Codex's shell), whose computation WSE does not meter: WSE meters only its own calls; sandbox code execution: WSE meters only its own calls)
+  WSE-metered computation 699.1 s; agent tokens 1,583,478 (input 1,577,323, output 6,155)
+  sandbox calls 4, 1.0 s of sandbox wall-clock time (not metered computation)
+```
+
+`report.compare()` on the 16 test problems:
+
+```text
+test data examples/data/math_test.jsonl: 16 problems; selected ckpt_9a07584b2251d762ac22fbce5c5c1918, original ckpt_60a7ac2ff87136505570931729913354
+metric                    original  selected   difference [95% interval]
+accuracy                     0.250     0.188   -0.062 [-0.188, +0.000] paired
+limit_hit_rate               0.688     0.750   +0.062 original [0.438, 0.875]; selected [0.562, 0.938]
+mean_generated_tokens        922.3     945.9   +23.6 original [823.2, 1001.6]; selected [863.6, 1009.9]
+```
+
+</details>
 
 - **`goal` guides; `minimize` and `preserve` decide.** A candidate qualifies when its development limit-hit rate is below the original's and its development accuracy is at least the original's; WSE keeps the qualifying candidate with the lowest limit-hit rate, and when none qualifies, `result.model` is the original. These are point estimates, not significance tests.
 - **The evaluation is fixed.** Every model is evaluated on the same problems, prompts, sampling settings, seeds, and token limit, and the agent cannot change the grading. `max_evaluations` counts the evaluations of whole models on the development problems, the original's included.
@@ -303,7 +349,7 @@ OPENAI_BASE_URL=https://api.openai.com/v1
 
 For Azure OpenAI, set `OPENAI_BASE_URL` to your resource's endpoint, `https://YOUR-RESOURCE.services.ai.azure.com/openai/v1`, and put your deployment's name after `codex:`. Codex reaches the provider through a local proxy that WSE runs and that adds the key, so neither Codex nor the agent's code holds it ([credentials](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/experiment-api.md#agent-credentials)).
 
-**3. Run an experiment.** Neither script below has been run with an agent yet. With your model's name, or your deployment's name, in place of `YOUR_AGENT_MODEL`, the small one runs Qwen3-0.6B on the 16 development problems at 1,024 tokens, with up to 10 evaluations (about a minute and a half each, by the model quickstart's timing), and then tests on 16 GSM8K test problems:
+**3. Run an experiment.** The small script below has run once with a live agent ([Results](https://github.com/xuguang-ai/weight-space-engineering#an-agent-edits-a-small-language-model)); the Qwen3.5-0.8B one has not been run. With your model's name, or your deployment's name, in place of `YOUR_AGENT_MODEL`, the small one runs Qwen3-0.6B on the 16 development problems at 1,024 tokens, with up to 10 evaluations (about a minute and a half each, by the model quickstart's timing), and then tests on 16 GSM8K test problems:
 
 ```bash
 uv run --extra models-hf --env-file .env \
@@ -355,6 +401,10 @@ Eleven problems were solved only with p50c, and one only with the original. The 
 
 An LLM agent, `gpt-5.6-luna` through the OpenAI Agents SDK runner that WSE used before Codex, repaired a 22-parameter classifier with a planted fault in 5 of 5 acceptance trials, working only through WSE's MCP tools: final accuracy 100% on 1,024 examples it never saw, against 50% before. A single run on 2026-11-11 made 8 model requests and 11 tool calls in 20 seconds, with 68,866 input and 1,428 output tokens, and changed 4 of the 22 parameters with one `set_slice` ([trial report](https://github.com/xuguang-ai/weight-space-engineering/blob/main/dev/m1-agent-trials.md), [the example](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/signed_sum/agent_api.py)). One small fixture says little about agent capability in general.
 
+### An agent edits a small language model
+
+Through `Experiment`, Codex with `gpt-5.6-luna` worked on Qwen3-0.6B's answers to 16 GSM8K training problems at 1,024 new tokens, to cut fewer answers off at the limit without losing accuracy ([examples/experiment_quickstart.py](https://github.com/xuguang-ai/weight-space-engineering/blob/main/examples/experiment_quickstart.py)). In 13 minutes it probed the residual stream, computed 8 candidates in Python, each scaling down 32 to 128 entries of the final RMSNorm weight, evaluated 7, and stopped itself. WSE's rule chose the one that halves 64 entries: on the development problems 5 → 7 correct and 10 → 7 cut off. On 16 GSM8K test problems registered after the freeze it did not help: 4 → 3 correct and 11 → 12 cut off (accuracy difference −0.062 [−0.188, +0.000]). The run shows the whole path working with a live agent, not an edit that generalizes ([the run](https://github.com/xuguang-ai/weight-space-engineering/blob/main/docs/results.md#6-a-live-llm-agent-edits-a-language-model-through-experiment)).
+
 ### What has been demonstrated
 
 | Experiment | Controller | Recorded result |
@@ -363,15 +413,15 @@ An LLM agent, `gpt-5.6-luna` through the OpenAI Agents SDK runner that WSE used 
 | Apply published p50c to Qwen3.5-0.8B | Command line, same runner as Python | 3/25 → 13/25 correct on MATH-500, with a 32,768-token limit |
 | Reconstruct p50c's projection edit with WSE operators | Direct Python | 2/32 → 10/32 correct on GSM8K practice problems; answers cut off at the limit fell from 30/32 to 21/32 |
 | Apply that reconstruction through MCP | Scripted controller | Answers cut off at the limit fell from 30/32 to 19/32 on another practice set |
-| An agent edits a language model (`Experiment` with Codex) | Live LLM agent | Not run yet |
+| An agent edits a language model (`Experiment` with Codex) | Live LLM agent | One run on Qwen3-0.6B: 5/16 → 7/16 correct on the development problems it was chosen on, 4/16 → 3/16 on test problems |
 
-The article's three Qwen3.5-0.8B edits import to their published hashes, and WSE's own `fill_slice@1` operator reproduces one of them, p25c, hash-exactly. The reconstruction takes its direction and columns from p50c's published change; a scripted search that used its form without its values found no repair. No LLM agent has edited a language model yet: that is the next experiment.
+The article's three Qwen3.5-0.8B edits import to their published hashes, and WSE's own `fill_slice@1` operator reproduces one of them, p25c, hash-exactly. The reconstruction takes its direction and columns from p50c's published change; a scripted search that used its form without its values found no repair. One live agent run has edited a language model, and its gain on the development problems did not carry over to the test problems.
 
 ## Current support
 
 | Area | Status |
 | --- | --- |
-| Agent interface | `Experiment` with the Codex CLI (new, not yet run live); the MCP server for other MCP clients |
+| Agent interface | `Experiment` with the Codex CLI (one live run, on Qwen3-0.6B); the MCP server for other MCP clients |
 | Language-model weights | Unquantized safetensors for causal models implemented natively by `transformers` |
 | Verified model imports | Qwen3.5-0.8B, Llama-3.2-1B-Instruct, Qwen3-0.6B, and gemma-3-1b-it |
 | Generation and activation probes | Apple MPS and CPU, tested on macOS with Apple silicon |
@@ -379,7 +429,7 @@ The article's three Qwen3.5-0.8B edits import to their published hashes, and WSE
 | Tested versions | Python 3.14, PyTorch 2.15, and `transformers` 5.22.2; WSE requires Python 3.11 or later |
 | Patch replay | Exact replay of stored edits, verified by hashes |
 | Model export | Hugging Face model directories; Qwen3.5 exports its language model only, without its vision encoder |
-| Next work | Live agent runs on Qwen with `Experiment`, and CUDA support ([handover](https://github.com/xuguang-ai/weight-space-engineering/blob/main/dev/handover-cuda.md)) |
+| Next work | Live agent runs on Qwen3.5-0.8B with `Experiment`, larger development and test sets, and CUDA support ([handover](https://github.com/xuguang-ai/weight-space-engineering/blob/main/dev/handover-cuda.md)) |
 
 Local language-model evaluation is slow: a 32-problem generation pass at 8,192 tokens took about 37–40 minutes on an M4 Pro.
 
