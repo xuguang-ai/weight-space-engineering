@@ -440,10 +440,12 @@ class BudgetLimits(_Frozen):
 class SandboxPolicy(_Frozen):
     """How a run may execute its own Python in the sandbox (``wse.sandbox``; M3 plan Section 2.5).
 
-    ``seconds_per_call`` is each call's wall-clock limit; the CPU-time limit
-    of a call is that many seconds per CPU core, a backstop for a process
-    that outlives the server. ``max_output_bytes`` bounds each of standard
-    output and error in a tool result. ``readable_tensors`` lists
+    ``seconds_per_call`` is each call's wall-clock limit (``sandbox_seconds``
+    bounds them all); a kernel's CPU time over its life is limited to that
+    total per CPU core, a backstop for threads that outlive their call.
+    ``max_memory_bytes`` limits the kernel's physical memory footprint,
+    checked every quarter second while a call runs. ``max_output_bytes``
+    bounds each of standard output and error in a tool result. ``readable_tensors`` lists
     ``fnmatch`` patterns of the base checkpoint's tensors that the sandbox
     may read; unset, it may read every tensor that the model family does not
     protect. ``export_pass_texts`` exports the outputs of the run's
@@ -452,6 +454,7 @@ class SandboxPolicy(_Frozen):
     """
 
     seconds_per_call: float = Field(gt=0, le=3600, allow_inf_nan=False)
+    max_memory_bytes: int = Field(default=16 << 30, ge=256 << 20, le=1 << 40)
     max_output_bytes: int = Field(default=16384, ge=1024, le=1 << 20)
     readable_tensors: list[str] | None = _optional(min_length=1)
     export_pass_texts: bool = True

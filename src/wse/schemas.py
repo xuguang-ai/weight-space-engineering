@@ -646,14 +646,24 @@ class SandboxOutput(_Frozen):
     pointer: str | None = None
 
 
-class SandboxRun(_Frozen):
-    """One run of agent-written code in the sandbox (``Engine.run_python``, ``wse_run_python``; M3 plan Section 2).
+SandboxEnding = Literal["completed", "error", "timed_out", "memory_limit", "cpu_limit", "file_size_limit", "crashed"]
 
-    ``ending`` is ``exited`` (see ``exit_code``), ``timed_out``,
-    ``cpu_limit``, ``file_size_limit``, or ``signal``. ``stdout`` and
-    ``stderr`` are bounded by the policy (``*_truncated`` says whether they
-    were cut; ``*_bytes`` counts all of it). ``inputs`` lists what the code
-    could read under ``inputs/``; ``outputs`` what it left in ``outputs/``;
+
+class SandboxRun(_Frozen):
+    """One call of agent-written code in the run's kernel (``Engine.run_python``, ``wse_run_python``; ``wse.sandbox``).
+
+    ``ending`` is ``completed``; ``error`` (the code raised: ``error`` names
+    the exception and ``stderr`` holds its traceback); ``timed_out``;
+    ``memory_limit``; ``cpu_limit``; ``file_size_limit``; or ``crashed`` (the
+    kernel died: see ``exit_code`` and ``signal``). ``state_kept`` says
+    whether the kernel and its variables survived the call, ``restarted``
+    whether the call started a new kernel (variables of earlier calls are
+    gone), ``session`` counts the run's kernels and ``session_call`` the calls
+    of this one. ``stdout`` and ``stderr`` are bounded by the policy and by
+    the response limit (``*_truncated`` says whether they were cut;
+    ``*_bytes`` counts all of it). ``inputs`` lists what the code could read
+    under ``inputs/``; ``outputs`` what it left in ``outputs/`` (at most
+    ``MAX_LISTED_OUTPUTS``; ``outputs_not_listed`` counts the rest);
     ``refused_outputs`` the links and other non-regular files there, which
     WSE never follows. ``usage`` is what the call charged: one sandbox call
     and its wall-clock seconds, not metered computation.
@@ -661,12 +671,13 @@ class SandboxRun(_Frozen):
 
     schema_version: Literal["1"] = SCHEMA_VERSION
     call: int = Field(ge=1)
-    ending: Literal["exited", "timed_out", "cpu_limit", "file_size_limit", "signal"]
+    ending: SandboxEnding
     exit_code: int | None
     signal: str | None
+    error: str | None
     wall_seconds: float
-    cpu_seconds: float
-    max_rss_bytes: int
+    cpu_seconds: float | None
+    peak_memory_bytes: int | None
     stdout: str
     stderr: str
     stdout_bytes: int
@@ -678,6 +689,11 @@ class SandboxRun(_Frozen):
     inputs: list[str]
     code_sha256: str
     usage: Usage
+    session: int = Field(ge=1)
+    session_call: int = Field(ge=1)
+    restarted: bool
+    state_kept: bool
+    outputs_not_listed: int | None = _optional(ge=1)
 
 
 class TensorDiff(_Frozen):

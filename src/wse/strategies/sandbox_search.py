@@ -135,8 +135,8 @@ class SandboxSearchStrategy:
         ran = self._ok((yield Action.call("wse_run_python", "Look for identical rows in the weight matrices.",
                                           experiment_id=eid, code=ANALYSIS, idempotency_key=self._key("analyze"))),
                        "the sandbox analysis")
-        if ran["ending"] != "exited" or ran["exit_code"] != 0 or ran["stdout_truncated"]:
-            raise _Stop(f"the sandbox analysis ended {ran['ending']} with exit code {ran['exit_code']}")
+        if ran["ending"] != "completed" or ran["stdout_truncated"]:
+            raise _Stop(f"the sandbox analysis ended {ran['ending']}")
         pairs = json.loads(ran["stdout"])
         if not pairs:
             raise _Stop("the sandbox found no pair of identical rows")

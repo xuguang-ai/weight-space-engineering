@@ -20,12 +20,17 @@ exporting only data that the run may already read through its tools:
 Final suites are never exported, and a run-bound engine cannot read them.
 
 A call then checks that one sandbox call and some sandbox time remain,
-runs the code (``wse.sandbox.run_python``) with a wall-clock limit of the
-policy's ``seconds_per_call`` or the time left, whichever is less, and
-charges ``sandbox_calls`` and the measured wall-clock time to
-``sandbox_seconds``. Nothing is held while the code runs, so an interrupted
-call leaves no reservation behind. ``compute_seconds`` is not charged: WSE
-does not meter what the code computes.
+runs the code as the next call of the run's kernel (``wse.sandbox``: a
+persistent process, so variables survive between calls) with a wall-clock
+limit of the policy's ``seconds_per_call`` or the time left, whichever is
+less, and charges ``sandbox_calls`` and the measured wall-clock time to
+``sandbox_seconds``. ``restart`` starts a new kernel first. Nothing is held
+while the code runs, so an interrupted call leaves no reservation behind.
+``compute_seconds`` is not charged: WSE does not meter what the code
+computes. A result whose two copies in a tool response would exceed twice
+the policy's ``max_result_json_bytes`` has its standard output and error
+shortened, from their stored bytes, to the largest common bound that fits,
+and at most ``MAX_LISTED_OUTPUTS`` output files are listed and stored.
 
 Every regular file the code left in ``outputs/`` (emptied before each call)
 is listed with its size and SHA-256. A ``.npy`` file holding a finite numeric array of one or two
@@ -72,13 +77,14 @@ from wse.schemas import (
 if TYPE_CHECKING:
     from wse.experiments import ExperimentService
 
-__all__ = ["MAX_CODE_BYTES", "MAX_REFERENCE_ELEMENTS", "layout_for", "readable_tensors", "run_python",
-           "sync_inputs"]
+__all__ = ["MAX_CODE_BYTES", "MAX_LISTED_OUTPUTS", "MAX_REFERENCE_ELEMENTS", "layout_for", "readable_tensors",
+           "run_python", "sync_inputs"]
 
 OPERATION = "run_python"
 MAX_CODE_BYTES = 256 * 1024
 MAX_REFERENCE_ELEMENTS = 65536
 MAX_ARRAY_FILE_BYTES = 64 * 1024 * 1024
+MAX_LISTED_OUTPUTS = 32  # output files listed and stored per call; calls/<n>/result.json lists every one
 ARRAY_KIND = "sandbox_array"
 MANIFEST = "manifest.json"
 
@@ -234,7 +240,7 @@ def _referenceable(array: np.ndarray) -> bool:
 def _outputs(service: ExperimentService, experiment_id: str, layout: SandboxLayout,
              result: sandbox.SandboxResult) -> list[SandboxOutput]:
     outputs = []
-    for output in result.outputs:
+    for output in result.outputs[:MAX_LISTED_OUTPUTS]:
         shape = dtype = pointer = None
         if output.path.endswith(".npy"):
             array = _load_array(layout, output)
@@ -254,8 +260,34 @@ def _outputs(service: ExperimentService, experiment_id: str, layout: SandboxLayo
     return outputs
 
 
-def run_python(service: ExperimentService, experiment_id: str, code: Any, key: Any) -> SandboxRun:
-    """Run ``code`` in the run's sandbox, charge it, record it, and return its result (module docstring)."""
+def _fitted(run: SandboxRun, directory: Path, budget: int, limit: int) -> SandboxRun:
+    """``run`` with its streams shortened, from their stored bytes, to the largest bound whose response fits."""
+    from wse.policy import response_size
+
+    if response_size(run.model_dump(mode="json")) <= budget:
+        return run
+    stored = {name: (directory / f"{name}.txt").read_bytes() for name in ("stdout", "stderr")}
+
+    def cut(bound: int) -> SandboxRun:
+        stdout, stdout_cut = sandbox.shorten(stored["stdout"], run.stdout_bytes, bound)
+        stderr, stderr_cut = sandbox.shorten(stored["stderr"], run.stderr_bytes, bound)
+        return run.model_copy(update={"stdout": stdout, "stderr": stderr,
+                                      "stdout_truncated": run.stdout_truncated or stdout_cut,
+                                      "stderr_truncated": run.stderr_truncated or stderr_cut})
+
+    low, high = 0, limit
+    while low < high:  # the largest bound whose response fits
+        middle = (low + high + 1) // 2
+        if response_size(cut(middle).model_dump(mode="json")) <= budget:
+            low = middle
+        else:
+            high = middle - 1
+    return cut(low)
+
+
+def run_python(service: ExperimentService, experiment_id: str, code: Any, key: Any,
+               restart: Any = False) -> SandboxRun:
+    """Run ``code`` in the run's kernel, charge it, record it, and return its result (module docstring)."""
     if not isinstance(key, str) or not IDEMPOTENCY_KEY_PATTERN.fullmatch(key):
         raise WSEError(ErrorCode.INVALID_ARGUMENT,
                        f"idempotency_key must match {IDEMPOTENCY_KEY_PATTERN.pattern}; reuse the same key to retry "
@@ -265,12 +297,14 @@ def run_python(service: ExperimentService, experiment_id: str, code: Any, key: A
     if len(code.encode("utf-8")) > MAX_CODE_BYTES:
         raise WSEError(ErrorCode.INVALID_ARGUMENT, f"code has more than {MAX_CODE_BYTES} bytes",
                        details={"max_bytes": MAX_CODE_BYTES})
+    if not isinstance(restart, bool):
+        raise WSEError(ErrorCode.INVALID_ARGUMENT, "restart must be true or false")
     row = service._experiment_row(experiment_id)
     policy = service.experiment_policy(experiment_id)
     if not sandbox_available(policy):
         raise WSEError(ErrorCode.POLICY_DENIED, f"policy {policy.policy_id} grants no code execution; use the "
                        "analysis and probe tools instead", details={"policy_id": policy.policy_id})
-    request_hash = json_hash({"code": code})
+    request_hash = json_hash({"code": code, "restart": restart})
     with service.db.transaction() as conn:
         recorded = service._lookup(conn, experiment_id, key, OPERATION, request_hash)
     if recorded is not None:
@@ -289,25 +323,32 @@ def run_python(service: ExperimentService, experiment_id: str, code: Any, key: A
     wall = min(policy.sandbox.seconds_per_call, seconds_left)
     layout = layout_for(service, experiment.run_id).create()
     inputs = sync_inputs(service, experiment, policy, layout)
-    result = sandbox.run_python(layout, code, wall_seconds=wall,
-                                cpu_seconds=max(1, math.ceil(wall * (os.cpu_count() or 1))),
-                                max_output_bytes=policy.sandbox.max_output_bytes)
+    lifetime_cpu = max(1, math.ceil(float(policy.budget.limit("sandbox_seconds")) * (os.cpu_count() or 1)))
+    result = sandbox.run_python(layout, code, wall_seconds=wall, cpu_seconds=lifetime_cpu,
+                                max_output_bytes=policy.sandbox.max_output_bytes,
+                                max_memory_bytes=policy.sandbox.max_memory_bytes, restart=restart)
     seconds = round(min(result.wall_seconds, wall), 3)
     outputs = _outputs(service, experiment_id, layout, result)
     run = SandboxRun(
-        call=result.call, ending=result.ending, exit_code=result.exit_code, signal=result.signal,
-        wall_seconds=result.wall_seconds, cpu_seconds=result.cpu_seconds, max_rss_bytes=result.max_rss_bytes,
-        stdout=result.stdout, stderr=result.stderr, stdout_bytes=result.stdout_bytes,
-        stderr_bytes=result.stderr_bytes, stdout_truncated=result.stdout_truncated,
+        call=result.call, ending=result.ending, exit_code=result.exit_code, signal=result.signal, error=result.error,
+        wall_seconds=result.wall_seconds, cpu_seconds=result.cpu_seconds,
+        peak_memory_bytes=result.peak_memory_bytes, stdout=result.stdout, stderr=result.stderr,
+        stdout_bytes=result.stdout_bytes, stderr_bytes=result.stderr_bytes, stdout_truncated=result.stdout_truncated,
         stderr_truncated=result.stderr_truncated, outputs=outputs, refused_outputs=list(result.refused_outputs),
-        inputs=inputs, code_sha256=result.code_sha256, usage=Usage(sandbox_calls=1, sandbox_seconds=seconds))
+        inputs=inputs, code_sha256=result.code_sha256, usage=Usage(sandbox_calls=1, sandbox_seconds=seconds),
+        session=result.session, session_call=result.session_call, restarted=result.restarted,
+        state_kept=result.state_kept, outputs_not_listed=max(0, len(result.outputs) - MAX_LISTED_OUTPUTS) or None)
+    run = _fitted(run, layout.calls / str(result.call), 2 * policy.operations.limits.max_result_json_bytes,
+                  policy.sandbox.max_output_bytes)
     with service.db.transaction() as conn:
         service.ledger.charge(conn, experiment_id, "sandbox_calls", 1)
         service.ledger.charge(conn, experiment_id, "sandbox_seconds", seconds)
         service._remember(conn, experiment_id, key, OPERATION, request_hash, run.model_dump_json())
         insert_audit_event(conn, "sandbox.ran", experiment_id, {
             "call": run.call, "code_sha256": run.code_sha256, "ending": run.ending, "exit_code": run.exit_code,
-            "wall_seconds": run.wall_seconds, "cpu_seconds": run.cpu_seconds, "max_rss_bytes": run.max_rss_bytes,
+            "signal": run.signal, "error": run.error, "wall_seconds": run.wall_seconds,
+            "cpu_seconds": run.cpu_seconds, "peak_memory_bytes": run.peak_memory_bytes, "session": run.session,
+            "session_call": run.session_call, "restarted": run.restarted, "state_kept": run.state_kept,
             "outputs": [{"path": o.path, "size": o.size, "sha256": o.sha256} for o in outputs],
             "refused_outputs": run.refused_outputs, "charged": {"sandbox_calls": 1, "sandbox_seconds": seconds},
         }, experiment_id=experiment_id)

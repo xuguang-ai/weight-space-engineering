@@ -1,10 +1,12 @@
-"""Run agent-written Python in a fresh, allow-listed, network-less process (M3 plan Section 2.1).
+"""Run agent-written Python in a persistent, allow-listed, network-less process (M3 plan Section 2.1).
 
-Each call writes the code to ``calls/<n>/code.py`` in the run's sandbox
-directory and runs it with the environment's own Python under macOS
-``sandbox-exec``. The profile denies everything, imports Apple's
-``system.sb`` (the system libraries, devices, and services every process
-needs), and then allows only:
+A run's sandbox holds one **kernel**: a Python process started on the first
+call and kept between calls, so variables, imports, and loaded tensors
+persist, as in a notebook. Each call writes its code to
+``calls/<n>/code.py`` and the kernel executes it in the same namespace. The
+kernel runs the environment's own Python under macOS ``sandbox-exec``. The
+profile denies everything, imports Apple's ``system.sb`` (the system
+libraries, devices, and services every process needs), and then allows only:
 
 * reading and mapping the Python runtime and executing its interpreter:
   the base installation (``sys.base_prefix``) and the environment
@@ -22,26 +24,45 @@ needs), and then allows only:
   resolution needs, and nothing else of them.
 
 Everything else is denied: the rest of the workspace (evaluator storage
-among it), the repository, the user's files, other executables, new
-processes, and the network. The profile is written next to the sandbox
-directory, not inside it. The environment is an allow-list
+and the database among it), the repository, the user's files, other
+executables, new processes, and the network. The profile is written next to
+the sandbox directory, not inside it. The environment is an allow-list
 (``ENVIRONMENT_NAMES``), so no credential reaches the process.
 
 A framework build of Python (python.org's macOS installer) starts its real
 interpreter from a launcher with ``posix_spawn``; the sandbox runs that
 interpreter directly and names the environment's Python in
 ``__PYVENV_LAUNCHER__``, as the launcher would, so no new process is
-needed. A bootstrap sets the CPU-time and file-size limits before the
-agent's code runs, and the server enforces the wall-clock limit by killing
-the process group. Standard output and error are each returned within a
-byte limit and stored in full up to ``STORED_OUTPUT_BYTES``.
+needed.
+
+**Limits.** A call that outlives its wall-clock limit is interrupted
+(``SIGINT``, a ``KeyboardInterrupt`` in the code) and keeps the kernel and
+its variables; a call that does not stop within ``INTERRUPT_GRACE_SECONDS``
+of the interrupt is killed with its process group, and the next call starts
+a new kernel. While a call runs, WSE reads the kernel's physical memory
+footprint every ``MEMORY_POLL_SECONDS`` and kills it above its limit. The
+kernel's CPU time over its whole life is limited (``RLIMIT_CPU``), as is the
+size of any file it writes (``FILE_SIZE_LIMIT``). A crash, an ``os._exit``,
+or a limit ends the kernel; ``sys.exit`` only ends the call. Each result
+says whether the kernel and its variables survived (``state_kept``) and
+whether the call started a new one (``restarted``). Code may start threads,
+which keep running between calls: the limits bound the kernel, not each
+thread.
+
+**Output.** The kernel's standard output and error are read continuously;
+each call takes what it wrote up to a marker the kernel prints when the
+call ends, so output that a thread prints later belongs to the next call.
+Each stream is returned to the agent within a byte limit (``shorten``: its
+start and end around a marker) and stored, up to its first
+``STORED_OUTPUT_BYTES`` and last ``TAIL_BYTES``, in ``calls/<n>/``.
 
 ``outputs/`` is emptied before each call, so a call's outputs are the files
-it wrote there; ``work/`` keeps files between calls. Only regular files with
-a single link count as outputs. The server never follows a symbolic link or
-a hard link that the sandboxed code made: either could point at a file the
-sandbox itself cannot read. Each call keeps a copy of its output files of at
-most ``KEPT_OUTPUT_BYTES`` in ``calls/<n>/outputs/``, for the record.
+it wrote there; ``work/`` keeps files between calls. Only regular files
+with a single link count as outputs. The server never follows a symbolic
+link or a hard link that the sandboxed code made: either could point at a
+file the sandbox itself cannot read. Each call keeps a copy of its output
+files of at most ``KEPT_OUTPUT_BYTES`` in ``calls/<n>/outputs/``, for the
+record.
 
 The isolation is offered only on macOS with ``/usr/bin/sandbox-exec``, and
 only after a self-check confirms that an allowed read works and a read
@@ -50,12 +71,16 @@ outside the allow-list fails (``available``). Elsewhere it fails closed.
 
 from __future__ import annotations
 
+import atexit
+import ctypes
 import functools
 import hashlib
 import importlib.metadata
 import json
 import os
+import queue
 import re
+import secrets
 import shutil
 import signal
 import site
@@ -67,33 +92,100 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 from wse.schemas import ErrorCode, WSEError
 
 SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
-STORED_OUTPUT_BYTES = 1 << 20
-TAIL_BYTES = 64 * 1024
-FILE_SIZE_LIMIT = 1 << 30
+STORED_OUTPUT_BYTES = 1 << 20  # the start of a call's stream stored in calls/<n>/
+TAIL_BYTES = 512 * 1024  # and its end: at least half of the largest output limit a policy may set
+FILE_SIZE_LIMIT = 4 << 30
+DEFAULT_MEMORY_LIMIT = 16 << 30
+INTERRUPT_GRACE_SECONDS = 5.0
+MEMORY_POLL_SECONDS = 0.25
+OUTPUT_SETTLE_SECONDS = 2.0  # how long the end-of-call markers may trail the kernel's reply
 # The libraries agent code may import; their declared dependencies come with them (``_analysis_entries``).
 ANALYSIS_DISTRIBUTIONS = ("numpy", "torch", "safetensors")
 KEPT_OUTPUT_BYTES = 1 << 20
 ENVIRONMENT_NAMES = ("HOME", "LANG", "MPLCONFIGDIR", "PATH", "PYTHONIOENCODING", "TMPDIR", "XDG_CACHE_HOME",
                      "__PYVENV_LAUNCHER__")
-BOOTSTRAP = """\
+# The kernel: limits, then one call per request line, in one namespace. Requests arrive on their own descriptor and
+# replies leave on another, so the code's standard input is empty and its standard output is its own.
+KERNEL = """\
+import json
+import os
 import resource
-import runpy
+import signal
 import sys
+import time
+import traceback
 
-cpu_seconds, file_bytes, path = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+cpu_seconds, file_bytes, request_fd, reply_fd = (int(value) for value in sys.argv[1:5])
 resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
 resource.setrlimit(resource.RLIMIT_FSIZE, (file_bytes, file_bytes))
-sys.argv = [path]
-runpy.run_path(path, run_name="__main__")
+requests = os.fdopen(request_fd, "r", encoding="utf-8")
+replies = os.fdopen(reply_fd, "w", encoding="utf-8")
+sys.stdin = open(os.devnull, encoding="utf-8")
+sys.argv = ["wse-kernel"]
+running = [False]
+
+
+def interrupt(signum, frame):
+    if running[0]:
+        raise KeyboardInterrupt
+
+
+signal.signal(signal.SIGINT, interrupt)
+
+
+def cpu():
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    return usage.ru_utime + usage.ru_stime
+
+
+def serve():
+    namespace = {"__name__": "__main__", "__builtins__": __builtins__}
+    for line in requests:
+        request = json.loads(line)
+        status, error = "completed", None
+        started_cpu, started = cpu(), time.monotonic()
+        try:
+            with open(request["path"], encoding="utf-8") as handle:
+                code = compile(handle.read(), request["path"], "exec")
+            running[0] = True
+            try:
+                exec(code, namespace)
+            finally:
+                running[0] = False
+        except KeyboardInterrupt as exc:
+            status, error = "interrupted", "KeyboardInterrupt"
+            traceback.print_exception(type(exc), exc, exc.__traceback__.tb_next)
+        except SystemExit as exc:
+            status, error = "error", "SystemExit: " + repr(exc.code)
+        except BaseException as exc:
+            status, error = "error", (type(exc).__name__ + ": " + str(exc))[:500]
+            traceback.print_exception(type(exc), exc, exc.__traceback__.tb_next)
+        for stream in (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        sys.stdout, sys.stderr = sys.__stdout__, sys.__stderr__
+        marker = request["marker"].encode()
+        os.write(1, marker)
+        os.write(2, marker)
+        replies.write(json.dumps({"marker": request["marker"], "status": status, "error": error,
+                                  "cpu_seconds": round(cpu() - started_cpu, 3),
+                                  "wall_seconds": round(time.monotonic() - started, 3)}) + "\\n")
+        replies.flush()
+
+
+serve()
 """
 
-__all__ = ["ANALYSIS_DISTRIBUTIONS", "ENVIRONMENT_NAMES", "KEPT_OUTPUT_BYTES", "OutputFile", "SandboxLayout", "SandboxResult", "available",
-           "profile_text", "read_output", "run_python"]
+__all__ = ["ANALYSIS_DISTRIBUTIONS", "DEFAULT_MEMORY_LIMIT", "ENVIRONMENT_NAMES", "KEPT_OUTPUT_BYTES", "Kernel",
+           "OutputFile", "SandboxLayout", "SandboxResult", "available", "close_kernels", "footprint", "kernel_for",
+           "profile_text", "read_output", "run_python", "shorten"]
 
 
 @dataclass(frozen=True)
@@ -147,21 +239,27 @@ class OutputFile:
 
 @dataclass(frozen=True)
 class SandboxResult:
-    """One call: how it ended, what it cost, its bounded output, and the files it left in ``outputs/``.
+    """One call: how it ended, what it cost, its bounded output, the files it left in ``outputs/``, and its kernel.
 
-    ``ending`` is ``exited`` (see ``exit_code``), ``timed_out`` (the
-    wall-clock limit), ``cpu_limit``, ``file_size_limit``, or ``signal``
-    (see ``signal``). ``stdout`` and ``stderr`` are bounded for the agent;
-    ``calls/<call>/`` stores them in full up to ``STORED_OUTPUT_BYTES``.
+    ``ending`` is ``completed``; ``error`` (the code raised; ``error`` names
+    the exception and ``stderr`` holds its traceback); ``timed_out`` (the
+    wall-clock limit; ``state_kept`` says whether the interrupt sufficed);
+    ``memory_limit``; ``cpu_limit`` (the kernel's lifetime CPU time);
+    ``file_size_limit``; or ``crashed`` (the kernel died: see ``exit_code``
+    and ``signal``). ``stdout`` and ``stderr`` are bounded for the agent;
+    ``calls/<call>/`` stores them (``STORED_OUTPUT_BYTES`` and ``TAIL_BYTES``).
+    ``session`` counts the kernels this sandbox started, and ``session_call``
+    the calls of this kernel, this one included.
     """
 
     call: int
     ending: str
     exit_code: int | None
     signal: str | None
+    error: str | None
     wall_seconds: float
-    cpu_seconds: float
-    max_rss_bytes: int
+    cpu_seconds: float | None
+    peak_memory_bytes: int | None
     stdout: str
     stderr: str
     stdout_bytes: int
@@ -171,6 +269,10 @@ class SandboxResult:
     outputs: tuple[OutputFile, ...]
     refused_outputs: tuple[str, ...]
     code_sha256: str
+    session: int
+    session_call: int
+    restarted: bool
+    state_kept: bool
 
 
 @dataclass(frozen=True)
@@ -316,50 +418,148 @@ def _environment(layout: SandboxLayout, runtime: _Runtime) -> dict[str, str]:
     return environment
 
 
-class _Capture:
-    """Read a stream to its end, keeping its head and tail and counting every byte."""
+class _Stream:
+    """One output stream of a kernel, read continuously; each call takes what was written up to its marker."""
 
     def __init__(self, stream: IO[bytes]) -> None:
-        self.head = bytearray()
-        self.tail = bytearray()
-        self.total = 0
-        self._thread = threading.Thread(target=self._read, args=(stream,), daemon=True)
+        self._condition = threading.Condition()
+        self._marker: bytes | None = None
+        self._found = False
+        self._closed = False
+        self._head = bytearray()
+        self._tail = bytearray()
+        self._total = 0
+        self._recent = b""
+        self._spill = bytearray()  # written outside a call: it opens the next call's output
+        self._thread = threading.Thread(target=self._read, args=(stream.fileno(),), daemon=True)
         self._thread.start()
 
-    def _read(self, stream: IO[bytes]) -> None:
+    def _read(self, descriptor: int) -> None:
         try:
-            while chunk := stream.read(65536):
-                self.total += len(chunk)
-                room = STORED_OUTPUT_BYTES - len(self.head)
-                if room > 0:
-                    self.head += chunk[:room]
-                    chunk = chunk[room:]
-                if chunk:
-                    self.tail += chunk
-                    del self.tail[:-TAIL_BYTES]
-        except (OSError, ValueError):
+            while chunk := os.read(descriptor, 65536):
+                with self._condition:
+                    self._feed(chunk)
+                    self._condition.notify_all()
+        except OSError:
             pass
+        with self._condition:
+            self._closed = True
+            self._condition.notify_all()
+
+    def _append(self, data: bytes) -> None:
+        self._total += len(data)
+        room = STORED_OUTPUT_BYTES - len(self._head)
+        if room > 0:
+            self._head += data[:room]
+            data = data[room:]
+        if data:
+            self._tail += data
+            del self._tail[:-TAIL_BYTES]
+
+    def _drop_last(self, count: int) -> None:
+        self._total -= count
+        taken = min(count, len(self._tail))
+        if taken:
+            del self._tail[len(self._tail) - taken:]
+        if count > taken:
+            del self._head[len(self._head) - (count - taken):]
+
+    def _feed(self, data: bytes) -> None:
+        if self._marker is None or self._found:
+            self._spill += data
+            del self._spill[:-TAIL_BYTES]
+            return
+        window = self._recent + data
+        index = window.find(self._marker)
+        if index < 0:
+            self._append(data)
+            self._recent = window[-(len(self._marker) - 1):]
+            return
+        start = index - len(self._recent)  # where the marker starts in ``data``; before it when negative
+        if start >= 0:
+            self._append(data[:start])
+        else:
+            self._drop_last(-start)
+        self._spill += window[index + len(self._marker):]
+        self._found = True
+
+    def begin(self, marker: bytes) -> None:
+        """Start a call whose output ends at ``marker``; output written between calls opens it."""
+        with self._condition:
+            self._marker, self._found = marker, False
+            self._head, self._tail, self._total, self._recent = bytearray(), bytearray(), 0, b""
+            spill, self._spill = bytes(self._spill), bytearray()
+            if spill:
+                self._feed(spill)
+
+    def finish(self, timeout: float) -> tuple[bytes, int]:
+        """The call's stored bytes and its length, once its marker arrived, the stream closed, or ``timeout``."""
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while not (self._found or self._closed):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                self._condition.wait(left)
+            if self._total <= len(self._head):
+                stored = bytes(self._head)
+            else:
+                gap = self._total - len(self._head) - len(self._tail)
+                middle = f"\n[... {gap} bytes not stored ...]\n".encode() if gap > 0 else b""
+                stored = bytes(self._head) + middle + bytes(self._tail)
+            total = self._total
+            self._marker = None
+            return stored, total
 
     def join(self, timeout: float) -> None:
         self._thread.join(timeout)
 
-    def stored(self) -> bytes:
-        if self.total <= len(self.head):
-            return bytes(self.head)
-        return bytes(self.head) + f"\n[... {self.total - len(self.head) - len(self.tail)} bytes not stored ...]\n".encode() \
-            + bytes(self.tail)
 
-    def bounded(self, limit: int) -> tuple[str, bool]:
-        """At most ``limit`` UTF-8 bytes for the agent: all of it, or its start and its end around a marker."""
-        if self.total <= limit:
-            return bytes(self.head).decode("utf-8", errors="replace"), False
-        marker = f"\n[... {self.total} bytes in all; the middle is not shown ...]\n"
-        budget = max(0, limit - len(marker.encode()))
-        first = bytes(self.head[: budget // 2]).decode("utf-8", errors="ignore")
-        end = bytes(self.head) + bytes(self.tail) if self.total > len(self.head) else bytes(self.head)
-        last_bytes = budget - len(first.encode())
-        last = end[len(end) - last_bytes:].decode("utf-8", errors="ignore") if last_bytes > 0 else ""
-        return first + marker + last, True
+def shorten(stored: bytes, total: int, limit: int) -> tuple[str, bool]:
+    """A stream of ``total`` bytes, stored as ``stored``, in at most ``limit`` UTF-8 bytes, and whether it was cut.
+
+    All of it when it fits; otherwise its start and its end around a marker
+    that gives the stream's length. Stored bytes of a long stream carry their
+    own marker where bytes were not kept.
+    """
+    if total <= limit and len(stored) == total:
+        return stored.decode("utf-8", errors="replace"), False
+    marker = f"\n[... {total} bytes in all; the middle is not shown ...]\n"
+    budget = max(0, limit - len(marker.encode()))
+    first = stored[: budget // 2].decode("utf-8", errors="ignore")
+    last_bytes = budget - len(first.encode())
+    last = stored[len(stored) - last_bytes:].decode("utf-8", errors="ignore") if last_bytes > 0 else ""
+    return first + marker + last, True
+
+
+class _RusageInfo(ctypes.Structure):
+    """``struct rusage_info_v0`` of macOS's ``<sys/resource.h>``, up to the fields WSE reads."""
+
+    _fields_ = [("ri_uuid", ctypes.c_uint8 * 16), ("ri_user_time", ctypes.c_uint64),
+                ("ri_system_time", ctypes.c_uint64), ("ri_pkg_idle_wkups", ctypes.c_uint64),
+                ("ri_interrupt_wkups", ctypes.c_uint64), ("ri_pageins", ctypes.c_uint64),
+                ("ri_wired_size", ctypes.c_uint64), ("ri_resident_size", ctypes.c_uint64),
+                ("ri_phys_footprint", ctypes.c_uint64), ("ri_proc_start_abstime", ctypes.c_uint64),
+                ("ri_proc_exit_abstime", ctypes.c_uint64)]
+
+
+@functools.cache
+def _proc_pid_rusage() -> Any:
+    function = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True).proc_pid_rusage
+    function.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    function.restype = ctypes.c_int
+    return function
+
+
+def footprint(pid: int) -> int | None:
+    """The physical memory footprint of process ``pid`` in bytes (macOS), or ``None`` when it cannot be read."""
+    try:
+        info = _RusageInfo()
+        if _proc_pid_rusage()(pid, 0, ctypes.byref(info)) != 0:
+            return None
+        return int(info.ri_phys_footprint)
+    except (OSError, AttributeError):
+        return None
 
 
 def _sha256_file(path: Path) -> str:
@@ -446,18 +646,251 @@ def _new_call(layout: SandboxLayout) -> tuple[int, Path]:
             number += 1
 
 
-def _ending(status: int, timed_out: bool) -> tuple[str, int | None, str | None]:
-    if timed_out:
-        return "timed_out", None, "SIGKILL"
-    if os.WIFEXITED(status):
-        return "exited", os.WEXITSTATUS(status), None
-    number = os.WTERMSIG(status)
+def _death(returncode: int | None) -> tuple[str, int | None, str | None]:
+    """The ending of a kernel that died with ``returncode`` (negative: the signal that ended it)."""
+    if returncode is None:
+        return "crashed", None, None
+    if returncode >= 0:
+        return "crashed", returncode, None
+    number = -returncode
     name = signal.Signals(number).name if number in signal.Signals._value2member_map_ else str(number)
     if number == signal.SIGXCPU:
         return "cpu_limit", None, name
     if number == signal.SIGXFSZ:
         return "file_size_limit", None, name
-    return "signal", None, name
+    return "crashed", None, name
+
+
+class Kernel:
+    """The persistent sandboxed Python process of one sandbox (module docstring); safe to share between threads.
+
+    ``cpu_seconds`` limits the CPU time of each kernel over its life, and
+    ``max_memory_bytes`` its physical footprint while a call runs.
+    """
+
+    def __init__(self, layout: SandboxLayout, *, cpu_seconds: int, max_memory_bytes: int | None = None) -> None:
+        if cpu_seconds <= 0 or (max_memory_bytes is not None and max_memory_bytes <= 0):
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, "the sandbox limits must be positive")
+        self.layout = layout
+        self.cpu_seconds = int(cpu_seconds)
+        self.max_memory_bytes = int(max_memory_bytes or DEFAULT_MEMORY_LIMIT)
+        self.session = 0
+        self.session_call = 0
+        self._process: subprocess.Popen[bytes] | None = None
+        self._requests: IO[str] | None = None
+        self._replies: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._streams: tuple[_Stream, _Stream] | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def alive(self) -> bool:
+        return self._process is not None and self._process.poll() is None
+
+    @property
+    def pid(self) -> int | None:
+        return None if self._process is None else self._process.pid
+
+    def _start(self) -> None:
+        layout = self.layout.create()
+        runtime = _runtime()
+        layout.profile_path.write_text(profile_text(layout), encoding="utf-8")
+        script = layout.calls / "kernel.py"
+        if not script.exists() or script.read_text(encoding="utf-8") != KERNEL:
+            script.write_text(KERNEL, encoding="utf-8")
+        request_read, request_write = os.pipe()
+        reply_read, reply_write = os.pipe()
+        command = [str(SANDBOX_EXEC), "-f", str(layout.profile_path), str(runtime.executable), "-I", "-B",
+                   str(script), str(self.cpu_seconds), str(FILE_SIZE_LIMIT), str(request_read), str(reply_write)]
+        try:
+            process = subprocess.Popen(command, cwd=layout.root, env=_environment(layout, runtime),
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       pass_fds=(request_read, reply_write), start_new_session=True)
+        except BaseException:
+            for descriptor in (request_read, request_write, reply_read, reply_write):
+                os.close(descriptor)
+            raise
+        os.close(request_read)
+        os.close(reply_write)
+        assert process.stdout is not None and process.stderr is not None
+        replies: queue.Queue[dict[str, Any] | None] = queue.Queue()
+
+        def read_replies() -> None:
+            with os.fdopen(reply_read, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        replies.put(json.loads(line))
+                    except ValueError:
+                        continue
+            replies.put(None)
+
+        threading.Thread(target=read_replies, daemon=True).start()
+        self._process, self._replies = process, replies
+        self._requests = os.fdopen(request_write, "w", encoding="utf-8")
+        self._streams = (_Stream(process.stdout), _Stream(process.stderr))
+        self.session += 1
+        self.session_call = 0
+
+    def _kill(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:  # pragma: no cover - SIGKILL does not fail
+            pass
+
+    def _release(self) -> None:
+        """Close the pipes of a kernel that has ended."""
+        if self._requests is not None:
+            try:
+                self._requests.close()
+            except OSError:
+                pass
+        if self._streams is not None:
+            for stream in self._streams:
+                stream.join(1.0)
+        if self._process is not None:
+            for pipe in (self._process.stdout, self._process.stderr):
+                if pipe is not None:
+                    pipe.close()
+        self._process, self._requests, self._streams = None, None, None
+
+    def close(self) -> None:
+        """End the kernel; its variables are lost."""
+        with self._lock:
+            self._kill()
+            self._release()
+
+    def run(self, code: str, call: int, directory: Path, *, wall_seconds: float, max_output_bytes: int,
+            restart: bool = False) -> tuple[SandboxResult, bytes, bytes]:
+        """Run ``code`` as call ``call`` (its record is ``directory``); return the result and the stored streams."""
+        if wall_seconds <= 0 or max_output_bytes <= 0:
+            raise WSEError(ErrorCode.INVALID_ARGUMENT, "the sandbox limits must be positive")
+        with self._lock:
+            restarted = False
+            if restart and self._process is not None:
+                self._kill()
+            if not self.alive:
+                restarted = self.session > 0
+                self._release()
+                self._start()
+            assert self._process is not None and self._requests is not None and self._streams is not None
+            process, streams = self._process, self._streams
+            self.session_call += 1
+            code_path = directory / "code.py"
+            code_path.write_text(code, encoding="utf-8")
+            marker = f"\n<<wse end of call {call} {secrets.token_hex(12)}>>\n"
+            for stream in streams:
+                stream.begin(marker.encode())
+            peak = footprint(process.pid)
+            started = time.monotonic()
+            reply: dict[str, Any] | None = None
+            ending, killed = None, None
+            try:
+                self._requests.write(json.dumps({"path": str(code_path), "marker": marker}) + "\n")
+                self._requests.flush()
+            except OSError:
+                killed = "crashed"
+            interrupted = None
+            deadline = started + wall_seconds
+            while killed is None:
+                now = time.monotonic()
+                limit = deadline if interrupted is None else interrupted + INTERRUPT_GRACE_SECONDS
+                try:
+                    item = self._replies.get(timeout=max(0.0, min(MEMORY_POLL_SECONDS, limit - now)))
+                except queue.Empty:
+                    item = {}
+                if item is None:  # the reply pipe closed: the kernel ended
+                    killed = "crashed"
+                    break
+                if item:
+                    if item.get("marker") == marker:
+                        reply = item
+                        break
+                    continue  # a line that answers no request of this call
+                used = footprint(process.pid)
+                if used is not None:
+                    peak = max(peak or 0, used)
+                    if used > self.max_memory_bytes:
+                        self._kill()
+                        killed = "memory_limit"
+                        break
+                now = time.monotonic()
+                if interrupted is None and now >= deadline:
+                    try:
+                        os.kill(process.pid, signal.SIGINT)
+                    except ProcessLookupError:
+                        pass
+                    interrupted = now
+                elif interrupted is not None and now >= interrupted + INTERRUPT_GRACE_SECONDS:
+                    self._kill()
+                    killed = "timed_out"
+            wall = time.monotonic() - started
+            exit_code = signal_name = None
+            if reply is not None:
+                if interrupted is not None and reply.get("status") == "interrupted":
+                    ending = "timed_out"
+                else:
+                    ending = {"completed": "completed", "error": "error", "interrupted": "error"}.get(
+                        str(reply.get("status")), "error")
+            elif killed == "crashed":
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:  # pragma: no cover - a kernel that closed its reply pipe and lives
+                    self._kill()
+                ending, exit_code, signal_name = _death(process.returncode)
+            else:
+                ending, signal_name = killed, "SIGKILL"
+            kept = reply is not None and self.alive
+            settle = OUTPUT_SETTLE_SECONDS if kept else 0.5
+            (stdout, stdout_total), (stderr, stderr_total) = (stream.finish(settle) for stream in streams)
+            if not kept:
+                self._kill()
+                self._release()
+            result = SandboxResult(
+                call=call, ending=ending, exit_code=exit_code, signal=signal_name,
+                error=None if reply is None else reply.get("error"), wall_seconds=round(wall, 3),
+                cpu_seconds=None if reply is None else reply.get("cpu_seconds"), peak_memory_bytes=peak,
+                stdout="", stderr="", stdout_bytes=stdout_total, stderr_bytes=stderr_total,
+                stdout_truncated=False, stderr_truncated=False, outputs=(), refused_outputs=(),
+                code_sha256="sha256:" + hashlib.sha256(code.encode("utf-8")).hexdigest(),
+                session=self.session, session_call=self.session_call, restarted=restarted, state_kept=kept)
+            shown_stdout, stdout_cut = shorten(stdout, stdout_total, max_output_bytes)
+            shown_stderr, stderr_cut = shorten(stderr, stderr_total, max_output_bytes)
+            from dataclasses import replace
+
+            return replace(result, stdout=shown_stdout, stderr=shown_stderr, stdout_truncated=stdout_cut,
+                           stderr_truncated=stderr_cut), stdout, stderr
+
+
+_KERNELS: dict[Path, Kernel] = {}
+_KERNELS_LOCK = threading.Lock()
+
+
+def kernel_for(layout: SandboxLayout, *, cpu_seconds: int, max_memory_bytes: int | None = None) -> Kernel:
+    """The kernel of ``layout`` in this process, created on first use with these limits."""
+    with _KERNELS_LOCK:
+        kernel = _KERNELS.get(layout.root)
+        if kernel is None:
+            kernel = _KERNELS[layout.root] = Kernel(layout, cpu_seconds=cpu_seconds,
+                                                    max_memory_bytes=max_memory_bytes)
+        return kernel
+
+
+def close_kernels() -> None:
+    """End every kernel this process started (at exit, and between tests)."""
+    with _KERNELS_LOCK:
+        kernels = list(_KERNELS.values())
+        _KERNELS.clear()
+    for kernel in kernels:
+        kernel.close()
+
+
+atexit.register(close_kernels)
 
 
 @functools.cache
@@ -477,81 +910,45 @@ def available() -> tuple[bool, str]:
                 "    print('leaked')\n"
                 "except OSError:\n"
                 "    print(open('inputs/allowed.txt').read())\n")
+        kernel = Kernel(layout, cpu_seconds=60)
         try:
-            result = _run(layout, code, wall_seconds=60.0, cpu_seconds=60, max_output_bytes=1024)
+            number, directory = _new_call(layout)
+            result, _, _ = kernel.run(code, number, directory, wall_seconds=60.0, max_output_bytes=1024)
         except OSError as exc:
             return False, f"the sandbox self-check could not start: {exc}"
-    if (result.ending, result.exit_code, result.stdout.strip()) != ("exited", 0, "allowed"):
-        return False, (f"the sandbox self-check failed: ended {result.ending}, exit code {result.exit_code}, "
-                       f"output {result.stdout.strip()[:80]!r}, errors {result.stderr.strip()[-200:]!r}")
+        finally:
+            kernel.close()
+    if (result.ending, result.stdout.strip()) != ("completed", "allowed"):
+        return False, (f"the sandbox self-check failed: ended {result.ending}, output {result.stdout.strip()[:80]!r}, "
+                       f"errors {result.stderr.strip()[-200:]!r}")
     return True, "sandbox-exec with an allow-list, checked"
 
 
-def run_python(layout: SandboxLayout, code: str, *, wall_seconds: float, cpu_seconds: int,
-               max_output_bytes: int) -> SandboxResult:
-    """Run ``code`` once in the sandbox of ``layout`` (module docstring); raise if the sandbox is unavailable."""
+def run_python(layout: SandboxLayout, code: str, *, wall_seconds: float, cpu_seconds: int, max_output_bytes: int,
+               max_memory_bytes: int | None = None, restart: bool = False) -> SandboxResult:
+    """Run ``code`` as the next call of ``layout``'s kernel (module docstring); raise if the sandbox is unavailable.
+
+    ``restart`` ends the kernel first, so the code runs in a new one.
+    ``cpu_seconds`` and ``max_memory_bytes`` apply when this call starts the
+    sandbox's first kernel.
+    """
     ok, reason = available()
     if not ok:
         raise WSEError(ErrorCode.UNSUPPORTED_CAPABILITY, f"code execution is not available here: {reason}",
                        details={"reason": reason})
-    return _run(layout, code, wall_seconds=wall_seconds, cpu_seconds=cpu_seconds, max_output_bytes=max_output_bytes)
-
-
-def _run(layout: SandboxLayout, code: str, *, wall_seconds: float, cpu_seconds: int,
-         max_output_bytes: int) -> SandboxResult:
-    if wall_seconds <= 0 or cpu_seconds <= 0 or max_output_bytes <= 0:
-        raise WSEError(ErrorCode.INVALID_ARGUMENT, "the sandbox limits must be positive")
     layout.create()
-    _empty(layout.outputs)
-    runtime = _runtime()
-    layout.profile_path.write_text(profile_text(layout), encoding="utf-8")
-    bootstrap = layout.calls / "bootstrap.py"
-    if not bootstrap.exists() or bootstrap.read_text(encoding="utf-8") != BOOTSTRAP:
-        bootstrap.write_text(BOOTSTRAP, encoding="utf-8")
+    kernel = kernel_for(layout, cpu_seconds=cpu_seconds, max_memory_bytes=max_memory_bytes)
     number, directory = _new_call(layout)
-    code_path = directory / "code.py"
-    code_path.write_text(code, encoding="utf-8")
-    command = [str(SANDBOX_EXEC), "-f", str(layout.profile_path), str(runtime.executable), "-I", "-B",
-               str(bootstrap), str(int(cpu_seconds)), str(FILE_SIZE_LIMIT), str(code_path)]
-    started = time.monotonic()
-    process = subprocess.Popen(command, cwd=layout.root, env=_environment(layout, runtime), stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-    assert process.stdout is not None and process.stderr is not None
-    out, err = _Capture(process.stdout), _Capture(process.stderr)
-    timed_out = False
-    deadline = started + wall_seconds
-    while True:
-        pid, status, usage = os.wait4(process.pid, os.WNOHANG)
-        if pid:
-            break
-        if time.monotonic() >= deadline:
-            timed_out = True
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            pid, status, usage = os.wait4(process.pid, 0)
-            break
-        time.sleep(0.02)
-    process.returncode = os.waitstatus_to_exitcode(status)
-    wall = time.monotonic() - started
-    for capture in (out, err):
-        capture.join(5.0)
-    for stream in (process.stdout, process.stderr):
-        stream.close()
-    ending, exit_code, signal_name = _ending(status, timed_out)
-    stdout, stdout_cut = out.bounded(max_output_bytes)
-    stderr, stderr_cut = err.bounded(max_output_bytes)
-    (directory / "stdout.txt").write_bytes(out.stored())
-    (directory / "stderr.txt").write_bytes(err.stored())
+    _empty(layout.outputs)
+    result, stdout, stderr = kernel.run(code, number, directory, wall_seconds=wall_seconds,
+                                        max_output_bytes=max_output_bytes, restart=restart)
+    (directory / "stdout.txt").write_bytes(stdout)
+    (directory / "stderr.txt").write_bytes(stderr)
     outputs, refused = list_outputs(layout)
     _keep(layout, directory, outputs)
-    result = SandboxResult(
-        call=number, ending=ending, exit_code=exit_code, signal=signal_name, wall_seconds=round(wall, 3),
-        cpu_seconds=round(usage.ru_utime + usage.ru_stime, 3), max_rss_bytes=int(usage.ru_maxrss),
-        stdout=stdout, stderr=stderr, stdout_bytes=out.total, stderr_bytes=err.total, stdout_truncated=stdout_cut,
-        stderr_truncated=stderr_cut, outputs=outputs, refused_outputs=refused,
-        code_sha256="sha256:" + hashlib.sha256(code.encode("utf-8")).hexdigest())
+    from dataclasses import replace
+
+    result = replace(result, outputs=outputs, refused_outputs=refused)
     summary = {key: value for key, value in asdict(result).items() if key not in ("stdout", "stderr")}
     (directory / "result.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return result

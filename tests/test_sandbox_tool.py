@@ -51,7 +51,7 @@ def _run(workspace, run, code: str, key: str = "c1"):
 def test_run_python_returns_bounded_output_and_its_output_files(workspace, run) -> None:
     code = "import numpy as np\nprint('hello')\nnp.save('outputs/v.npy', np.arange(4, dtype=np.float32))\n"
     result = _run(workspace, run, code)
-    assert (result.ending, result.exit_code, result.stdout) == ("exited", 0, "hello\n")
+    assert (result.ending, result.exit_code, result.stdout) == ("completed", None, "hello\n")
     [output] = result.outputs
     assert (output.path, output.shape, output.dtype) == ("v.npy", [4], "float32")
     assert output.pointer.startswith("wse://analyses/") and output.pointer.endswith("#/values")
@@ -68,7 +68,7 @@ def test_run_python_reads_the_base_checkpoint_weights(workspace, run) -> None:
             "weights = load_file('inputs/weights/base.safetensors')\n"
             "print(json.dumps({name: weights[name].tolist() for name in sorted(weights)}))\n")
     result = _run(workspace, run, code)
-    assert result.exit_code == 0, result.stderr
+    assert result.ending == "completed", result.stderr
     with Engine(workspace) as engine:
         handle = engine.open_checkpoint(run[2])
         expected = {name: handle.tensor(name).tolist() for name in sorted(handle.tensor_names())}
@@ -104,7 +104,8 @@ def test_run_python_is_recorded_in_the_audit_log(workspace, run) -> None:
         events = [event for event in engine.audit_log(run[1]) if event["event_type"] == "sandbox.ran"]
     [event] = events
     payload = event["payload"]
-    assert (payload["call"], payload["code_sha256"], payload["ending"]) == (result.call, result.code_sha256, "exited")
+    assert (payload["call"], payload["code_sha256"], payload["ending"]) == (result.call, result.code_sha256,
+                                                                          "completed")
     assert payload["outputs"] == [{"path": "a.txt", "size": 1, "sha256": result.outputs[0].sha256}]
 
 
@@ -140,6 +141,29 @@ def test_only_finite_arrays_of_one_or_two_dimensions_get_a_reference(workspace, 
     assert stored["values"] == [[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]] and stored["shape"] == [2, 3]
 
 
+def test_a_large_result_is_shortened_to_fit_its_response(workspace, run) -> None:
+    # Quotes and backslashes are escaped once in the JSON copy and twice in the text mirror.
+    from wse.policy import builtin_experiment_policies, response_size
+    from wse.sandbox_runs import layout_for
+
+    limit = builtin_experiment_policies()[SMALL_MODEL_POLICY_ID].operations.limits.max_result_json_bytes
+    result = _run(workspace, run, "import sys\nprint(chr(34) * 20000)\nsys.stderr.write(chr(92) * 20000)\n")
+    assert result.stdout_truncated and result.stderr_truncated
+    assert response_size(result.model_dump(mode="json")) <= 2 * limit
+    assert result.stdout.startswith(chr(34)) and "20001 bytes in all; the middle is not shown" in result.stdout
+    assert (result.stdout_bytes, result.stderr_bytes) == (20001, 20000)
+    with Engine(workspace) as engine:
+        directory = layout_for(engine.experiments, run[0]).calls / str(result.call)
+    assert (directory / "stdout.txt").read_bytes() == b'"' * 20000 + b"\n"
+
+
+def test_at_most_32_output_files_are_listed_and_stored(workspace, run) -> None:
+    code = "import numpy as np\nfor i in range(40):\n    np.save(f'outputs/v{i:02d}.npy', np.arange(3.0) + i)\n"
+    result = _run(workspace, run, code)
+    assert [o.path for o in result.outputs] == [f"v{i:02d}.npy" for i in range(32)]
+    assert result.outputs_not_listed == 8 and all(o.pointer for o in result.outputs)
+
+
 # ---------------------------------------------------------------------------
 # A language model: passes, probes, protected tensors, and a direction by reference
 # ---------------------------------------------------------------------------
@@ -171,7 +195,7 @@ def test_passes_probes_and_unprotected_weights_reach_the_inputs(lm, monkeypatch)
         result = bound.run_python(eid, code, "inputs")
         document = bound.read_analysis_result(job.result["result_uri"])
         texts = [bound.read_analysis_result(sample.output_uri)["text"] for sample in samples]
-    assert result.exit_code == 0, result.stderr
+    assert result.ending == "completed", result.stderr
     seen = json.loads(result.stdout)
     assert "model.embed_tokens.weight" not in seen["names"] and "lm_head.weight" not in seen["names"]
     assert f"{DOWN0}.weight" in seen["names"]

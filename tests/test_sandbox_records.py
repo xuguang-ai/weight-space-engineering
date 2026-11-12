@@ -79,7 +79,7 @@ def test_the_export_holds_every_sandbox_call_and_still_replays(workspace, signed
             assert (out / call["code.py"]).read_text(encoding="utf-8") == code
     assert (out / record["calls"][0]["stdout.txt"]).read_text(encoding="utf-8") == first.stdout
     summary = json.loads((out / record["calls"][0]["result.json"]).read_text(encoding="utf-8"))
-    assert summary["code_sha256"] == first.code_sha256 and summary["ending"] == "exited"
+    assert summary["code_sha256"] == first.code_sha256 and summary["ending"] == "completed"
 
     # The stored array an edit may name, byte for byte: its file hashes to the digest in its URI.
     [array] = record["arrays"]
@@ -140,7 +140,7 @@ def test_qwen_sandbox_inputs_hold_no_published_edit_or_final_item(lm, monkeypatc
     run_id, eid, report = _pass(lm, monkeypatch, policy=_sandbox_generation_policy("loop_sandbox_leaks"))
     with Engine(lm.workspace, run_id=run_id) as bound:
         result = bound.run_python(eid, "import os\nprint(sorted(os.listdir('inputs')))\n", "list")
-    assert result.exit_code == 0, result.stderr
+    assert result.ending == "completed", result.stderr
     with Engine(lm.workspace) as engine:
         layout = layout_for(engine.experiments, run_id)
         base_hash = engine.load_manifest(lm.base).weights_hash

@@ -205,6 +205,8 @@ EvalConfigArg = Annotated[Any, WithJsonSchema({**EVAL_CONFIG_SCHEMA, "descriptio
 CodeArg = Annotated[str, Field(description="Python to run in this run's sandbox (NumPy, PyTorch on the CPU, "
                                            "safetensors): it reads inputs/ and writes work/ and outputs/; no network, "
                                            "no other files, no new processes.")]
+RestartArg = Annotated[bool, Field(description="True ends the kernel first, so the code runs in a new one with "
+                                               "no earlier variables.")]
 WaitArg = Annotated[float, Field(json_schema_extra={"minimum": 0, "maximum": MAX_WAIT_SECONDS},
                                  description="Seconds (0-10) to hold the call until the job is terminal.")]
 CursorArg = Annotated[str | None, Field(json_schema_extra={"maxLength": MAX_ECHO_CHARACTERS},
@@ -555,10 +557,12 @@ class WSEMCPServer:
         return _respond(self._call(run))
 
     def wse_run_python(self, *, experiment_id: ExperimentIdArg = None, code: CodeArg, idempotency_key: KeyArg,
-                       ) -> Annotated[CallToolResult, ToolResponse[SandboxRun]]:
-        """Run your own Python in this run's sandbox when the policy grants it; each call is a fresh process.
+                       restart: RestartArg = False) -> Annotated[CallToolResult, ToolResponse[SandboxRun]]:
+        """Run your own Python in this run's persistent kernel when the policy grants it.
 
-        The working directory holds inputs/ (read only: weights/base.safetensors with the base checkpoint's
+        Variables, imports, and loaded tensors stay between calls, as in a notebook; restart=true starts a new
+        kernel. A call past its time limit is interrupted (KeyboardInterrupt) and keeps the kernel; one that does not
+        stop, or exceeds the memory limit, ends the kernel (state_kept is false). The working directory holds inputs/ (read only: weights/base.safetensors with the base checkpoint's
         permitted tensors in their stored dtype, which safetensors.torch.load_file reads; passes/<report_id>.jsonl
         with every output of your development generation passes; probes/<job_id>.npz and .json with your probe
         results; manifest.json), work/ (your files, kept between calls), and outputs/ (emptied before each call).
@@ -570,12 +574,13 @@ class WSEMCPServer:
         """
         def run() -> ToolResponse[SandboxRun]:
             eid = self._experiment_id(experiment_id)
-            result = self.engine.run_python(eid, code, idempotency_key)
+            result = self.engine.run_python(eid, code, idempotency_key, restart)
             pointers = [o.pointer for o in result.outputs if o.pointer]
+            kernel = ("a new kernel" if result.restarted or result.session_call == 1 else "the kernel") + (
+                "" if result.state_kept else ", which then ended")
             return ToolResponse[SandboxRun](
-                summary=f"call {result.call} {result.ending}" + ("" if result.exit_code is None else
-                                                                 f" with exit code {result.exit_code}")
-                        + f" in {result.wall_seconds:.1f} s; {len(result.outputs)} output files",
+                summary=f"call {result.call} {result.ending}" + (f" ({result.error})" if result.error else "")
+                        + f" in {result.wall_seconds:.1f} s in {kernel}; {len(result.outputs)} output files",
                 uris=pointers, usage=self._usage(eid, result.usage, SANDBOX_COUNTERS), result=result)
         return _respond(self._call(run))
 

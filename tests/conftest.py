@@ -52,3 +52,12 @@ def hf_snapshots(tmp_path_factory) -> dict[str, Path]:
     import hf_fixtures
 
     return hf_fixtures.build_all(tmp_path_factory.mktemp("hf_snapshots"))
+
+
+@pytest.fixture(autouse=True)
+def _close_sandbox_kernels():
+    """End the sandbox kernels a test started, so no kernel outlives its test (``wse.sandbox``)."""
+    yield
+    from wse import sandbox
+
+    sandbox.close_kernels()

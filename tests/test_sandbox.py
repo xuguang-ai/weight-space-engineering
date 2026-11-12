@@ -1,4 +1,4 @@
-"""The sandbox process: one allow-listed, network-less Python process per call (M3 plan Section 2.1, Task 1).
+"""The sandbox kernel: a persistent, allow-listed, network-less Python process per sandbox (``wse.sandbox``).
 
 The programs run inside the sandbox print only whether an operation was
 allowed, never the content of a file, so a failure of the isolation cannot
@@ -47,7 +47,7 @@ def _status_lines(targets: dict[str, str], operation: str) -> str:
 def test_sandbox_runs_numpy_and_torch_on_the_cpu(layout: SandboxLayout) -> None:
     code = "import numpy, torch\nprint(float(torch.ones(8, 8).matmul(torch.ones(8, 8)).sum()), bool(numpy.__version__))\n"
     result = run_python(layout, code, **LIMITS)
-    assert (result.ending, result.exit_code) == ("exited", 0), result.stderr
+    assert result.ending == "completed", result.stderr
     assert result.stdout.startswith("512.0 True")
 
 
@@ -61,7 +61,7 @@ def test_sandbox_reads_its_inputs_and_writes_only_its_work_and_outputs(layout: S
         + _status_lines({"write inputs": "inputs/x.txt", "write root": "x.txt"}, "open({path}, 'w').write('x')")
     )
     result = run_python(layout, code, **LIMITS)
-    assert (result.ending, result.exit_code) == ("exited", 0), result.stderr
+    assert result.ending == "completed", result.stderr
     assert result.stdout.splitlines() == ["input", "write inputs: denied", "write root: denied"]
     assert (layout.work / "state.txt").read_text() == "s"
     assert [(f.path, f.size) for f in result.outputs] == [("v.npy", (layout.outputs / "v.npy").stat().st_size)]
@@ -78,7 +78,7 @@ def test_sandbox_cannot_read_the_workspace_the_repository_or_a_planted_file(layo
             + _status_lines({"workspace listing": str(workspace), "home listing": str(Path.home())},
                             "os.listdir({path})"))
     result = run_python(layout, code, **LIMITS)
-    assert (result.ending, result.exit_code) == ("exited", 0), result.stderr
+    assert result.ending == "completed", result.stderr
     assert result.stdout.splitlines() == [f"{name}: denied" for name in
                                           [*targets, "workspace listing", "home listing"]]
 
@@ -110,18 +110,56 @@ def test_sandbox_environment_carries_no_credentials(layout: SandboxLayout, monke
 
 
 @needs_sandbox
-def test_wall_clock_limit_kills_the_process_and_records_it(layout: SandboxLayout) -> None:
+def test_a_call_past_its_wall_clock_limit_is_interrupted_and_the_kernel_keeps_its_state(layout: SandboxLayout) -> None:
+    run_python(layout, "kept = 'yes'\n", **LIMITS)
     result = run_python(layout, "import time\ntime.sleep(60)\n", wall_seconds=2.0, cpu_seconds=60,
-                        max_output_bytes=1024)
-    assert result.ending == "timed_out" and result.exit_code is None
-    assert 2.0 <= result.wall_seconds < 15.0
+                        max_output_bytes=4096)
+    assert (result.ending, result.state_kept, result.exit_code) == ("timed_out", True, None)
+    assert 2.0 <= result.wall_seconds < 15.0 and "KeyboardInterrupt" in result.stderr
+    after = run_python(layout, "print(kept)\n", **LIMITS)
+    assert (after.stdout.strip(), after.restarted, after.session) == ("yes", False, 1)
 
 
 @needs_sandbox
-def test_cpu_limit_stops_a_busy_loop(layout: SandboxLayout) -> None:
+def test_a_call_that_ignores_the_interrupt_is_killed_and_the_next_call_starts_a_new_kernel(
+        layout: SandboxLayout) -> None:
+    run_python(layout, "kept = 'yes'\n", **LIMITS)
+    code = "import signal, time\nsignal.signal(signal.SIGINT, signal.SIG_IGN)\nwhile True:\n    time.sleep(0.05)\n"
+    result = run_python(layout, code, wall_seconds=1.0, cpu_seconds=60, max_output_bytes=1024)
+    assert (result.ending, result.state_kept, result.signal) == ("timed_out", False, "SIGKILL")
+    assert result.wall_seconds < 1.0 + sandbox.INTERRUPT_GRACE_SECONDS + 5
+    after = run_python(layout, "print('kept' in globals())\n", **LIMITS)
+    assert (after.stdout.strip(), after.restarted, after.session, after.session_call) == ("False", True, 2, 1)
+
+
+@needs_sandbox
+def test_cpu_limit_ends_the_kernel(layout: SandboxLayout) -> None:
     result = run_python(layout, "while True:\n    pass\n", wall_seconds=60.0, cpu_seconds=1, max_output_bytes=1024)
-    assert result.ending == "cpu_limit"
+    assert (result.ending, result.state_kept) == ("cpu_limit", False)
     assert result.wall_seconds < 30.0
+
+
+@needs_sandbox
+def test_memory_limit_ends_the_kernel(layout: SandboxLayout) -> None:
+    code = "import numpy as np\nblock = np.ones(1 << 27)\nprint(block.sum())\n"  # 1 GiB
+    result = run_python(layout, code, wall_seconds=60.0, cpu_seconds=60, max_output_bytes=1024,
+                        max_memory_bytes=256 << 20)
+    assert (result.ending, result.state_kept, result.signal) == ("memory_limit", False, "SIGKILL")
+    assert result.peak_memory_bytes > 256 << 20
+
+
+@needs_sandbox
+def test_errors_keep_the_kernel_and_crashes_end_it(layout: SandboxLayout) -> None:
+    run_python(layout, "kept = 'yes'\n", **LIMITS)
+    error = run_python(layout, "raise ValueError('boom')\n", **LIMITS)
+    assert (error.ending, error.error, error.state_kept) == ("error", "ValueError: boom", True)
+    assert "ValueError: boom" in error.stderr and "kernel.py" not in error.stderr
+    exit_call = run_python(layout, "import sys\nsys.exit(3)\n", **LIMITS)
+    assert (exit_call.ending, exit_call.error, exit_call.state_kept) == ("error", "SystemExit: 3", True)
+    crash = run_python(layout, "import os\nos._exit(7)\n", **LIMITS)
+    assert (crash.ending, crash.exit_code, crash.state_kept) == ("crashed", 7, False)
+    after = run_python(layout, "print('kept' in globals())\n", **LIMITS)
+    assert (after.stdout.strip(), after.restarted) == ("False", True)
 
 
 @needs_sandbox
@@ -141,7 +179,7 @@ def test_links_in_outputs_are_refused_not_followed(layout: SandboxLayout, tmp_pa
     code = (f"import os\nos.symlink({str(tmp_path / 'planted.txt')!r}, 'outputs/link.txt')\n"
             "open('outputs/plain.txt', 'w').write('p')\n")
     result = run_python(layout, code, **LIMITS)
-    assert (result.ending, result.exit_code) == ("exited", 0), result.stderr
+    assert result.ending == "completed", result.stderr
     assert [f.path for f in result.outputs] == ["plain.txt"]
     assert result.refused_outputs == ("link.txt",)
 
@@ -159,13 +197,28 @@ def test_the_sandbox_cannot_start_another_process(layout: SandboxLayout) -> None
 
 
 @needs_sandbox
-def test_each_call_is_a_fresh_process_and_files_persist(layout: SandboxLayout) -> None:
+def test_variables_and_files_persist_and_restart_starts_a_new_kernel(layout: SandboxLayout) -> None:
     first = run_python(layout, "x = 1\nopen('work/s.txt', 'w').write('kept')\n", **LIMITS)
-    second = run_python(layout, "print(open('work/s.txt').read(), 'x' in globals())\n", **LIMITS)
-    assert (first.call, second.call) == (1, 2)
-    assert second.stdout.strip() == "kept False"
+    second = run_python(layout, "print(open('work/s.txt').read(), x + 1)\n", **LIMITS)
+    assert (first.call, second.call, second.session, second.session_call) == (1, 2, 1, 2)
+    assert second.stdout.strip() == "kept 2"
     assert (layout.calls / "1" / "code.py").read_text() == "x = 1\nopen('work/s.txt', 'w').write('kept')\n"
     assert first.code_sha256 == "sha256:" + hashlib.sha256((layout.calls / "1" / "code.py").read_bytes()).hexdigest()
+    fresh = run_python(layout, "print(open('work/s.txt').read(), 'x' in globals())\n", **LIMITS, restart=True)
+    assert (fresh.stdout.strip(), fresh.restarted, fresh.session) == ("kept False", True, 2)
+
+
+@needs_sandbox
+def test_output_a_thread_writes_after_its_call_belongs_to_the_next_call(layout: SandboxLayout) -> None:
+    import time
+
+    code = ("import threading, time\n"
+            "threading.Thread(target=lambda: (time.sleep(0.5), print('late', flush=True))).start()\n"
+            "print('now')\n")
+    first = run_python(layout, code, **LIMITS)
+    time.sleep(1.5)
+    second = run_python(layout, "print('next')\n", **LIMITS)
+    assert first.stdout == "now\n" and second.stdout == "late\nnext\n"
 
 
 def _metadata_file(name: str) -> Path:
@@ -195,7 +248,7 @@ def test_sandbox_reads_only_the_analysis_libraries_of_its_environment(layout: Sa
             "    except Exception as exc:\n"
             "        print(name, type(exc).__name__)\n")
     result = run_python(layout, code, **LIMITS)
-    assert result.exit_code == 0, result.stderr
+    assert result.ending == "completed", result.stderr
     lines = result.stdout.splitlines()
     assert lines[0] == "denied denied read read"
     assert lines[1].startswith("wse ") and lines[1] != "wse imported"

@@ -328,8 +328,9 @@ def render_instructions(task: TaskDefinition, policy: ExperimentPolicy, *, exper
                      "Its vectors are references (<result_uri>#/sites/<i>/contrast/direction) that wse_analyze and "
                      "wse_preview_patch accept.")
     if sandbox:
-        steps.append("Run your own Python with wse_run_python (NumPy, PyTorch on the CPU, safetensors; each call is a "
-                     "fresh process with a time limit). It reads inputs/weights/base.safetensors (the base "
+        steps.append("Run your own Python with wse_run_python (NumPy, PyTorch on the CPU, safetensors) in a "
+                     "persistent kernel: variables, imports, and loaded tensors stay between calls, each call has a "
+                     "time limit, and restart=true starts a new kernel. It reads inputs/weights/base.safetensors (the base "
                      "checkpoint's permitted tensors in their stored dtype; load them with "
                      "safetensors.torch.load_file), inputs/passes/<report_id>.jsonl (every output of your generation "
                      "passes, with its grade and text), and inputs/probes/<job_id>.npz and .json (your probe "
@@ -435,8 +436,8 @@ class ExperimentExecutor:
             "wse_probe": lambda *, checkpoint_id, texts, sites, idempotency_key, groups=None, top=None,
                 experiment_id=None: e.submit_probe(eid(experiment_id), checkpoint_id, texts, sites, idempotency_key,
                                                    groups=groups, top=top),
-            "wse_run_python": lambda *, code, idempotency_key, experiment_id=None: e.run_python(
-                eid(experiment_id), code, idempotency_key),
+            "wse_run_python": lambda *, code, idempotency_key, experiment_id=None, restart=False: e.run_python(
+                eid(experiment_id), code, idempotency_key, restart),
             "wse_preview_patch": lambda *, patch_spec, idempotency_key, experiment_id=None: e.preview_patch(
                 eid(experiment_id), patch_spec, idempotency_key),
             "wse_apply_patch": lambda *, patch_id, idempotency_key, experiment_id=None: e.apply_patch(
