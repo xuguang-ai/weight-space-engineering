@@ -27,9 +27,9 @@ leaves room for ten. Keep the Mac awake (``caffeinate -is``). Disk: the download
 workspace's copy of the model 1.5 GB; the export adds the selected model and the experiment's record, which holds
 the original model again.
 
-Needs the Codex CLI (``codex`` on PATH, or its path in ``WSE_CODEX_PATH``) and your model provider's key and
-endpoint in ``.env``, copied from ``.env.example``. With your model's name, or your Azure deployment's name, in
-place of ``YOUR_AGENT_MODEL``:
+Needs the Codex CLI (its path in ``WSE_CODEX_PATH``, else ``codex`` on PATH, else OpenAI's VS Code extension's)
+and your model provider's key and endpoint in ``.env``, copied from ``.env.example``. With your model's name, or
+your Azure deployment's name, in place of ``YOUR_AGENT_MODEL``:
 
     caffeinate -is uv run --extra models-hf --env-file .env \\
       python examples/experiment_qwen_loops.py \\

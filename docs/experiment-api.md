@@ -60,7 +60,7 @@ uv sync
 
 Language models need the `models-hf` extra, which `uv run --extra models-hf` installs the first time a command uses it.
 
-The agent is the [Codex CLI](https://github.com/openai/codex), which you install separately. WSE runs the `codex` on your `PATH`, or the executable that the environment variable `WSE_CODEX_PATH` names. Check that `codex --version` runs.
+The agent is the [Codex CLI](https://github.com/openai/codex), which you install separately. WSE runs the binary that the environment variable `WSE_CODEX_PATH` names, else the `codex` on your `PATH`, else the newest one bundled with OpenAI's VS Code extension; on macOS it first checks that the binary's code signature names OpenAI. Check that `codex --version` runs. WSE has been tested with codex-cli 0.167.0-alpha.4.1.
 
 ## Agent credentials
 
@@ -127,7 +127,8 @@ Both scripts take `--model`, `--repo`, and `--revision` for another model or a l
 ## What happens during a run
 
 1. **Baseline.** WSE evaluates the original model on the development problems. This evaluation counts toward `max_evaluations`. When another experiment in the workspace already evaluated the same model on the same development problems, with the same evaluator, settings, sample count, seed, batch size, and device, and without errors, WSE links that report instead of evaluating again; the link records which report it repeats and still counts as one evaluation.
-2. **Agent.** WSE starts Codex (`codex exec`) in the experiment's working directory, with WSE's skill file (`SKILL.md`), which gives it the goal, the run, and its budget, and with the run's WSE tools connected over MCP. The agent inspects the weights, probes activations, writes and runs its own Python, and submits candidates in two ways: as edits by WSE's registered operators, or as tensors its code computed and saved to a `.safetensors` file under `outputs/` or `work/` of its working directory, which `wse_submit_candidate(..., path="outputs/candidate.safetensors")` turns into a candidate after checking every tensor's name, shape, dtype, values, and protection. It asks WSE to evaluate a candidate with `wse_evaluate`, which returns when the evaluation has finished, so a long evaluation costs one tool call instead of repeated polling. WSE records the Codex session, which `codex exec resume` continues.
+2. **Agent.** WSE starts Codex (`codex exec --json`) in the run's working directory, `<workspace>/sandboxes/<run_id>`, with a Codex home of the run's own. Its `config.toml` sends the model's requests through WSE's local proxy, sets the permission profile of the agent's commands ([below](#what-the-agent-can-reach)), and connects the run's WSE tools over MCP (`wse serve`, bound to this run and limited to the tools its policy allows). WSE's skill, `skills/wse/SKILL.md` in that home, describes the tools, analysis in Python, the two ways to submit a candidate, evaluation, the selection rule, and how to stop; the prompt gives the task, the rule, the baseline, the budget, and the run's IDs. The agent inspects the weights, probes activations, runs its own commands and Python, and submits candidates in two ways: as edits by WSE's registered operators, or as tensors its code computed and saved to a `.safetensors` file under `outputs/` or `work/`, which `wse_submit_candidate(..., path="outputs/candidate.safetensors")` turns into a candidate after checking every tensor's name, shape, dtype, values, and protection. It asks WSE to evaluate a candidate with `wse_evaluate`, which returns when the evaluation has finished, so a long evaluation costs one tool call instead of repeated polling: Codex lets one WSE call run as long as the policy's longest operation.
+   The agent stops by replying with a final message whose first line starts with `WSE-STOP:`. When Codex ends its turn without that line while budget remains, or after an error that a new turn can fix, WSE continues the same session with `codex exec resume`, at most twice. The run also ends when a stop condition is met (no evaluation left, for example), at its time limit (`wall_clock_hours`, 12 by default), or at its turn limit (`max_turns`, 400 model requests by default); WSE then stops Codex with SIGINT, then SIGTERM and SIGKILL, and ends every process Codex started. WSE keeps each segment's event log, Codex's session record, and the proxy's request log, and records the agent's tokens (input, cached input, output, and reasoning) per model request.
 3. **Selection and freeze.** The agent does not choose: when it stops, or its budget or time runs out, WSE applies the selection rule to its own development evaluations and freezes the choice.
 4. **Test, on request.** `result.test(path)` evaluates the frozen choice and the original on the test problems.
 
@@ -166,16 +167,19 @@ The values are point estimates. `preserve=["accuracy"]` means that the candidate
 
 ## What the agent can reach
 
-The agent works in a Codex sandbox that WSE configures for the run:
+The agent's commands run under Codex's own sandbox, configured by a permission profile that WSE writes into the run's Codex config (`[permissions.wse]`). The profile lists what commands may read and write; everything else is denied:
 
 | | Access |
 | --- | --- |
-| The experiment's working directory | Read and write |
-| The model's files and the Python analysis libraries | Read only |
-| The test data, WSE's database, and your keys | None |
-| Your model provider | Through the local proxy only |
+| `inputs/` in the run's working directory: the base checkpoint's weights (`weights/base.safetensors`), and the reports and generated outputs of finished development evaluations, refreshed as evaluations finish (with `sandbox="python"`) | Read only |
+| `work/`, `outputs/`, and `tmp/` in the working directory | Read and write |
+| The Python interpreter, and NumPy, PyTorch, and safetensors with the packages they depend on | Read only; `python` imports nothing else, WSE included |
+| The repository, the workspace's database and stored data (test data included), other runs' directories, your home directory, `/tmp`, and Codex's own configuration and sessions | None |
+| The network | None for the agent's commands; Codex reaches your model provider only through WSE's local proxy |
 
-It reaches WSE only through the run's MCP tools, which act on this experiment's model and candidates.
+The agent reaches WSE only through the run's MCP tools, which act on this experiment's model and candidates; the MCP server runs outside the agent's sandbox with an environment of its own. Commands get an environment built from scratch, without keys or the proxy's token, in a non-login shell. Codex loads no `AGENTS.md`, configuration, or skills from the directories around the run or from your `~/.codex`.
+
+These rules were measured with codex-cli 0.167.0-alpha.4.1 on macOS, with the run's profile under `codex sandbox` and with commands that Codex ran in a run: attempts to read the repository's README, source, and test problems, WSE's installed package metadata, the workspace's database and evaluator data, a `.env` file, Codex's config and sessions, `~/.codex`, `~/.cache/huggingface`, `~/.ssh`, the home directory, other runs' directories, `/tmp` and `/private/tmp`, and to reach the internet or a port on this machine, were all denied, while reading `inputs/` and importing the analysis libraries worked ([tests/test_codex_isolation.py](../tests/test_codex_isolation.py)). With `sandbox=None`, `inputs/` stays empty: the agent still has a shell, but no model data to run it on.
 
 ## What is verified, and what is not
 
@@ -188,7 +192,7 @@ It reaches WSE only through the run's MCP tools, which act on this experiment's 
 
 **WSE does not verify:**
 
-- **What the agent's code computes.** The agent can read the model's weights and run its own computations on them, forward passes included. WSE meters its own calls, not that work, so every run with `sandbox="python"` is labeled `unverified`, and its records say why.
+- **What the agent's code computes.** The agent runs its own commands in Codex's shell and, with `sandbox="python"`, can read the model's weights and compute anything from them, forward passes included. WSE meters its own calls, not that work, so every Codex run is labeled `unverified`, and its records say why. The budget bounds WSE's operations (evaluations, probes, previews, commits); it does not bound the agent's own computation, which only the time and turn limits do.
 - **That an improvement generalizes.** The test checks one more set of problems of the same kind; a few dozen problems give wide intervals, and other tasks are not tested.
 - **The agent's explanations.** What the agent says about why an edit works is its own claim; WSE checks the weights and the metrics, not the reasoning.
 
@@ -196,6 +200,8 @@ It reaches WSE only through the run's MCP tools, which act on this experiment's 
 
 - **Not yet run with an agent** (above).
 - **macOS only.** The agent's sandbox has been configured and tested on macOS only.
+- **One Codex version tested.** WSE writes its Codex config with `--strict-config`, using keys of codex-cli 0.167.0-alpha.4.1 (permission profiles among them); another version may reject a key or treat it differently. On macOS, WSE runs a Codex binary only after its code signature names OpenAI (Team ID `2DC432GLL2`). It runs the binary that `WSE_CODEX_PATH` names, else the `codex` on your `PATH`, else the newest one bundled with OpenAI's VS Code extension.
+- **The turn limit can be passed by one request.** WSE counts model requests from Codex's session record, so a fast loop can make one request more than `max_turns` before it is stopped.
 - **Apple MPS or the CPU.** Generation runs on MPS or the CPU; CUDA support is planned ([handover](../dev/handover-cuda.md)). On the CPU, a decoding step of Qwen3.5 takes about 5 to 10 seconds, about 170 times slower than on MPS ([models.md](models.md#known-limits)).
 - **Slow evaluations.** On an M4 Pro, 32 problems at 8,192 tokens took 37 to 40 minutes for Qwen3.5-0.8B.
 - **One built-in evaluator,** `math`.

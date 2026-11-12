@@ -492,3 +492,25 @@ def test_codex_offers_no_sub_agents(engine, workspace, prepared):
     (output,) = tool_outputs(fake.requests[1]["body"])
     assert "NO-SPAWN" in output and "SPAWNED" not in output
     assert len(fake.requests) == 2  # no sub-agent made a model request of its own
+
+
+def test_the_native_profile_denies_other_runs_temporary_directories_and_ssh_keys(configured):
+    """Paths outside the allow-list that the other probes do not name: other runs, temporary directories, keys."""
+    import os
+
+    workspace, sandbox = configured["workspace"], configured["sandbox"]
+    other = workspace / "sandboxes" / "run_other" / "inputs"
+    other.mkdir(parents=True, exist_ok=True)
+    (other / "notes.txt").write_text("another run's input\n")
+    probes = {"another run's input": ("cat", other / "notes.txt"), "the runs' parent": ("ls", workspace / "sandboxes"),
+              "/private/tmp": ("ls", Path("/private/tmp")), "/tmp": ("ls", Path("/tmp")),
+              "the operator's TMPDIR": ("ls", Path(os.environ.get("TMPDIR", "/private/var/folders"))),
+              "the home directory": ("ls", Path.home())}
+    if (Path.home() / ".ssh").exists():
+        probes["~/.ssh"] = ("ls", Path.home() / ".ssh")
+    result = _sandboxed(configured, "ls inputs > /dev/null && echo CONTROL-OK\n" + probe_script(probes))
+    assert "CONTROL-OK" in result.stdout, result.stderr
+    assert probe_results(probes, result.stdout) == {label: "DENIED" for label in probes}
+    for target in ("/private/tmp/wse-codex-probe.txt", str(other / "written.txt")):
+        assert not _allowed(configured, f"echo x > {target}"), target
+        Path(target).unlink(missing_ok=True)
