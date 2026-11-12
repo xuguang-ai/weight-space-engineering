@@ -211,7 +211,7 @@ def test_the_stand_in_plays_the_runners_own_strategy_object(engine, workspace, p
     runner = ReferenceRunner(workspace, registry=registry, setup=["wse_test_plugins:setup"], worker_args=FAST_WORKER,
                              serve_env={"PYTHONPATH": str(TESTS_DIR)}, settle_timeout_seconds=60)
     eid = runner.run_experiment(run_id, prepared["task_id"], WEIGHTS_ONLY_POLICY_ID,
-                                {"kind": "agent", "adapter": "codex_cli@1", "model": "wse-test-double:in_process_only@1"})
+                                {"kind": "agent", "model": "wse-test-double:in_process_only@1"})
     result = runner.last_result["result"]
     assert result["status"] == "completed" and result["reason"] == "the agent stopped: WSE-STOP: read 1 observations"
     assert runner.last_result["config"]["test_double"]["strategy"] == "in_process_only@1"
@@ -239,7 +239,7 @@ def _connection(workspace: Path, tools: list[str] | None = None) -> RunConnectio
     return RunConnection(workspace=str(workspace), run_id="run_cfg", experiment_id="exp_cfg", task_id="task",
                          policy_id="policy", serve_command=[sys.executable, "-m", "wse.cli", "--workspace",
                                                             str(workspace), "serve", "--run-id", "run_cfg"],
-                         serve_env={"PATH": "/usr/bin:/bin", "HOME": "/home/x", "OPENAI_AGENTS_DISABLE_TRACING": "1"},
+                         serve_env={"PATH": "/usr/bin:/bin", "HOME": "/home/x", "LANG": "C.UTF-8"},
                          cwd=str(workspace), allowed_tools=tools or ["wse_get_experiment", "wse_preview_patch"],
                          instructions="Instructions.", initial_message="Begin work on experiment exp_cfg.",
                          constraint_status="unverified")

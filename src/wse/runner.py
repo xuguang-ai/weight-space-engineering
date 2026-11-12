@@ -460,7 +460,7 @@ def initial_message(experiment_id: str) -> str:
 
 
 def serve_environment(extra: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The complete environment of a ``wse serve`` subprocess: allow-listed variables only, tracing disabled.
+    """The complete environment of a ``wse serve`` subprocess: allow-listed variables only.
 
     Credentials never reach the server: variables whose names look like
     secrets are rejected.
@@ -471,7 +471,6 @@ def serve_environment(extra: Mapping[str, str] | None = None) -> dict[str, str]:
             raise WSEError(ErrorCode.POLICY_DENIED, f"environment variable {name} looks like a credential; the WSE "
                            "server never receives credentials")
         env[name] = str(value)
-    env["OPENAI_AGENTS_DISABLE_TRACING"] = "1"
     return env
 
 
@@ -995,7 +994,7 @@ class ReferenceRunner:
             run_id = operator.get_experiment(eid).run_id
             self._start_record(operator, eid, kind="strategy", ref=ref, config=recorded,
                                constraint_status=constraint_status, constraint_reason=constraint_reason,
-                               tracing={"sdk_tracing": "not applicable: no agent SDK runs"})
+                               tracing={"host_tracing": "not applicable: no agent host runs"})
             monitor = StopMonitor(operator, eid, task)
             trace = _Trace(operator, eid)
             if jobs_available(policy):
@@ -1198,9 +1197,7 @@ class ReferenceRunner:
             resolve = getattr(strategy, "config", None)
             recorded["test_double"] = {"strategy": f"{strategy.strategy_id}@{strategy.version}",
                                        "resolved_config": resolve() if callable(resolve) else None}
-        tracing = {"sdk_tracing_disabled": config.tracing_disabled, "benchmark": config.benchmark,
-                   "trace_include_sensitive_data": not config.tracing_disabled and not config.benchmark,
-                   "server_env_OPENAI_AGENTS_DISABLE_TRACING": "1"}
+        tracing = {"host_tracing_disabled": config.tracing_disabled, "benchmark": config.benchmark}
         ref = ExtensionRef.parse(config.adapter)
 
         async def main() -> None:

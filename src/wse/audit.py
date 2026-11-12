@@ -534,7 +534,7 @@ def export_experiment(engine: Engine, experiment_id: str, output_dir: str | Path
         selected_checkpoint_id=experiment.selected_checkpoint_id, checkpoints=checkpoints, patches=patches,
         reports=reports, final=final, controller=controller,
         constraint_status=(controller or {}).get("constraint_status", "unverified"),
-        tracing=(controller or {}).get("tracing", {"sdk_tracing": "no controller recorded"}),
+        tracing=(controller or {}).get("tracing", {"host_tracing": "no controller recorded"}),
         costs=costs, environment=environment_record(),
         replay={"base_bundle": BASE_BUNDLE_DIR if include_base_weights else None, "base_format": base_format,
                 "method": "exact patch replay: stored after-values and hashes, no editing operator runs",

@@ -25,6 +25,7 @@ from wse.policy import SMALL_MODEL_POLICY_ID, WEIGHTS_ONLY_POLICY_ID, Experiment
 from wse.registry import builtin_registry
 from wse.runner import (
     EVALUATION_TOOLS,
+    SERVE_ENV_ALLOWLIST,
     ExperimentExecutor,
     ReferenceRunner,
     StopMonitor,
@@ -257,7 +258,7 @@ def test_the_server_environment_is_allow_listed_and_never_carries_credentials(mo
     monkeypatch.setenv("WSE_UNRELATED", "1")
     env = serve_environment({"PYTHONPATH": "/x"})
     assert "OPENAI_API_KEY" not in env and "WSE_UNRELATED" not in env
-    assert env["OPENAI_AGENTS_DISABLE_TRACING"] == "1" and env["PYTHONPATH"] == "/x"
+    assert env["PYTHONPATH"] == "/x" and set(env) <= set(SERVE_ENV_ALLOWLIST)
     with pytest.raises(WSEError) as excinfo:
         serve_environment({"OPENAI_API_KEY": "x"})
     assert excinfo.value.code == ErrorCode.POLICY_DENIED
@@ -286,7 +287,7 @@ def test_exports_carry_hashes_traces_policies_and_costs_and_replay_to_identical_
     assert len(manifest["reports"]) == 3 + 2 and manifest["final"]["candidate_accuracy"] == 1.0
     assert manifest["constraint_status"] == "verified" and manifest["controller"]["controller"]["extension_id"] == \
         "scripted_search"
-    assert manifest["tracing"] == {"sdk_tracing": "not applicable: no agent SDK runs"}
+    assert manifest["tracing"] == {"host_tracing": "not applicable: no agent host runs"}
     assert manifest["costs"]["candidates"] == 2 and manifest["costs"]["budget"]["evaluated_examples"]["consumed"] == 192
     assert manifest["costs"]["selected_changed_elements"] == 4 and manifest["costs"]["parameter_count"] == 22
     trace = json.loads((out / "tool_trace.json").read_text())
